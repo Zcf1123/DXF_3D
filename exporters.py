@@ -25,13 +25,10 @@ from .view_classifier import ViewBundle
 def export_step(fcstd_path: str, step_path: str) -> str:
     import FreeCAD as App  # type: ignore
     import Part  # type: ignore
-    doc_name = os.path.splitext(os.path.basename(fcstd_path))[0] + "_step"
     doc = App.openDocument(fcstd_path)
     try:
-        shapes = [o.Shape for o in doc.Objects
-                  if hasattr(o, "Shape") and not o.Shape.isNull()]
-        if shapes:
-            Part.export(shapes, step_path)
+        shape = _result_shape(doc)
+        Part.export([shape], step_path)
     finally:
         App.closeDocument(doc.Name)
     return step_path
@@ -44,25 +41,24 @@ def export_obj(fcstd_path: str, obj_path: str,
     import MeshPart  # type: ignore
     doc = App.openDocument(fcstd_path)
     try:
-        meshes = []
-        for o in doc.Objects:
-            if not (hasattr(o, "Shape") and not o.Shape.isNull()):
-                continue
-            try:
-                m = MeshPart.meshFromShape(Shape=o.Shape,
-                                           LinearDeflection=linear_deflection,
-                                           AngularDeflection=0.5)
-                meshes.append(m)
-            except Exception:
-                pass
-        if meshes:
-            merged = meshes[0]
-            for m in meshes[1:]:
-                merged.addMesh(m)
-            Mesh.export([_wrap_mesh_object(doc, merged)], obj_path)
+        shape = _result_shape(doc)
+        mesh = MeshPart.meshFromShape(Shape=shape,
+                                      LinearDeflection=linear_deflection,
+                                      AngularDeflection=0.5)
+        Mesh.export([_wrap_mesh_object(doc, mesh)], obj_path)
     finally:
         App.closeDocument(doc.Name)
     return obj_path
+
+
+def _result_shape(doc):
+    result = doc.getObject("Result")
+    shape = getattr(result, "Shape", None)
+    if shape is None or shape.isNull():
+        raise RuntimeError("Result solid not found in FCStd")
+    if not shape.Solids:
+        raise RuntimeError("Result object has no solid geometry")
+    return shape
 
 
 def _wrap_mesh_object(doc, mesh):

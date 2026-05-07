@@ -176,4 +176,126 @@ class LLMPlanner:
             if isinstance(f, dict) and "kind" in f and "params" in f \
                and isinstance(f["params"], dict):
                 cleaned.append({"kind": f["kind"], "params": f["params"]})
+
+        ok, reason = _validate_refined_features(draft_features, cleaned)
+        if not ok:
+            return None, f"LLM 结果未通过程序校验：{reason}；沿用算法草案"
+        cleaned = _remove_duplicate_hole_features(cleaned)
         return cleaned, f"LLM 复核完成（{self.model}）：返回 {len(cleaned)} 个特征"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic safety checks for LLM output
+# ---------------------------------------------------------------------------
+
+_ALLOWED_KINDS = {"extrude_profile", "base_block", "hole"}
+
+
+def _validate_refined_features(
+    draft: List[Dict[str, Any]],
+    refined: List[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Validate that the LLM only made safe, minimal edits.
+
+    The prompt tells the model not to delete holes, not to rewrite the chosen
+    extrusion profile, and not to invent new features.  This function enforces
+    those constraints in code so a bad completion cannot silently degrade the
+    final model.
+    """
+    for item in refined:
+        kind = item.get("kind")
+        if kind not in _ALLOWED_KINDS:
+            return False, f"unknown feature kind {kind!r}"
+
+    draft_base = [
+        f for f in draft
+        if f.get("kind") in {"extrude_profile", "base_block"}
+    ]
+    refined_base = [
+        f for f in refined
+        if f.get("kind") in {"extrude_profile", "base_block"}
+    ]
+    if len(draft_base) != len(refined_base):
+        return False, "base/profile feature count changed"
+    for i, (before, after) in enumerate(zip(draft_base, refined_base)):
+        if before.get("kind") != after.get("kind"):
+            return False, f"base/profile kind changed at index {i}"
+        ok, reason = _validate_base_feature(before, after)
+        if not ok:
+            return False, reason
+
+    draft_holes = _dedupe_holes([f for f in draft if f.get("kind") == "hole"])
+    refined_holes = _dedupe_holes([f for f in refined if f.get("kind") == "hole"])
+    if len(refined_holes) < len(draft_holes):
+        return False, (
+            f"hole count decreased from {len(draft_holes)} "
+            f"to {len(refined_holes)}"
+        )
+    for hole in draft_holes:
+        if not any(_same_hole(hole, candidate) for candidate in refined_holes):
+            return False, "draft hole missing from refined features"
+    if len(refined_holes) > len(draft_holes):
+        return False, "new hole feature was added"
+
+    return True, "ok"
+
+
+def _validate_base_feature(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+) -> Tuple[bool, str]:
+    kind = before.get("kind")
+    bp = before.get("params", {})
+    ap = after.get("params", {})
+    if kind == "extrude_profile":
+        for key in ("plane", "source_view", "edges"):
+            if bp.get(key) != ap.get(key):
+                return False, f"extrude_profile {key} changed"
+    elif kind == "base_block":
+        for key in ("width", "depth", "height", "origin"):
+            if key in bp and bp.get(key) != ap.get(key):
+                return False, f"base_block {key} changed"
+    return True, "ok"
+
+
+def _dedupe_holes(holes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unique: List[Dict[str, Any]] = []
+    for hole in holes:
+        if not any(_same_hole(hole, seen) for seen in unique):
+            unique.append(hole)
+    return unique
+
+
+def _remove_duplicate_hole_features(
+    features: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen_holes: List[Dict[str, Any]] = []
+    for feature in features:
+        if feature.get("kind") != "hole":
+            out.append(feature)
+            continue
+        if any(_same_hole(feature, seen) for seen in seen_holes):
+            continue
+        seen_holes.append(feature)
+        out.append(feature)
+    return out
+
+
+def _same_hole(a: Dict[str, Any], b: Dict[str, Any], tol: float = 0.1) -> bool:
+    ap = a.get("params", {})
+    bp = b.get("params", {})
+    if ap.get("axis") != bp.get("axis"):
+        return False
+    if ap.get("source_view") != bp.get("source_view"):
+        return False
+    try:
+        if abs(float(ap.get("radius")) - float(bp.get("radius"))) > tol:
+            return False
+        apos = ap.get("position", [])
+        bpos = bp.get("position", [])
+        if len(apos) != 3 or len(bpos) != 3:
+            return False
+        return all(abs(float(apos[i]) - float(bpos[i])) <= tol for i in range(3))
+    except Exception:
+        return False

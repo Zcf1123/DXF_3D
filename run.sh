@@ -11,6 +11,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 IMAGE="${DXF_3D_IMAGE:-dxf-3d}"
+TZ_NAME="${TZ:-Asia/Shanghai}"
 
 # 把每个传入路径拼成 Python 列表字面量；位于 DXF_3D 目录下的文件
 # 映射到 /app/DXF_3D/<rel>，外部文件原样保留（需要用户自行提供绝对路径）。
@@ -35,8 +36,10 @@ PY_LIST+="]"
 
 INNER_CMD="import sys; sys.path.insert(0,'/app'); from DXF_3D.run import main; sys.exit(main(${PY_LIST}))"
 
+# freecadcmd writes progress noise to stdout; run.py writes the concise
+# pipeline summary to stderr, so it remains visible.
 exec docker run --rm \
-    -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e HOME=/tmp \
+    -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e HOME=/tmp -e TZ="${TZ_NAME}" \
     -v "${HERE}/dxf_files:/app/DXF_3D/dxf_files" \
     -v "${HERE}/outputs:/app/DXF_3D/outputs" \
     -v "${HERE}/config.json:/app/DXF_3D/config.json:ro" \

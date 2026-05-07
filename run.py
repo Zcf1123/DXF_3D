@@ -7,7 +7,7 @@ image):
                    from DXF_3D.run import main; sys.exit(main())"
 
 By default reads every `*.dxf` in `DXF_3D/dxf_files/` and writes a
-per-run directory under `DXF_3D/outputs/run_<timestamp>_<base>/`
+per-run directory under `DXF_3D/outputs/<YYYYMMDD>_<HHMMSS>_<base>/`
 containing:
 
     <base>.FCStd            FreeCAD project
@@ -52,7 +52,7 @@ OUTPUTS_DIR = os.path.join(HERE, "outputs")
 
 def _make_run_dir(base: str) -> str:
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(OUTPUTS_DIR, f"run_{ts}_{base}")
+    out_dir = os.path.join(OUTPUTS_DIR, f"{ts}_{base}")
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -219,6 +219,8 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         if "error" in artifacts:
             log.error("建模失败: %s", artifacts["error"])
             raise RuntimeError(artifacts["error"])
+        for warning in artifacts.get("warnings", []):
+            log.warning("建模警告: %s", warning)
         fcstd_path = artifacts["fcstd"]
         summary["fcstd"] = fcstd_path
         log.info("FCStd 文件    : %s", fcstd_path)

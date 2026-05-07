@@ -87,7 +87,7 @@ cd /path/to/DXF_3D
 
 ```
 LLM         : qwen3.5-35b-a3b
-Output dir  : DXF_3D/outputs/run_20260430_082020_Drawing1
+Output dir  : DXF_3D/outputs/20260507_095610_Drawing1
 Status      : OK
 ```
 
@@ -152,7 +152,7 @@ Status      : OK
 
 ---
 
-## 五、产物（每次运行一个 `outputs/run_<时间戳>_<base>/` 目录）
+## 五、产物（每次运行一个 `outputs/<YYYYMMDD>_<HHMMSS>_<base>/` 目录）
 
 | 文件                       | 说明 |
 | -------------------------- | ---- |
@@ -224,7 +224,7 @@ DXF_3D/
 ├── config.json               LLM 配置（API key / base_url / model）
 ├── run.sh                    Docker 启动脚本
 ├── dxf_files/                <—— 把要处理的 .dxf 放在这里
-├── outputs/                  <—— 每次运行生成 run_<时间戳>_<base>/
+├── outputs/                  <—— 每次运行生成 <YYYYMMDD>_<HHMMSS>_<base>/
 ├── prompts/
 │   ├── PROMPT_SPEC.md        prompt 文件分块规范
 │   └── feature_refiner.md    特征复核 prompt（中文，详细）

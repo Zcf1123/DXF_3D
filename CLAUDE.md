@@ -36,7 +36,7 @@ DXF_3D/
 │   └── feature_refiner.md  # LLM 特征精化的 system/user 模板
 │
 ├── dxf_files/              # 输入目录，放待处理的 .dxf（不纳入 Git）
-└── outputs/                # 输出目录，按 run_<timestamp>_<base>/ 分目录（不纳入 Git）
+└── outputs/                # 输出目录，按 <YYYYMMDD>_<HHMMSS>_<base>/ 分目录（不纳入 Git）
 ```
 
 ---
@@ -171,7 +171,7 @@ LLM 通过 `llm_planner.py` 精化此列表，返回相同结构的 JSON。
 
 ## 9. 输出产物说明
 
-每次运行生成 `outputs/run_<timestamp>_<base>/`，包含：
+每次运行生成 `outputs/<YYYYMMDD>_<HHMMSS>_<base>/`，包含：
 
 | 文件                   | 含义                                         |
 |------------------------|----------------------------------------------|

@@ -20,7 +20,7 @@ from .feature_inference import Feature
 
 def build_model(features: List[Feature], out_dir: str,
                 base_name: str = "model",
-                projected: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+                projected: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build a FreeCAD document and save it as <base_name>.FCStd.
 
     When *projected* (a dict of ``ProjectedView`` objects keyed by view name)
@@ -37,8 +37,7 @@ def build_model(features: List[Feature], out_dir: str,
         return {"error": f"FreeCAD is not importable: {exc}"}
 
     try:
-        fc_path = _direct_build(features, out_dir, base_name, projected)
-        return {"fcstd": fc_path}
+        return _direct_build(features, out_dir, base_name, projected)
     except Exception as exc:
         return {"error": f"build failed: {exc}"}
 
@@ -47,12 +46,13 @@ def build_model(features: List[Feature], out_dir: str,
 
 def _direct_build(features: List[Feature], out_dir: str,
                   base_name: str,
-                  projected: Optional[Dict[str, Any]] = None) -> str:
+                  projected: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     import FreeCAD as App
     import Part
 
     doc = App.newDocument(base_name)
     solid = None
+    warnings: List[str] = []
 
     for f in features:
         if f.kind == "extrude_profile":
@@ -67,13 +67,19 @@ def _direct_build(features: List[Feature], out_dir: str,
             if cyl is not None:
                 try:
                     solid = solid.cut(cyl)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.append(
+                        f"hole cut failed for {f.params}: {exc}"
+                    )
+            else:
+                warnings.append(f"hole cylinder could not be created: {f.params}")
+
+    if solid is None:
+        raise RuntimeError("no solid was produced from inferred features")
 
     fc_path = os.path.join(out_dir, f"{base_name}.FCStd")
-    if solid is not None:
-        obj = doc.addObject("Part::Feature", "Result")
-        obj.Shape = solid
+    obj = doc.addObject("Part::Feature", "Result")
+    obj.Shape = solid
 
     # Embed the original 2D three-view drawings as named edge compounds.
     if projected is not None:
@@ -82,7 +88,7 @@ def _direct_build(features: List[Feature], out_dir: str,
     doc.recompute()
     doc.saveAs(fc_path)
     App.closeDocument(base_name)
-    return fc_path
+    return {"fcstd": fc_path, "warnings": warnings}
 
 
 # ---------------------------------------------------------------------------
