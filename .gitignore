@@ -1,0 +1,30 @@
+# 运行时输入/输出目录
+dxf_files/
+outputs/
+
+# 配置文件
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# FreeCAD
+*.FCStd
+*.FCBak
+
+# 日志
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~

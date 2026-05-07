@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+outputs/
+dxf_files/
+.git
+.gitignore
+*.swp
+.DS_Store
