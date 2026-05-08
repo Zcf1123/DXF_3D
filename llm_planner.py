@@ -127,6 +127,8 @@ class LLMPlanner:
                         view_geometry: Optional[List[Dict[str, Any]]] = None,
                         ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
         """Return (refined_features_or_None, log_message)."""
+        if _is_deterministic_sphere_draft(draft_features):
+            return draft_features, "算法已确定为球体，跳过 LLM 特征改写"
         if not self.enabled:
             return None, f"LLM 已禁用：{self.disabled_reason}"
 
@@ -239,7 +241,7 @@ class LLMPlanner:
 # Deterministic safety checks for LLM output
 # ---------------------------------------------------------------------------
 
-_ALLOWED_KINDS = {"extrude_profile", "base_block", "hole", "edge_chamfer"}
+_ALLOWED_KINDS = {"extrude_profile", "base_block", "sphere", "hole", "edge_chamfer"}
 _CANONICAL_VIEWS = {"front", "top", "right"}
 
 
@@ -290,7 +292,8 @@ def _validate_view_review(
                     return False, f"{label}_entity_ids contains unknown id {value}"
         if keep_ids is not None:
             kept = set(keep_ids)
-            if len(kept) < max(3, int(len(valid_ids) * 0.35)):
+            min_keep = 1 if len(valid_ids) < 3 else max(3, int(len(valid_ids) * 0.35))
+            if len(kept) < min_keep:
                 return False, f"too many entities removed from {input_name}"
     return True, "ok"
 
@@ -314,11 +317,11 @@ def _validate_refined_features(
 
     draft_base = [
         f for f in draft
-        if f.get("kind") in {"extrude_profile", "base_block"}
+        if f.get("kind") in {"extrude_profile", "base_block", "sphere"}
     ]
     refined_base = [
         f for f in refined
-        if f.get("kind") in {"extrude_profile", "base_block"}
+        if f.get("kind") in {"extrude_profile", "base_block", "sphere"}
     ]
     if len(draft_base) != len(refined_base):
         return False, "base/profile feature count changed"
@@ -357,6 +360,15 @@ def _validate_refined_features(
             return False, "added edge_chamfer lacks view evidence"
 
     return True, "ok"
+
+
+def _is_deterministic_sphere_draft(features: List[Dict[str, Any]]) -> bool:
+    return (
+        len(features) == 1
+        and isinstance(features[0], dict)
+        and features[0].get("kind") == "sphere"
+        and isinstance(features[0].get("params"), dict)
+    )
 
 
 def _edge_chamfer_has_view_evidence(
@@ -440,6 +452,25 @@ def _validate_base_feature(
         for key in ("width", "depth", "height", "origin"):
             if key in bp and bp.get(key) != ap.get(key):
                 return False, f"base_block {key} changed"
+    elif kind == "sphere":
+        try:
+            before_radius = float(bp.get("radius"))
+            after_radius = float(ap.get("radius"))
+        except Exception:
+            return False, "sphere radius invalid"
+        tol = max(abs(before_radius) * 1e-6, 1e-6)
+        if abs(before_radius - after_radius) > tol:
+            return False, "sphere radius changed"
+        before_center = bp.get("center", [])
+        after_center = ap.get("center", [])
+        if len(before_center) != 3 or len(after_center) != 3:
+            return False, "sphere center invalid"
+        try:
+            if any(abs(float(before_center[i]) - float(after_center[i])) > tol
+                   for i in range(3)):
+                return False, "sphere center changed"
+        except Exception:
+            return False, "sphere center invalid"
     return True, "ok"
 
 
@@ -470,7 +501,7 @@ def _remove_duplicate_hole_features(
 def _order_features_for_builder(
     features: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    order = {"extrude_profile": 0, "base_block": 0, "hole": 1, "edge_chamfer": 2}
+    order = {"extrude_profile": 0, "base_block": 0, "sphere": 0, "hole": 1, "edge_chamfer": 2}
     return sorted(
         features,
         key=lambda feature: order.get(str(feature.get("kind")), 99),

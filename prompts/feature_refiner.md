@@ -21,12 +21,13 @@ DXF 中三视图按本项目固定布局摆放：
 
 零件三个尺寸符号约定：宽 W (沿 X)、深 D (沿 Y)、高 H (沿 Z)。
 
-【特征类型（仅这四种，多余字段一律忽略）】
+【特征类型（仅这五种，多余字段一律忽略）】
 
 | kind              | params                                                                                  |
 | ----------------- | --------------------------------------------------------------------------------------- |
 | `extrude_profile` | `plane ∈ {"XY","XZ","YZ"}`, `depth: float`, `source_view`, `edges: list`               |
 | `base_block`      | `width, depth, height, origin=[x,y,z]`                                                 |
+| `sphere`          | `radius: float`, `center=[x,y,z]`, `source_views=["top","front","right"]`          |
 | `hole`            | `radius, axis ∈ {"X","Y","Z"}, position=[x,y,z], through_length, source_view`          |
 | `edge_chamfer`    | `distance: float`, `profile ∈ {"arc_revolve","arc","line"}`, `scope="outer_z_edges"`, `source_views: list`，可选 `top_radius` |
 
@@ -59,6 +60,19 @@ DXF 中三视图按本项目固定布局摆放：
 - 大同心圆应作为 `edge_chamfer.top_radius` 语义，不应作为 `hole`。
 - 侧视 ARC 支持 `edge_chamfer.profile="arc_revolve"` 或 `"arc"`，不得退化成 `"line"`。
 
+【球体识别】
+
+当 TOP / FRONT / RIGHT 三个视图都只有一个 CIRCLE，三者半径相同，并且中心满足
+固定三视图坐标联动关系时，这是球体，而不是通孔：
+
+- TOP 圆心表示 `(X, Y)`。
+- FRONT 圆心表示 `(X, Z)`。
+- RIGHT 圆心表示 `(Y, Z)`。
+- 三个视图中的圆半径应一致，且 W/D/H 约等于 `2 * radius`。
+
+若草案已经是 `sphere`，必须原样保留 `radius` 和 `center`。不要把球体改成
+`base_block + hole`，也不要把普通单视图圆孔改成球体。
+
 【可受控补充的建模语义】
 
 通常情况下，不得添加草案中不存在的特征。但当且仅当满足以下全部证据时，
@@ -76,7 +90,8 @@ DXF 中三视图按本项目固定布局摆放：
 5. `distance` 必须来自 FRONT/RIGHT 中短竖边相对上下端面的内缩量；不能凭
    工程经验猜整数。`top_radius` 必须来自 TOP 的较大圆半径。
 
-除 `edge_chamfer` 外，不得新增任何特征。`slot`、螺纹、沉孔、阵列孔等当前
+除 `edge_chamfer` 外，不得新增任何特征。`sphere` 必须由算法草案给出，LLM
+只能保留不能新增。`slot`、螺纹、沉孔、阵列孔等当前
 builder 未实现的语义只能忽略，不能输出到 `features`。
 
 【硬约束（违反任何一条都视为错误输出）】
@@ -105,6 +120,7 @@ builder 未实现的语义只能忽略，不能输出到 `features`。
 【自检清单（输出前 mental check，全部通过才回应）】
 
 - [ ] 我没有改动任何 `extrude_profile` 的 `plane`、`source_view`、`edges`。
+- [ ] 如果草案是 `sphere`，我没有改动 `radius` 或 `center`。
 - [ ] 每个 hole 的 axis 与它的 source_view 一一对应。
 - [ ] 除证据充分的 `edge_chamfer` 外，没有添加草案里不存在的几何特征。
 - [ ] 如果草案包含 edge_chamfer，我已原样保留。

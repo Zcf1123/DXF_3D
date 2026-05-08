@@ -54,6 +54,7 @@ fi
 # pipeline summary to stderr, so it remains visible.
 exec docker run --rm \
     -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e HOME=/tmp -e TZ="${TZ_NAME}" \
+    -e DXF_3D_OUTPUT_SUBDIR="${DXF_3D_OUTPUT_SUBDIR:-}" \
     -v "${HERE}/dxf_files:/app/DXF_3D/dxf_files" \
     -v "${HERE}/outputs:/app/DXF_3D/outputs" \
     -v "${HERE}/config.json:/app/DXF_3D/config.json:ro" \

@@ -9,11 +9,13 @@ Strategy:
        - front outline -> profile in XZ, extrude along +Y by D
        - right outline -> profile in YZ, extrude along +X by W
      Falls back to a bounding-box block if no closed outline is found.
-  2. CIRCLE entities become through-holes:
+  2. A single same-radius CIRCLE in all three canonical views becomes a sphere
+      when the projected centers agree across TOP/FRONT/RIGHT.
+  3. CIRCLE entities become through-holes:
        circle in TOP   view -> hole axis = Z
        circle in FRONT view -> hole axis = Y
        circle in RIGHT view -> hole axis = X
-  3. For prismatic polygon profiles, visible front/right arc offsets become
+  4. For prismatic polygon profiles, visible front/right arc offsets become
       a top/bottom arc-profile edge treatment.
 """
 from __future__ import annotations
@@ -31,7 +33,7 @@ from .view_classifier import ViewBundle
 
 @dataclass
 class Feature:
-    kind: str   # "extrude_profile" | "base_block" | "hole" | "edge_chamfer"
+    kind: str   # "extrude_profile" | "base_block" | "sphere" | "hole" | "edge_chamfer"
     params: Dict = field(default_factory=dict)
 
     def to_dict(self):
@@ -167,6 +169,81 @@ def _make_outline(pv: ProjectedView) -> Tuple[Optional[Outline], List[DxfEntity]
                         bbox=(0.0, 0.0, pv.width, pv.height),
                         entities=pv.entities)
     return extract_outline_and_holes(bundle, hidden_pred=_is_hidden_entity)
+
+
+def _visible_circles(pv: Optional[ProjectedView]) -> List[DxfEntity]:
+    if pv is None:
+        return []
+    return [
+        e for e in pv.entities
+        if e.kind == "CIRCLE" and e.center is not None and e.radius is not None
+        and not _is_hidden_entity(e)
+    ]
+
+
+def _infer_sphere_feature(
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+) -> Optional[Feature]:
+    """Infer a sphere from three linked circular orthographic projections.
+
+    A through-hole usually appears as a circle in one view and hidden/parallel
+    evidence in the other views. A sphere projects to a same-radius circle in
+    all three canonical views, and the centers must agree under the fixed
+    TOP/FRONT/RIGHT coordinate mapping:
+        TOP   circle center -> (X, Y)
+        FRONT circle center -> (X, Z)
+        RIGHT circle center -> (Y, Z)
+    """
+    required = {name: _visible_circles(projected.get(name))
+                for name in ("top", "front", "right")}
+    if any(len(circles) != 1 for circles in required.values()):
+        return None
+    if any(
+        any(e.kind != "CIRCLE" for e in projected[name].entities)
+        for name in ("top", "front", "right")
+    ):
+        return None
+
+    top = required["top"][0]
+    front = required["front"][0]
+    right = required["right"][0]
+    assert top.center and front.center and right.center
+    radius = float(top.radius or 0.0)
+    if radius <= 0:
+        return None
+    scale = max(width, depth, height, radius * 2.0, 1.0)
+    tol = max(scale * 0.03, 1e-3)
+    for circle in (front, right):
+        if abs(float(circle.radius or 0.0) - radius) > tol:
+            return None
+    if any(abs(dim - 2.0 * radius) > tol for dim in (width, depth, height)):
+        return None
+
+    x_from_top, y_from_top = top.center
+    x_from_front, z_from_front = front.center
+    y_from_right, z_from_right = right.center
+    if abs(float(x_from_top) - float(x_from_front)) > tol:
+        return None
+    if abs(float(y_from_top) - float(y_from_right)) > tol:
+        return None
+    if abs(float(z_from_front) - float(z_from_right)) > tol:
+        return None
+
+    return Feature(
+        kind="sphere",
+        params={
+            "radius": radius,
+            "center": [
+                (float(x_from_top) + float(x_from_front)) * 0.5,
+                (float(y_from_top) + float(y_from_right)) * 0.5,
+                (float(z_from_front) + float(z_from_right)) * 0.5,
+            ],
+            "source_views": ["top", "front", "right"],
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +393,10 @@ def infer_features(projected: Dict[str, ProjectedView],
 
     width, depth, height = estimate_part_size(projected, bundles)
     features: List[Feature] = []
+
+    sphere = _infer_sphere_feature(projected, width, depth, height)
+    if sphere is not None:
+        return [sphere]
 
     # -- 1. Pick the most informative outline as the extrusion profile.
     candidates = []  # list of (score, view_name, outline, holes)

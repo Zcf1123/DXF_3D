@@ -123,13 +123,16 @@ Status      : OK
 1. 闭合轮廓只能由 `LINE` / `ARC` / `CIRCLE` / `LWPOLYLINE` 组成；
    `SPLINE` / `ELLIPSE` / `HATCH` 一律忽略。
 2. 每个视图的外轮廓必须**首尾闭合**（容差 `1e-3`）。
-3. 视图内部的 `CIRCLE` 自动作为通孔：
+3. 当 TOP / FRONT / RIGHT 三个视图都只有一个同半径 `CIRCLE`，且圆心满足
+   `(TOP.x == FRONT.x)`、`(TOP.y == RIGHT.x)`、`(FRONT.y == RIGHT.y)` 的三视图
+   坐标联动关系时，识别为 `sphere`，不作为通孔。
+4. 其它视图内部的 `CIRCLE` 自动作为通孔：
    - TOP 视图中的圆 → 孔轴 = Z
    - FRONT 视图中的圆 → 孔轴 = Y
    - RIGHT 视图中的圆 → 孔轴 = X
-4. 对多边形棱柱类零件，FRONT/RIGHT 中真实 ARC + TOP 中相切大圆可识别为
+5. 对多边形棱柱类零件，FRONT/RIGHT 中真实 ARC + TOP 中相切大圆可识别为
    上下外轮廓圆弧端面倒角（`edge_chamfer.profile="arc_revolve"`）。
-5. 坐标单位默认按毫米处理，**不做单位识别 / 缩放**。
+6. 坐标单位默认按毫米处理，**不做单位识别 / 缩放**。
 
 ### 3. 图层（推荐，可选）
 
@@ -172,6 +175,10 @@ Status      : OK
 | `generated_model.py`       | 独立可重跑脚本：`freecadcmd generated_model.py` |
 | `run.log`                  | 详细中文日志（每一阶段、警告、栈追踪） |
 
+测试或调试时可设置 `DXF_3D_OUTPUT_SUBDIR=test`，输出会进入
+`outputs/test/<YYYYMMDD>_<HHMMSS>_<base>/`。未设置时保持默认行为，仍输出到
+`outputs/<YYYYMMDD>_<HHMMSS>_<base>/`。
+
 ---
 
 ## 六、流水线
@@ -188,7 +195,7 @@ dxf_loader → view_classifier → projection_mapper → feature_inference
 | `view_classifier.py`    | 按象限把实体分到 FRONT/TOP/RIGHT 三个 `ViewBundle` |
 | `projection_mapper.py`  | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
 | `geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
-| `feature_inference.py`  | 推断拉伸轮廓、孔和可确定的边倒角，输出 `Feature` 列表 |
+| `feature_inference.py`  | 推断拉伸轮廓、球体、孔和可确定的边倒角，输出 `Feature` 列表 |
 | `llm_planner.py`        | 读 `config.json` 调用 OpenAI 兼容 API，复核视图语义和特征草案；证据充分时可补充受支持的 `edge_chamfer` |
 | `freecad_builder.py`    | 按特征列表用 FreeCAD `Part` 建模并保存 `.FCStd` |
 | `exporters.py`          | STEP / OBJ / PNG / 总览 PNG / model.json / 可复现 Python |

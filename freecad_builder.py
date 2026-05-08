@@ -62,6 +62,11 @@ def _direct_build(features: List[Feature], out_dir: str,
             ox, oy, oz = p.get("origin", [0, 0, 0])
             solid = Part.makeBox(p["width"], p["depth"], p["height"],
                                  App.Vector(ox, oy, oz))
+        elif f.kind == "sphere":
+            p = f.params
+            x, y, z = p.get("center", [0, 0, 0])
+            solid = Part.makeSphere(float(p["radius"]),
+                                    App.Vector(float(x), float(y), float(z)))
         elif f.kind == "hole" and solid is not None:
             cyl = _make_hole_cylinder(f.params)
             if cyl is not None:

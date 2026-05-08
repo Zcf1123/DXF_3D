@@ -229,6 +229,8 @@ def export_model_views_png(fcstd_path: str, png_path: str) -> str:
 
 
 def _project_shape_edges(shape, view_name: str):
+    if _is_sphere_shape(shape):
+        return _project_sphere_outline(shape, view_name)
     segs = []
     artifact_tol = max(
         float(shape.BoundBox.XLength),
@@ -252,6 +254,52 @@ def _project_shape_edges(shape, view_name: str):
             if abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) < 1e-9:
                 continue
             segs.append((a, b))
+    return segs
+
+
+def _is_sphere_shape(shape) -> bool:
+    if not getattr(shape, "Solids", None):
+        return False
+    bb = shape.BoundBox
+    scale = max(float(bb.XLength), float(bb.YLength), float(bb.ZLength), 1.0)
+    if abs(float(bb.XLength) - float(bb.YLength)) > scale * 0.02:
+        return False
+    if abs(float(bb.XLength) - float(bb.ZLength)) > scale * 0.02:
+        return False
+    for face in getattr(shape, "Faces", []):
+        surface_name = type(face.Surface).__name__ if hasattr(face, "Surface") else ""
+        if surface_name == "Sphere":
+            return True
+    return False
+
+
+def _project_sphere_outline(shape, view_name: str):
+    import math
+
+    bb = shape.BoundBox
+    center = (
+        (float(bb.XMin) + float(bb.XMax)) * 0.5,
+        (float(bb.YMin) + float(bb.YMax)) * 0.5,
+        (float(bb.ZMin) + float(bb.ZMax)) * 0.5,
+    )
+    radius = min(float(bb.XLength), float(bb.YLength), float(bb.ZLength)) * 0.5
+    segs = []
+    points = []
+    for i in range(97):
+        t = 2.0 * math.pi * i / 96.0
+        if view_name == "front":
+            points.append((center[0] + radius * math.cos(t),
+                           center[2] + radius * math.sin(t)))
+        elif view_name == "right":
+            points.append((center[1] + radius * math.cos(t),
+                           center[2] + radius * math.sin(t)))
+        elif view_name == "top":
+            points.append((center[0] + radius * math.cos(t),
+                           center[1] + radius * math.sin(t)))
+        else:
+            raise ValueError(f"unknown view name: {view_name}")
+    for a, b in zip(points, points[1:]):
+        segs.append((a, b))
     return segs
 
 
@@ -452,21 +500,52 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
                     p.x * v[0] + p.y * v[1] + p.z * v[2])
 
         segs = []
-        for edge in compound.Edges:
-            if _is_short_3d_artifact_edge(edge, compound):
-                continue
-            if _is_internal_3d_center_seam(edge, compound):
-                continue
-            L = max(edge.Length, 1e-9)
-            n = max(2, int(L * 6))
-            try:
-                pts = edge.discretize(n)
-            except Exception:
-                continue
-            for i in range(len(pts) - 1):
-                a = proj(pts[i])
-                b = proj(pts[i + 1])
-                segs.append((a, b))
+        if _is_sphere_shape(compound):
+            import FreeCAD as App  # type: ignore
+            bb = compound.BoundBox
+            center = App.Vector(
+                (float(bb.XMin) + float(bb.XMax)) * 0.5,
+                (float(bb.YMin) + float(bb.YMax)) * 0.5,
+                (float(bb.ZMin) + float(bb.ZMax)) * 0.5,
+            )
+            radius = min(float(bb.XLength), float(bb.YLength), float(bb.ZLength)) * 0.5
+            circles = []
+            for plane in ("xy", "xz", "yz"):
+                pts = []
+                for i in range(145):
+                    t = 2.0 * math.pi * i / 144.0
+                    if plane == "xy":
+                        pts.append(App.Vector(center.x + radius * math.cos(t),
+                                              center.y + radius * math.sin(t),
+                                              center.z))
+                    elif plane == "xz":
+                        pts.append(App.Vector(center.x + radius * math.cos(t),
+                                              center.y,
+                                              center.z + radius * math.sin(t)))
+                    else:
+                        pts.append(App.Vector(center.x,
+                                              center.y + radius * math.cos(t),
+                                              center.z + radius * math.sin(t)))
+                circles.append(pts)
+            for pts in circles:
+                for i in range(len(pts) - 1):
+                    segs.append((proj(pts[i]), proj(pts[i + 1])))
+        else:
+            for edge in compound.Edges:
+                if _is_short_3d_artifact_edge(edge, compound):
+                    continue
+                if _is_internal_3d_center_seam(edge, compound):
+                    continue
+                L = max(edge.Length, 1e-9)
+                n = max(2, int(L * 6))
+                try:
+                    pts = edge.discretize(n)
+                except Exception:
+                    continue
+                for i in range(len(pts) - 1):
+                    a = proj(pts[i])
+                    b = proj(pts[i + 1])
+                    segs.append((a, b))
         if not segs:
             raise RuntimeError("no edges to project")
     finally:
@@ -680,6 +759,10 @@ def export_generated_python(features: List[Feature], py_path: str,
                 solid = Part.makeBox(params["width"], params["depth"],
                                      params["height"],
                                      App.Vector(ox, oy, oz))
+            elif kind == "sphere":
+                x, y, z = params.get("center", [0,0,0])
+                solid = Part.makeSphere(float(params["radius"]),
+                                        App.Vector(float(x), float(y), float(z)))
             elif kind == "hole" and solid is not None:
                 cyl = _hole_cyl(params)
                 if cyl is not None:

@@ -150,7 +150,11 @@ def _apply_view_review(bundles, review: Dict[str, Any]) -> Dict[str, Any]:
 
 def _make_run_dir(base: str) -> str:
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(OUTPUTS_DIR, f"{ts}_{base}")
+    output_root = OUTPUTS_DIR
+    output_subdir = os.environ.get("DXF_3D_OUTPUT_SUBDIR", "").strip().strip("/")
+    if output_subdir:
+        output_root = os.path.join(output_root, output_subdir)
+    out_dir = os.path.join(output_root, f"{ts}_{base}")
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -302,6 +306,10 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
                 log.info("  · 底块: W=%.3f D=%.3f H=%.3f origin=%s",
                          p.get("width", 0), p.get("depth", 0),
                          p.get("height", 0), p.get("origin"))
+            elif f.kind == "sphere":
+                log.info("  · 球体: r=%.3f center=%s (来自 %s)",
+                         p.get("radius", 0), p.get("center"),
+                         ",".join(p.get("source_views", [])))
             elif f.kind == "hole":
                 log.info("  · 通孔: axis=%s r=%.3f pos=%s 长度=%.3f (来自 %s)",
                          p.get("axis"), p.get("radius", 0), p.get("position"),
