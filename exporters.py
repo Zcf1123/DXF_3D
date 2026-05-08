@@ -238,7 +238,7 @@ def _project_shape_edges(shape, view_name: str):
     ) * 0.075
     for edge in shape.Edges:
         try:
-            if _is_internal_right_center_line(edge, view_name, shape):
+            if _is_full_height_internal_seam_line(edge, view_name, shape):
                 continue
             if _is_short_projected_artifact_edge(edge, view_name, artifact_tol):
                 continue
@@ -253,6 +253,40 @@ def _project_shape_edges(shape, view_name: str):
                 continue
             segs.append((a, b))
     return segs
+
+
+def _is_full_height_internal_seam_line(edge, view_name: str, shape) -> bool:
+    if view_name not in {"front", "right"} or len(edge.Vertexes) != 2:
+        return False
+    curve_name = type(edge.Curve).__name__ if hasattr(edge, "Curve") else ""
+    if curve_name != "Line":
+        return False
+    p0 = edge.Vertexes[0].Point
+    p1 = edge.Vertexes[1].Point
+    chord_3d = p0.distanceToPoint(p1)
+    if chord_3d <= 1e-9:
+        return False
+    if abs(float(edge.Length) - chord_3d) > max(1e-6, chord_3d * 1e-5):
+        return False
+    bb = shape.BoundBox
+    span_x = max(float(bb.XLength), 1.0)
+    span_y = max(float(bb.YLength), 1.0)
+    span_z = max(float(bb.ZLength), 1.0)
+    if abs(float(p0.x) - float(p1.x)) > span_x * 0.001:
+        return False
+    if abs(float(p0.y) - float(p1.y)) > span_y * 0.001:
+        return False
+    z_min = float(bb.ZMin)
+    z_max = float(bb.ZMax)
+    touches_bottom = min(abs(float(p0.z) - z_min), abs(float(p1.z) - z_min)) <= span_z * 0.02
+    touches_top = min(abs(float(p0.z) - z_max), abs(float(p1.z) - z_max)) <= span_z * 0.02
+    if not (touches_bottom and touches_top):
+        return False
+    if view_name == "front":
+        projected_x = float(p0.x)
+        return (projected_x - float(bb.XMin)) > span_x * 0.05 and (float(bb.XMax) - projected_x) > span_x * 0.05
+    projected_y = float(p0.y)
+    return (projected_y - float(bb.YMin)) > span_y * 0.05 and (float(bb.YMax) - projected_y) > span_y * 0.05
 
 
 def _is_internal_right_center_line(edge, view_name: str, shape) -> bool:
@@ -574,7 +608,9 @@ def export_generated_python(features: List[Feature], py_path: str,
             x, y, z = p["position"]; length = float(p["through_length"])
             v = {{"X": App.Vector(1,0,0), "Y": App.Vector(0,1,0),
                  "Z": App.Vector(0,0,1)}}.get(axis, App.Vector(0,0,1))
-            return Part.makeCylinder(r, length, App.Vector(x,y,z), v)
+            cyl = Part.makeCylinder(r, length, App.Vector(x,y,z), v)
+            cyl.rotate(App.Vector(x,y,z), v, 180.0)
+            return cyl
 
         def _edge_chamfer(shape, p):
             distance = float(p.get("distance", 0.0) or 0.0)
@@ -603,6 +639,7 @@ def export_generated_python(features: List[Feature], py_path: str,
                     App.Vector(0,0,0), App.Vector(0,0,1), 360.0)
                 if not env.Solids and env.Shells:
                     env = Part.Solid(env.Shells[0])
+                env.rotate(App.Vector(0,0,0), App.Vector(0,0,1), 30.0)
                 env.translate(App.Vector(center_x, center_y, float(bb.ZMin)))
                 return shape.common(env).removeSplitter()
             bb = shape.BoundBox

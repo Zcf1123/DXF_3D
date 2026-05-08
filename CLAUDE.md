@@ -1,6 +1,6 @@
 # CLAUDE.md — DXF_3D 项目速查手册
 
-> 本文件是给 Claude 看的上下文备忘录。把 `DXF_3D/` 拷贝到任意主机后，
+> 本文件是 Claude 的上下文备忘录。把 `DXF_3D/` 拷贝到任意主机后，
 > 先读这里，再看代码。
 
 ---
@@ -33,6 +33,7 @@ DXF_3D/
 │
 ├── prompts/
 │   ├── PROMPT_SPEC.md      # Prompt 文件格式规范（必读）
+│   ├── drawing_view_reviewer.md  # 三视图语义复核模板
 │   └── feature_refiner.md  # LLM 特征精化的 system/user 模板
 │
 ├── dxf_files/              # 输入目录，放待处理的 .dxf（不纳入 Git）
@@ -62,7 +63,8 @@ Outline + 尺寸 (W/D/H)   ← 优先读 DIMENSION 标注，回退用 bbox
 List[Feature]
    │  ▲
    │  │  llm_planner.py（可选，任何失败回退算法路径）
-   │  └─ LLMPlanner.refine_features()
+   │  ├─ LLMPlanner.review_views()     ← 视图命名/辅助线保守复核
+   │  └─ LLMPlanner.refine_features()  ← 特征复核，可证据补充 edge_chamfer
    │
    ▼  freecad_builder.py    ← 需要 freecadcmd 环境
 .FCStd 文件
@@ -155,7 +157,10 @@ freecadcmd -c "import sys; sys.path.insert(0,'/app'); from DXF_3D.run import mai
 | `hole`            | 圆形通孔，boolean cut        |
 | `edge_chamfer`    | 上下外轮廓边倒角/弧形过渡    |
 
-LLM 通过 `llm_planner.py` 精化此列表，返回相同结构的 JSON。
+LLM 通过 `llm_planner.py` 精化此列表，返回相同结构的 JSON。默认不得重写
+`extrude_profile` / `hole` / edges；唯一允许新增的是有 TOP 多边形轮廓、侧视 ARC
+等三视图证据支撑的 `edge_chamfer`。`llm_planner._validate_refined_features()` 会在
+代码层校验，校验失败则沿用算法草案。
 
 ---
 
@@ -166,6 +171,7 @@ LLM 通过 `llm_planner.py` 精化此列表，返回相同结构的 JSON。
 - 必须含 `## SYSTEM` 和 `## USER` 两个二级标题区块。
 - `USER` 中用 `{{ key }}` 占位符，运行时替换。
 - 可选 `## EXAMPLES`（few-shot），用 `--- input ---` / `--- output ---` 分隔。
+- 当前启用：`drawing_view_reviewer.md`、`feature_refiner.md`。
 - 加载函数：`llm_planner.load_prompt(name)` —— `name` 是文件名去掉 `.md`。
 
 ---
@@ -196,6 +202,8 @@ LLM 通过 `llm_planner.py` 精化此列表，返回相同结构的 JSON。
 - **FreeCAD 延迟导入**：所有 `import FreeCAD` / `import Part` / `import Mesh` 只在函数内部出现，确保模块在普通 Python 环境可被 `import`（用于测试/调试）。
 - **LLM 失败永不中断**：`llm_planner.py` 的所有异常必须捕获，回退算法路径，写 `run.log`。
 - **Prompt 只改 `prompts/` 目录**：不在 Python 代码里拼接 system/user 字符串。
+- **LLM 泛化必须受校验**：新增特征只允许进入当前 builder 支持的类型；目前仅允许
+   在三视图证据充分时补充 `edge_chamfer`，不能让 LLM 直接输出 unsupported 特征。
 - **`*Dn` 匿名块不引入几何**：`dxf_loader.py` 中用 `re.compile(r"^\*D\d+$")` 正则跳过所有维度装饰块（引线、箭头、标注文字）。维度数值从 `DIMENSION` 实体的 `dim_measurement` 字段读取。**不得删除此过滤**，否则标注实体会污染视图聚类和轮廓提取。
 
 ---

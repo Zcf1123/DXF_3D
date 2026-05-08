@@ -303,14 +303,20 @@ def _make_hole_cylinder(params: Dict):
     length = float(params["through_length"])
 
     if axis == "Z":
-        return Part.makeCylinder(r, length,
-                                 App.Vector(x, y, z), App.Vector(0, 0, 1))
+        cyl = Part.makeCylinder(r, length,
+                                App.Vector(x, y, z), App.Vector(0, 0, 1))
+        cyl.rotate(App.Vector(x, y, z), App.Vector(0, 0, 1), 180.0)
+        return cyl
     if axis == "Y":
-        return Part.makeCylinder(r, length,
-                                 App.Vector(x, y, z), App.Vector(0, 1, 0))
+        cyl = Part.makeCylinder(r, length,
+                                App.Vector(x, y, z), App.Vector(0, 1, 0))
+        cyl.rotate(App.Vector(x, y, z), App.Vector(0, 1, 0), 180.0)
+        return cyl
     if axis == "X":
-        return Part.makeCylinder(r, length,
-                                 App.Vector(x, y, z), App.Vector(1, 0, 0))
+        cyl = Part.makeCylinder(r, length,
+                                App.Vector(x, y, z), App.Vector(1, 0, 0))
+        cyl.rotate(App.Vector(x, y, z), App.Vector(1, 0, 0), 180.0)
+        return cyl
     return None
 
 
@@ -410,6 +416,11 @@ def _apply_revolved_arc_envelope(solid, params: Dict):
     )
     if not envelope.Solids and envelope.Shells:
         envelope = Part.Solid(envelope.Shells[0])
+    envelope.rotate(
+        App.Vector(0.0, 0.0, 0.0),
+        App.Vector(0.0, 0.0, 1.0),
+        30.0,
+    )
     envelope.translate(App.Vector(center_x, center_y, float(bb.ZMin)))
     result = solid.common(envelope)
     return result.removeSplitter()

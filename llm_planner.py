@@ -179,10 +179,13 @@ class LLMPlanner:
                and isinstance(f["params"], dict):
                 cleaned.append({"kind": f["kind"], "params": f["params"]})
 
-        ok, reason = _validate_refined_features(draft_features, cleaned)
+        ok, reason = _validate_refined_features(
+            draft_features, cleaned, view_geometry or []
+        )
         if not ok:
             return None, f"LLM 结果未通过程序校验：{reason}；沿用算法草案"
         cleaned = _remove_duplicate_hole_features(cleaned)
+        cleaned = _order_features_for_builder(cleaned)
         return cleaned, f"LLM 复核完成（{self.model}）：返回 {len(cleaned)} 个特征"
 
     def review_views(self, view_summary: List[Dict[str, Any]]) \
@@ -295,13 +298,14 @@ def _validate_view_review(
 def _validate_refined_features(
     draft: List[Dict[str, Any]],
     refined: List[Dict[str, Any]],
+    view_geometry: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[bool, str]:
     """Validate that the LLM only made safe, minimal edits.
 
-    The prompt tells the model not to delete holes, not to rewrite the chosen
-    extrusion profile, and not to invent new features.  This function enforces
-    those constraints in code so a bad completion cannot silently degrade the
-    final model.
+    The prompt tells the model not to delete holes or rewrite the chosen
+    extrusion profile. It may add one edge_chamfer only when the view geometry
+    contains strong cross-view evidence, and this function enforces that in
+    code so a bad completion cannot silently degrade the final model.
     """
     for item in refined:
         kind = item.get("kind")
@@ -340,13 +344,85 @@ def _validate_refined_features(
 
     draft_chamfers = [f for f in draft if f.get("kind") == "edge_chamfer"]
     refined_chamfers = [f for f in refined if f.get("kind") == "edge_chamfer"]
-    if len(draft_chamfers) != len(refined_chamfers):
+    if len(refined_chamfers) < len(draft_chamfers):
         return False, "edge_chamfer feature count changed"
-    for before, after in zip(draft_chamfers, refined_chamfers):
+    if len(refined_chamfers) > len(draft_chamfers) + 1:
+        return False, "too many edge_chamfer features were added"
+    for before, after in zip(draft_chamfers, refined_chamfers[:len(draft_chamfers)]):
         if before.get("params") != after.get("params"):
             return False, "edge_chamfer params changed"
+    if len(refined_chamfers) > len(draft_chamfers):
+        added = refined_chamfers[-1]
+        if not _edge_chamfer_has_view_evidence(draft, added, view_geometry or []):
+            return False, "added edge_chamfer lacks view evidence"
 
     return True, "ok"
+
+
+def _edge_chamfer_has_view_evidence(
+    draft: List[Dict[str, Any]],
+    feature: Dict[str, Any],
+    view_geometry: List[Dict[str, Any]],
+) -> bool:
+    params = feature.get("params", {})
+    if params.get("scope") != "outer_z_edges":
+        return False
+    profile = params.get("profile")
+    if profile not in {"arc_revolve", "arc", "line"}:
+        return False
+    try:
+        distance = float(params.get("distance"))
+    except Exception:
+        return False
+    if distance <= 0:
+        return False
+    if profile == "arc_revolve":
+        try:
+            if float(params.get("top_radius")) <= 0:
+                return False
+        except Exception:
+            return False
+
+    base = next(
+        (f for f in draft if f.get("kind") == "extrude_profile"),
+        None,
+    )
+    base_params = base.get("params", {}) if isinstance(base, dict) else {}
+    if base_params.get("source_view") != "top" or base_params.get("plane") != "XY":
+        return False
+    if len(base_params.get("edges", [])) < 5:
+        return False
+
+    by_name = {
+        str(v.get("input_name")): v for v in view_geometry
+        if isinstance(v, dict) and v.get("input_name") is not None
+    }
+    top_entities = by_name.get("top", {}).get("entities", [])
+    if not top_entities:
+        return False
+
+    side_entities = []
+    for name in ("front", "right"):
+        side_entities.extend(by_name.get(name, {}).get("entities", []))
+    if not any(e.get("kind") == "ARC" for e in side_entities):
+        return False
+    if profile == "arc_revolve":
+        top_circles = [e for e in top_entities if e.get("kind") == "CIRCLE"]
+        radii = []
+        for circle in top_circles:
+            try:
+                radii.append(float(circle.get("radius")))
+            except Exception:
+                pass
+        if len(radii) < 2:
+            return False
+        try:
+            top_radius = float(params.get("top_radius"))
+        except Exception:
+            return False
+        if abs(top_radius - max(radii)) > max(0.2, max(radii) * 0.03):
+            return False
+    return True
 
 
 def _validate_base_feature(
@@ -389,6 +465,16 @@ def _remove_duplicate_hole_features(
         seen_holes.append(feature)
         out.append(feature)
     return out
+
+
+def _order_features_for_builder(
+    features: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    order = {"extrude_profile": 0, "base_block": 0, "hole": 1, "edge_chamfer": 2}
+    return sorted(
+        features,
+        key=lambda feature: order.get(str(feature.get("kind")), 99),
+    )
 
 
 def _same_hole(a: Dict[str, Any], b: Dict[str, Any], tol: float = 0.1) -> bool:

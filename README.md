@@ -127,7 +127,9 @@ Status      : OK
    - TOP 视图中的圆 → 孔轴 = Z
    - FRONT 视图中的圆 → 孔轴 = Y
    - RIGHT 视图中的圆 → 孔轴 = X
-4. 坐标单位默认按毫米处理，**不做单位识别 / 缩放**。
+4. 对多边形棱柱类零件，FRONT/RIGHT 中真实 ARC + TOP 中相切大圆可识别为
+   上下外轮廓圆弧端面倒角（`edge_chamfer.profile="arc_revolve"`）。
+5. 坐标单位默认按毫米处理，**不做单位识别 / 缩放**。
 
 ### 3. 图层（推荐，可选）
 
@@ -144,7 +146,8 @@ Status      : OK
 
 - 多于三视图、剖视图、局部放大图、辅助视图、断面视图。
 - 仅靠 RIGHT/TOP 推断的斜面。
-- 螺纹 / 圆角 / 倒角。
+- 螺纹、沉孔、阵列孔、自由曲面和复杂圆角。
+- 没有 TOP 多边形轮廓 + 侧视 ARC 证据的任意倒角/圆角。
 - 缺少明显视图布局的对称图。
 
 违反 §1（布局）或 §2（闭合轮廓）时，流水线会拒绝建模并把错误写入
@@ -186,7 +189,7 @@ dxf_loader → view_classifier → projection_mapper → feature_inference
 | `projection_mapper.py`  | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
 | `geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
 | `feature_inference.py`  | 推断拉伸轮廓、孔和可确定的边倒角，输出 `Feature` 列表 |
-| `llm_planner.py`        | 读 `config.json` 调用 OpenAI 兼容 API，结合三视图实体摘要按 `prompts/feature_refiner.md` 复核草案 |
+| `llm_planner.py`        | 读 `config.json` 调用 OpenAI 兼容 API，复核视图语义和特征草案；证据充分时可补充受支持的 `edge_chamfer` |
 | `freecad_builder.py`    | 按特征列表用 FreeCAD `Part` 建模并保存 `.FCStd` |
 | `exporters.py`          | STEP / OBJ / PNG / 总览 PNG / model.json / 可复现 Python |
 | `run.py`                | CLI 编排器 |
@@ -205,11 +208,21 @@ dxf_loader → view_classifier → projection_mapper → feature_inference
 }
 ```
 
-LLM 任何失败（缺 key、网络中断、JSON 解析错误）都不会中断流水线，会自动
-回退到纯算法路径，原因写入 `run.log`。
+LLM 任何失败（缺 key、网络中断、JSON 解析错误、校验不通过）都不会中断流水线，
+会自动回退到纯算法路径，原因写入 `run.log`。
+
+LLM 当前分两步介入：
+
+1. `drawing_view_reviewer.md`：复核 FRONT / TOP / RIGHT 视图命名，保守删除明显
+   辅助线、标注线或跨视图线。
+2. `feature_refiner.md`：复核 `features_draft.json`。默认不能重写主体轮廓、孔、
+   edges 或尺寸；唯一允许新增的是有 TOP 多边形 + 侧视 ARC 等证据支撑的
+   `edge_chamfer`，用于提升六角螺母、带圆弧端面过渡的多边形棱柱等相似形状
+   的泛化能力。
 
 prompt 文件遵循 [prompts/PROMPT_SPEC.md](prompts/PROMPT_SPEC.md) 的二级
-标题分块约定，目前唯一启用的 prompt 是
+标题分块约定，目前启用的 prompt 是
+[prompts/drawing_view_reviewer.md](prompts/drawing_view_reviewer.md) 和
 [prompts/feature_refiner.md](prompts/feature_refiner.md)。
 
 ---
@@ -227,6 +240,7 @@ DXF_3D/
 ├── outputs/                  <—— 每次运行生成 <YYYYMMDD>_<HHMMSS>_<base>/
 ├── prompts/
 │   ├── PROMPT_SPEC.md        prompt 文件分块规范
+│   ├── drawing_view_reviewer.md  三视图语义复核 prompt
 │   └── feature_refiner.md    特征复核 prompt（中文，详细）
 ├── dxf_loader.py
 ├── view_classifier.py

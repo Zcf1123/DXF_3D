@@ -250,6 +250,8 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         else:
             log.info("视图语义复核  : 沿用算法分类结果")
 
+        feature_view_summary = _view_semantic_summary(bundles)
+
         view_bboxes = {b.name: list(b.bbox) for b in bundles
                        if not b.name.startswith("unknown_")}
         with open(os.path.join(run_dir, "views.json"), "w",
@@ -319,7 +321,7 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         if llm.enabled:
             log.info("调用模型      : %s", llm.model)
             refined, msg = llm.refine_features(
-                view_bboxes, draft_dicts, view_review_summary
+                view_bboxes, draft_dicts, feature_view_summary
             )
             log.info("LLM 返回      : %s", msg)
             if refined is not None:
