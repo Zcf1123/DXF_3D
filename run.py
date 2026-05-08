@@ -46,6 +46,104 @@ DXF_FILES_DIR = os.path.join(HERE, "dxf_files")
 OUTPUTS_DIR = os.path.join(HERE, "outputs")
 
 
+def _round_num(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _entity_semantic_summary(entity, idx: int) -> Dict[str, Any]:
+    b = entity.bbox()
+    item: Dict[str, Any] = {
+        "id": idx,
+        "kind": entity.kind,
+        "layer": entity.layer,
+        "linetype": entity.linetype,
+        "linetype_desc": entity.extra.get("linetype_desc"),
+        "bbox": [_round_num(v) for v in b] if b else None,
+    }
+    if entity.kind == "LINE" and len(entity.points) >= 2:
+        item["points"] = [[_round_num(p[0]), _round_num(p[1])]
+                          for p in entity.points[:2]]
+    elif entity.kind == "CIRCLE" and entity.center is not None:
+        item["center"] = [_round_num(entity.center[0]), _round_num(entity.center[1])]
+        item["radius"] = _round_num(entity.radius or 0.0)
+    elif entity.kind == "ARC" and entity.center is not None:
+        item["center"] = [_round_num(entity.center[0]), _round_num(entity.center[1])]
+        item["radius"] = _round_num(entity.radius or 0.0)
+        item["start_angle"] = _round_num(entity.start_angle or 0.0)
+        item["end_angle"] = _round_num(entity.end_angle or 0.0)
+    return item
+
+
+def _view_semantic_summary(bundles) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for bundle in bundles:
+        out.append({
+            "input_name": bundle.name,
+            "bbox": [_round_num(v) for v in bundle.bbox],
+            "entity_count": len(bundle.entities),
+            "entities": [
+                _entity_semantic_summary(entity, idx)
+                for idx, entity in enumerate(bundle.entities)
+            ],
+            "annotations": [
+                {
+                    "kind": ann.kind,
+                    "bbox": [_round_num(v) for v in ann.bbox()] if ann.bbox() else None,
+                    "dim_text": ann.dim_text,
+                    "dim_measurement": ann.dim_measurement,
+                }
+                for ann in bundle.annotations
+            ],
+        })
+    return out
+
+
+def _apply_view_review(bundles, review: Dict[str, Any]) -> Dict[str, Any]:
+    by_name = {bundle.name: bundle for bundle in bundles}
+    applied: Dict[str, Any] = {"views": []}
+    for item in review.get("views", []):
+        input_name = item["input_name"]
+        bundle = by_name.get(input_name)
+        if bundle is None:
+            continue
+        before_count = len(bundle.entities)
+        keep_ids = item.get("keep_entity_ids")
+        remove_ids = set(item.get("remove_entity_ids", []))
+        if keep_ids is not None:
+            keep_set = set(keep_ids)
+        else:
+            keep_set = set(range(before_count)) - remove_ids
+        bundle.entities = [
+            entity for idx, entity in enumerate(bundle.entities)
+            if idx in keep_set and idx not in remove_ids
+        ]
+        if bundle.entities:
+            xs0: List[float] = []
+            ys0: List[float] = []
+            xs1: List[float] = []
+            ys1: List[float] = []
+            for entity in bundle.entities:
+                b = entity.bbox()
+                if b is None:
+                    continue
+                xs0.append(b[0]); ys0.append(b[1]); xs1.append(b[2]); ys1.append(b[3])
+            if xs0:
+                bundle.bbox = (min(xs0), min(ys0), max(xs1), max(ys1))
+        old_name = bundle.name
+        bundle.name = item["canonical_name"]
+        removed_ids = (set(range(before_count)) - keep_set) | remove_ids
+        applied["views"].append({
+            "input_name": input_name,
+            "old_name": old_name,
+            "canonical_name": bundle.name,
+            "before_count": before_count,
+            "after_count": len(bundle.entities),
+            "removed_ids": sorted(removed_ids),
+            "reason": item.get("reason", ""),
+        })
+    return applied
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -126,6 +224,32 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
             log.info("视图 %-18s bbox=(%.3f, %.3f) — (%.3f, %.3f)  实体数=%d",
                      b.name, b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3],
                      len(b.entities))
+        with open(os.path.join(run_dir, "views_algorithm.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump([b.to_dict() for b in bundles],
+                      f, indent=2, ensure_ascii=False)
+
+        banner("阶段 2.5 ─ 工程图语义复核（LLM，可选）")
+        view_review_summary = _view_semantic_summary(bundles)
+        with open(os.path.join(run_dir, "views_semantic_input.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(view_review_summary, f, indent=2, ensure_ascii=False)
+        review, review_msg = llm.review_views(view_review_summary)
+        log.info("视图语义复核  : %s", review_msg)
+        if review is not None:
+            applied_review = _apply_view_review(bundles, review)
+            with open(os.path.join(run_dir, "views_semantic.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"raw": review, "applied": applied_review},
+                          f, indent=2, ensure_ascii=False)
+            for item in applied_review["views"]:
+                log.info("  · %-8s -> %-8s 实体 %d -> %d，删除 %d 条：%s",
+                         item["old_name"], item["canonical_name"],
+                         item["before_count"], item["after_count"],
+                         len(item["removed_ids"]), item.get("reason", ""))
+        else:
+            log.info("视图语义复核  : 沿用算法分类结果")
+
         view_bboxes = {b.name: list(b.bbox) for b in bundles
                        if not b.name.startswith("unknown_")}
         with open(os.path.join(run_dir, "views.json"), "w",
@@ -180,6 +304,10 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
                 log.info("  · 通孔: axis=%s r=%.3f pos=%s 长度=%.3f (来自 %s)",
                          p.get("axis"), p.get("radius", 0), p.get("position"),
                          p.get("through_length", 0), p.get("source_view"))
+            elif f.kind == "edge_chamfer":
+                log.info("  · 边倒角/圆弧过渡: profile=%s distance=%.3f scope=%s top_radius=%s",
+                         p.get("profile", "line"), p.get("distance", 0),
+                         p.get("scope"), p.get("top_radius"))
         with open(os.path.join(run_dir, "features_draft.json"), "w",
                   encoding="utf-8") as f:
             json.dump(draft_dicts, f, indent=2, ensure_ascii=False)
@@ -190,7 +318,9 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         final_dicts = draft_dicts
         if llm.enabled:
             log.info("调用模型      : %s", llm.model)
-            refined, msg = llm.refine_features(view_bboxes, draft_dicts)
+            refined, msg = llm.refine_features(
+                view_bboxes, draft_dicts, view_review_summary
+            )
             log.info("LLM 返回      : %s", msg)
             if refined is not None:
                 final_dicts = refined
@@ -229,12 +359,16 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         banner("阶段 6 ─ 导出附加产物")
         from .exporters import (
             export_step, export_obj, export_preview_png,
+            export_normalized_views_png,
+            export_model_views_png,
             export_iso_overview_png, export_model_json,
             export_generated_python,
         )
         step_path = os.path.join(run_dir, f"{base}.step")
         obj_path = os.path.join(run_dir, f"{base}.obj")
         png_path = os.path.join(run_dir, f"{base}.png")
+        normalized_png = os.path.join(run_dir, f"{base}_views_normalized.png")
+        model_views_png = os.path.join(run_dir, f"{base}_model_views.png")
         overview_png = os.path.join(run_dir, f"{base}_overview.png")
         json_path = os.path.join(run_dir, "model.json")
         py_path = os.path.join(run_dir, "generated_model.py")
@@ -244,6 +378,10 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
             ("OBJ",             lambda: export_obj(fcstd_path, obj_path)),
             ("三视图预览 PNG",  lambda: export_preview_png(
                 bundles, png_path)),
+            ("归一化三视图 PNG", lambda: export_normalized_views_png(
+                projected, normalized_png)),
+            ("模型三视图 PNG",  lambda: export_model_views_png(
+                fcstd_path, model_views_png)),
             ("3D 总览 PNG",      lambda: export_iso_overview_png(
                 fcstd_path, overview_png)),
             ("model.json",      lambda: export_model_json(
@@ -266,6 +404,8 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         log.info("  STEP             : %s", step_path)
         log.info("  OBJ              : %s", obj_path)
         log.info("  三视图预览 PNG    : %s", png_path)
+        log.info("  归一化三视图 PNG  : %s", normalized_png)
+        log.info("  模型三视图 PNG    : %s", model_views_png)
         log.info("  3D 总览 PNG       : %s", overview_png)
         log.info("  特征 JSON         : %s",
                  os.path.join(run_dir, "features.json"))

@@ -185,8 +185,8 @@ dxf_loader → view_classifier → projection_mapper → feature_inference
 | `view_classifier.py`    | 按象限把实体分到 FRONT/TOP/RIGHT 三个 `ViewBundle` |
 | `projection_mapper.py`  | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
 | `geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
-| `feature_inference.py`  | 选最复杂视图作为拉伸轮廓、其余视图贡献孔，输出 `Feature` 列表 |
-| `llm_planner.py`        | 读 `config.json` 调用 OpenAI 兼容 API，按 `prompts/feature_refiner.md` 复核草案 |
+| `feature_inference.py`  | 推断拉伸轮廓、孔和可确定的边倒角，输出 `Feature` 列表 |
+| `llm_planner.py`        | 读 `config.json` 调用 OpenAI 兼容 API，结合三视图实体摘要按 `prompts/feature_refiner.md` 复核草案 |
 | `freecad_builder.py`    | 按特征列表用 FreeCAD `Part` 建模并保存 `.FCStd` |
 | `exporters.py`          | STEP / OBJ / PNG / 总览 PNG / model.json / 可复现 Python |
 | `run.py`                | CLI 编排器 |

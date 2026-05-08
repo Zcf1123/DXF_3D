@@ -150,9 +150,10 @@ freecadcmd -c "import sys; sys.path.insert(0,'/app'); from DXF_3D.run import mai
 
 | kind              | 含义                         |
 |-------------------|------------------------------|
-| `extrude_profile` | 主体轮廓拉伸，选最复杂视图   |
+| `extrude_profile` | 主体轮廓拉伸，选最合适视图   |
 | `base_block`      | 无闭合轮廓时的包围盒方块兜底 |
 | `hole`            | 圆形通孔，boolean cut        |
+| `edge_chamfer`    | 上下外轮廓边倒角/弧形过渡    |
 
 LLM 通过 `llm_planner.py` 精化此列表，返回相同结构的 JSON。
 

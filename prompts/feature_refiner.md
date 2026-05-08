@@ -19,13 +19,14 @@ DXF 中三视图按本项目固定布局摆放：
 
 零件三个尺寸符号约定：宽 W (沿 X)、深 D (沿 Y)、高 H (沿 Z)。
 
-【特征类型（仅这三种，多余字段一律忽略）】
+【特征类型（仅这四种，多余字段一律忽略）】
 
 | kind              | params                                                                                  |
 | ----------------- | --------------------------------------------------------------------------------------- |
 | `extrude_profile` | `plane ∈ {"XY","XZ","YZ"}`, `depth: float`, `source_view`, `edges: list`               |
 | `base_block`      | `width, depth, height, origin=[x,y,z]`                                                 |
 | `hole`            | `radius, axis ∈ {"X","Y","Z"}, position=[x,y,z], through_length, source_view`          |
+| `edge_chamfer`    | `distance: float`, `profile ∈ {"arc_revolve","arc","line"}`, `scope="outer_z_edges"`, `source_views: list`，可选 `top_radius` |
 
 【source_view ↔ plane ↔ 拉伸轴 严格对照表】
 
@@ -46,6 +47,16 @@ DXF 中三视图按本项目固定布局摆放：
   · 阶梯轴侧面：FRONT 是台阶外形 → `plane=XZ, source_view=front, depth=D`
   · L 形支座侧面：RIGHT 是 L 形 → `plane=YZ, source_view=right, depth=W`
 
+【六角螺母 / 圆弧端面倒角识别】
+
+当三视图同时出现以下模式时，这是标准六角螺母的 R 形端面倒角/圆弧包络，
+不是普通直线倒角，也不是额外通孔：
+
+- TOP：六边形外轮廓 + 中心小圆孔 + 与六边形相切/近似相切的大同心圆。
+- FRONT/RIGHT：上下边界包含 ARC，且短竖线从端面内缩一段距离。
+- 大同心圆应作为 `edge_chamfer.top_radius` 语义，不应作为 `hole`。
+- 侧视 ARC 支持 `edge_chamfer.profile="arc_revolve"` 或 `"arc"`，不得退化成 `"line"`。
+
 【硬约束（违反任何一条都视为错误输出）】
 
 1. **严禁改 `plane` 或 `source_view`**：保持算法的判断；不得把
@@ -56,6 +67,9 @@ DXF 中三视图按本项目固定布局摆放：
    right→X）。如果草案里有冲突，以 source_view 为准修正 axis。
 4. **不得创造草案中没有的特征**：不要凭空添加圆角、倒角、肋板、阵列孔
    或螺纹。三视图里没画的，模型里就没有。
+   若草案已经包含 `edge_chamfer`，必须原样保留，不得删除或改参数。
+   六角螺母这类图中，TOP 视图的大同心圆、FRONT/RIGHT 的上下圆弧通常表示
+   R 形端面倒角包络；若草案已有 `profile="arc_revolve"`，必须保留。
 5. **不得删除草案中已有的孔**，除非它满足"重复孔"判据：
    两个孔的 axis 相同 **且** position 三个分量分别相差 ≤ 0.1 **且**
    radius 相差 ≤ 0.1，则保留其中一个。
@@ -71,6 +85,7 @@ DXF 中三视图按本项目固定布局摆放：
 - [ ] 我没有改动任何 `extrude_profile` 的 `plane`、`source_view`、`edges`。
 - [ ] 每个 hole 的 axis 与它的 source_view 一一对应。
 - [ ] 没有添加草案里不存在的几何特征。
+- [ ] 如果草案包含 edge_chamfer，我已原样保留。
 - [ ] 没有把同一个孔重复输出多次。
 - [ ] depth / radius 与 view_bboxes 数值兼容（差异 < 10%）。
 - [ ] 输出严格是 `{"features": [...]}` 的纯 JSON，没有任何前后缀。
@@ -79,6 +94,9 @@ DXF 中三视图按本项目固定布局摆放：
 
 视图 bbox（DXF 坐标系，单位 mm）：
 {{ view_bboxes }}
+
+三视图实体摘要（含 LINE/CIRCLE/ARC 的 bbox、圆心、半径和角度）：
+{{ view_geometry }}
 
 算法生成的初始特征草案（请审阅而不是重写）：
 {{ draft_features }}

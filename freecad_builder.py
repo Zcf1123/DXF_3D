@@ -73,6 +73,15 @@ def _direct_build(features: List[Feature], out_dir: str,
                     )
             else:
                 warnings.append(f"hole cylinder could not be created: {f.params}")
+        elif f.kind == "edge_chamfer" and solid is not None:
+            try:
+                chamfered = _apply_edge_chamfer(solid, f.params)
+                if chamfered is not None:
+                    solid = chamfered
+                else:
+                    warnings.append(f"no chamfer edges matched: {f.params}")
+            except Exception as exc:
+                warnings.append(f"edge chamfer failed for {f.params}: {exc}")
 
     if solid is None:
         raise RuntimeError("no solid was produced from inferred features")
@@ -303,3 +312,104 @@ def _make_hole_cylinder(params: Dict):
         return Part.makeCylinder(r, length,
                                  App.Vector(x, y, z), App.Vector(1, 0, 0))
     return None
+
+
+def _apply_edge_chamfer(solid, params: Dict):
+    distance = float(params.get("distance", 0.0) or 0.0)
+    if distance <= 0:
+        return None
+    scope = params.get("scope", "outer_z_edges")
+    if scope != "outer_z_edges":
+        return None
+
+    if params.get("profile") == "arc_revolve":
+        return _apply_revolved_arc_envelope(solid, params)
+
+    bb = solid.BoundBox
+    z_min = float(bb.ZMin)
+    z_max = float(bb.ZMax)
+    scale = max(float(bb.XLength), float(bb.YLength), float(bb.ZLength), 1.0)
+    tol = max(scale * 1e-7, 1e-6)
+    profile = params.get("profile", "line")
+
+    edges = []
+    for edge in solid.Edges:
+        edge_bb = edge.BoundBox
+        same_end_face = (
+            abs(float(edge_bb.ZMin) - z_min) <= tol
+            and abs(float(edge_bb.ZMax) - z_min) <= tol
+        ) or (
+            abs(float(edge_bb.ZMin) - z_max) <= tol
+            and abs(float(edge_bb.ZMax) - z_max) <= tol
+        )
+        if not same_end_face:
+            continue
+        if float(edge.Length) <= tol:
+            continue
+        if profile == "arc":
+            edges.append(edge)
+            continue
+        if len(edge.Vertexes) != 2:
+            continue
+        p0 = edge.Vertexes[0].Point
+        p1 = edge.Vertexes[1].Point
+        chord = p0.distanceToPoint(p1)
+        if chord > tol and abs(float(edge.Length) - chord) <= max(tol, chord * 1e-6):
+            edges.append(edge)
+
+    if not edges:
+        return None
+    if profile == "arc":
+        return solid.makeFillet(distance, edges)
+    return solid.makeChamfer(distance, edges)
+
+
+def _apply_revolved_arc_envelope(solid, params: Dict):
+    import FreeCAD as App
+    import Part
+
+    distance = float(params.get("distance", 0.0) or 0.0)
+    top_radius = float(params.get("top_radius", 0.0) or 0.0)
+    if distance <= 0 or top_radius <= 0:
+        return None
+
+    bb = solid.BoundBox
+    height = float(bb.ZLength)
+    if height <= 0 or distance >= height * 0.5:
+        return None
+    center_x = (float(bb.XMin) + float(bb.XMax)) * 0.5
+    center_y = (float(bb.YMin) + float(bb.YMax)) * 0.5
+    outer_radius = max(float(bb.XLength), float(bb.YLength)) * 0.5
+    if top_radius >= outer_radius:
+        return None
+
+    z0 = 0.0
+    z1 = distance
+    z2 = height - distance
+    z3 = height
+    r0 = 0.0
+    r1 = top_radius
+    r2 = outer_radius
+
+    bottom_mid = App.Vector((r1 + r2) * 0.5, 0.0, z1 * 0.35)
+    top_mid = App.Vector((r1 + r2) * 0.5, 0.0, z3 - z1 * 0.35)
+
+    edges = [
+        Part.LineSegment(App.Vector(r0, 0.0, z0), App.Vector(r1, 0.0, z0)).toShape(),
+        Part.Arc(App.Vector(r1, 0.0, z0), bottom_mid, App.Vector(r2, 0.0, z1)).toShape(),
+        Part.LineSegment(App.Vector(r2, 0.0, z1), App.Vector(r2, 0.0, z2)).toShape(),
+        Part.Arc(App.Vector(r2, 0.0, z2), top_mid, App.Vector(r1, 0.0, z3)).toShape(),
+        Part.LineSegment(App.Vector(r1, 0.0, z3), App.Vector(r0, 0.0, z3)).toShape(),
+        Part.LineSegment(App.Vector(r0, 0.0, z3), App.Vector(r0, 0.0, z0)).toShape(),
+    ]
+    face = Part.Face(Part.Wire(edges))
+    envelope = face.revolve(
+        App.Vector(0.0, 0.0, 0.0),
+        App.Vector(0.0, 0.0, 1.0),
+        360.0,
+    )
+    if not envelope.Solids and envelope.Shells:
+        envelope = Part.Solid(envelope.Shells[0])
+    envelope.translate(App.Vector(center_x, center_y, float(bb.ZMin)))
+    result = solid.common(envelope)
+    return result.removeSplitter()

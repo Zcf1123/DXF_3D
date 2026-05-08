@@ -70,7 +70,7 @@ def _translate_entity(e: DxfEntity, dx: float, dy: float) -> DxfEntity:
     if e.center is not None:
         new_center = (e.center[0] + dx, e.center[1] + dy)
     return DxfEntity(
-        kind=e.kind, layer=e.layer,
+        kind=e.kind, layer=e.layer, linetype=e.linetype,
         points=new_points,
         center=new_center,
         radius=e.radius,

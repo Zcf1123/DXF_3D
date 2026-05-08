@@ -32,6 +32,7 @@ class DxfEntity:
                                    # | "SPLINE" | "ELLIPSE" | "TEXT" | "MTEXT"
                                    # | "DIMENSION" | "INSERT" | "HATCH"
     layer: str = "0"
+    linetype: str = ""             # group code 6; "" means ByLayer
     points: List[Tuple[float, float]] = field(default_factory=list)
     center: Optional[Tuple[float, float]] = None
     radius: Optional[float] = None
@@ -86,6 +87,54 @@ def _try_import_ezdxf():  # kept for back-compat callers, always returns None
     return None
 
 
+def _parse_ltype_descriptions(
+    tables_pairs: List[Tuple[str, str]],
+) -> Dict[str, str]:
+    """Parse the TABLES section and return {LINETYPE_NAME_UPPER: description}.
+
+    DXF LTYPE records store a human-readable description (group code 3) that
+    often reveals intent even for custom names, e.g.::
+
+        2  JIS_02_1.2
+        3  HIDDEN01.25  _ _ _ _ _ _ _ _ _
+
+    This description is used as a fallback when the linetype *name* does not
+    match any of the standard tokens in ``_HIDDEN_LINETYPE_TOKENS``.
+    """
+    result: Dict[str, str] = {}
+    state = "idle"   # idle | in_ltype_table | in_ltype_record
+    cur_name: Optional[str] = None
+    cur_desc: Optional[str] = None
+
+    def _save() -> None:
+        if cur_name:
+            result[cur_name.upper()] = cur_desc or ""
+
+    for code, value in tables_pairs:
+        if code == "0":
+            if value == "TABLE":
+                state = "idle"
+            elif value == "ENDTAB":
+                if state == "in_ltype_record":
+                    _save()
+                state = "idle"
+                cur_name = cur_desc = None
+            elif value == "LTYPE" and state in ("in_ltype_table", "in_ltype_record"):
+                if state == "in_ltype_record":
+                    _save()
+                state = "in_ltype_record"
+                cur_name = cur_desc = None
+        elif code == "2":
+            if state == "idle" and value == "LTYPE":
+                state = "in_ltype_table"
+            elif state == "in_ltype_record" and cur_name is None:
+                cur_name = value
+        elif code == "3" and state == "in_ltype_record":
+            cur_desc = value
+
+    return result
+
+
 def load_dxf(path: str) -> Tuple[List[DxfEntity], Dict[str, Any]]:
     """Load a DXF file and return (entities, metadata).
 
@@ -96,6 +145,7 @@ def load_dxf(path: str) -> Tuple[List[DxfEntity], Dict[str, Any]]:
       - units: $INSUNITS code as string if found
       - bbox: overall bounding box (xmin, ymin, xmax, ymax) or None
       - entity_count: number of returned entities
+      - linetype_descriptions: {NAME_UPPER: description} from LTYPE table
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
@@ -103,6 +153,7 @@ def load_dxf(path: str) -> Tuple[List[DxfEntity], Dict[str, Any]]:
     pairs = _read_pairs(path)
     sections = _split_sections(pairs)
     header_units = _header_value(sections.get("HEADER", []), "$INSUNITS")
+    ltype_descs = _parse_ltype_descriptions(sections.get("TABLES", []))
 
     blocks = _parse_blocks(sections.get("BLOCKS", []))
 
@@ -136,6 +187,14 @@ def load_dxf(path: str) -> Tuple[List[DxfEntity], Dict[str, Any]]:
 
     entities = [e for e in (_to_entity(k, p) for k, p in flat) if e is not None]
 
+    # Enrich entities: attach the LTYPE description so consumers can detect
+    # custom hidden-line types (e.g. "JIS_02_1.2" whose description is
+    # "HIDDEN01.25  _ _ _") without hard-coding every vendor name.
+    for e in entities:
+        lt_upper = (e.linetype or "").upper()
+        if lt_upper and lt_upper in ltype_descs:
+            e.extra["linetype_desc"] = ltype_descs[lt_upper]
+
     layers = sorted({e.layer for e in entities})
     bbox = _overall_bbox(entities)
 
@@ -146,6 +205,7 @@ def load_dxf(path: str) -> Tuple[List[DxfEntity], Dict[str, Any]]:
         "units": header_units,
         "bbox": bbox,
         "entity_count": len(entities),
+        "linetype_descriptions": ltype_descs,
     }
     return entities, meta
 
@@ -415,9 +475,10 @@ def _f(d: Dict[str, Any], code: str, default: float = 0.0) -> float:
 
 def _to_entity(kind: str, p: Dict[str, Any]) -> Optional[DxfEntity]:
     layer = str(p.get("8", "0") or "0")
+    linetype = str(p.get("6", "") or "")   # group code 6: explicit linetype, "" = ByLayer
     if kind == "LINE":
         return DxfEntity(
-            kind="LINE", layer=layer,
+            kind="LINE", layer=layer, linetype=linetype,
             points=[(_f(p, "10"), _f(p, "20")),
                     (_f(p, "11"), _f(p, "21"))],
         )
@@ -426,7 +487,7 @@ def _to_entity(kind: str, p: Dict[str, Any]) -> Optional[DxfEntity]:
         if r <= 0:
             return None
         return DxfEntity(
-            kind="CIRCLE", layer=layer,
+            kind="CIRCLE", layer=layer, linetype=linetype,
             center=(_f(p, "10"), _f(p, "20")), radius=r,
         )
     if kind == "ARC":
@@ -434,7 +495,7 @@ def _to_entity(kind: str, p: Dict[str, Any]) -> Optional[DxfEntity]:
         if r <= 0:
             return None
         return DxfEntity(
-            kind="ARC", layer=layer,
+            kind="ARC", layer=layer, linetype=linetype,
             center=(_f(p, "10"), _f(p, "20")), radius=r,
             start_angle=_f(p, "50"), end_angle=_f(p, "51"),
         )
@@ -442,12 +503,12 @@ def _to_entity(kind: str, p: Dict[str, Any]) -> Optional[DxfEntity]:
         pts = list(p.get("_points") or [])
         flag = int(_f(p, "70", 0.0))
         return DxfEntity(
-            kind=kind, layer=layer, points=pts,
+            kind=kind, layer=layer, linetype=linetype, points=pts,
             extra={"closed": bool(flag & 1)},
         )
     if kind == "ELLIPSE":
         return DxfEntity(
-            kind="ELLIPSE", layer=layer,
+            kind="ELLIPSE", layer=layer, linetype=linetype,
             center=(_f(p, "10"), _f(p, "20")),
             extra={
                 "major_axis": (_f(p, "11"), _f(p, "21")),
@@ -457,7 +518,7 @@ def _to_entity(kind: str, p: Dict[str, Any]) -> Optional[DxfEntity]:
             },
         )
     if kind == "SPLINE":
-        return DxfEntity(kind="SPLINE", layer=layer)
+        return DxfEntity(kind="SPLINE", layer=layer, linetype=linetype)
     if kind in ("TEXT", "MTEXT"):
         text = p.get("1", "")
         if not isinstance(text, str):

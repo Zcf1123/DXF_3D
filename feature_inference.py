@@ -13,6 +13,8 @@ Strategy:
        circle in TOP   view -> hole axis = Z
        circle in FRONT view -> hole axis = Y
        circle in RIGHT view -> hole axis = X
+  3. For prismatic polygon profiles, visible front/right arc offsets become
+      a top/bottom arc-profile edge treatment.
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ from .view_classifier import ViewBundle
 
 @dataclass
 class Feature:
-    kind: str   # "extrude_profile" | "base_block" | "hole"
+    kind: str   # "extrude_profile" | "base_block" | "hole" | "edge_chamfer"
     params: Dict = field(default_factory=dict)
 
     def to_dict(self):
@@ -63,11 +65,108 @@ def _outline_complexity(outline: Outline) -> int:
     return score
 
 
+def _looks_like_boundary_construction_circle(
+    circle: DxfEntity,
+    outline: Optional[Outline],
+) -> bool:
+    """Return True for circles that describe an outer tangent/reference line.
+
+    Some mechanical drawings include a circle tangent to a hexagon or other
+    polygon in the top view. It is useful drawing geometry, but treating it as
+    a through-hole destroys the model. Real holes should sit clearly inside the
+    material; a circle whose bbox touches opposite sides of the outline bbox is
+    a boundary construction circle for our feature purposes.
+    """
+    if outline is None or circle.center is None or circle.radius is None:
+        return False
+    min_x, min_y, max_x, max_y = outline.bbox
+    width = max_x - min_x
+    height = max_y - min_y
+    scale = max(width, height, float(circle.radius), 1.0)
+    tol = max(scale * 0.01, 1e-3)
+    cx, cy = circle.center
+    radius = float(circle.radius)
+    touches_x = abs((cx - radius) - min_x) <= tol and abs((cx + radius) - max_x) <= tol
+    touches_y = abs((cy - radius) - min_y) <= tol and abs((cy + radius) - max_y) <= tol
+    return touches_x or touches_y
+
+
+def _filter_hole_circles(
+    outline: Optional[Outline],
+    circles: List[DxfEntity],
+) -> List[DxfEntity]:
+    return [
+        circle for circle in circles
+        if not _looks_like_boundary_construction_circle(circle, outline)
+    ]
+
+
+def _boundary_construction_circles(
+    outline: Optional[Outline],
+    circles: List[DxfEntity],
+) -> List[DxfEntity]:
+    return [
+        circle for circle in circles
+        if _looks_like_boundary_construction_circle(circle, outline)
+    ]
+
+
+def _is_polygonal_prismatic_profile(outline: Optional[Outline]) -> bool:
+    if outline is None:
+        return False
+    if len(outline.edges) < 5:
+        return False
+    return all(edge.get("kind") == "LINE" for edge in outline.edges)
+
+
+def _infer_end_chamfer_distance(
+    projected: Dict[str, ProjectedView],
+    height: float,
+) -> Optional[float]:
+    """Infer top/bottom chamfer distance from FRONT/RIGHT side views.
+
+    In this nut drawing, the side views keep short vertical side segments
+    inset from z=0 and z=H and connect them to the end faces with arcs. The
+    inset gives a stable radius for a FreeCAD fillet on the horizontal outer
+    edges of the vertical prism.
+    """
+    if height <= 0:
+        return None
+    candidates: List[float] = []
+    for view_name in ("front", "right"):
+        pv = projected.get(view_name)
+        if pv is None:
+            continue
+        for entity in pv.entities:
+            if entity.kind != "LINE" or len(entity.points) < 2:
+                continue
+            for _x, z in entity.points[:2]:
+                z = float(z)
+                if 1e-6 < z < height * 0.45:
+                    candidates.append(z)
+                upper = height - z
+                if 1e-6 < upper < height * 0.45:
+                    candidates.append(upper)
+    if not candidates:
+        return None
+    distance = min(candidates)
+    if distance <= 0 or distance >= height * 0.45:
+        return None
+    return distance
+
+
+def _candidate_score(outline: Optional[Outline], holes: List[DxfEntity]) -> int:
+    score = _outline_complexity(outline)
+    if score <= 0:
+        return score
+    return score + 5 * len(holes)
+
+
 def _make_outline(pv: ProjectedView) -> Tuple[Optional[Outline], List[DxfEntity]]:
     bundle = ViewBundle(name=pv.name,
                         bbox=(0.0, 0.0, pv.width, pv.height),
                         entities=pv.entities)
-    return extract_outline_and_holes(bundle)
+    return extract_outline_and_holes(bundle, hidden_pred=_is_hidden_entity)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +180,40 @@ _HIDDEN_LAYER_TOKENS: frozenset = frozenset({
     "VERDECKT", "MASQUE", "NASCOSTA", "虚线",
 })
 
+# Standard AutoCAD linetype names (group code 6) that represent dashed/hidden lines.
+_HIDDEN_LINETYPE_TOKENS: frozenset = frozenset({
+    "HIDDEN", "HIDDEN2", "HIDDENX2",
+    "DASHED", "DASHED2", "DASHEDX2",
+    "DASH", "PHANTOM", "PHANTOM2", "PHANTOMX2",
+    "CENTER", "CENTER2", "CENTERX2",     # center lines sometimes mark holes
+    "ACAD_ISO02W100", "ACAD_ISO03W100",  # ISO dashed / dash-dot
+})
 
+
+def _is_hidden_entity(e: DxfEntity) -> bool:
+    """Return True if *e* carries hidden/dashed line style.
+
+    Checks (in order):
+    1. Entity-level linetype name (group code 6) against known tokens.
+    2. Linetype *description* from the LTYPE table (stored in
+       ``extra['linetype_desc']`` by the loader) — catches custom names
+       such as ``JIS_02_1.2`` whose description reads ``HIDDEN01.25  _ _``.
+    3. Layer name keywords — works when the author used named layers but
+       did not set per-entity linetypes.
+    """
+    lt = (e.linetype or "").upper()
+    if lt and lt not in ("BYLAYER", "BYBLOCK", "CONTINUOUS"):
+        if any(tok in lt for tok in _HIDDEN_LINETYPE_TOKENS):
+            return True
+        # Fallback: check the human-readable description from the LTYPE table.
+        desc = (e.extra.get("linetype_desc") or "").upper()
+        if desc and any(tok in desc for tok in _HIDDEN_LINETYPE_TOKENS):
+            return True
+    upper = e.layer.upper()
+    return any(tok in upper for tok in _HIDDEN_LAYER_TOKENS)
+
+
+# Keep old name as alias so any external callers still work.
 def _is_hidden_layer(layer: str) -> bool:
     upper = layer.upper()
     return any(tok in upper for tok in _HIDDEN_LAYER_TOKENS)
@@ -109,7 +241,7 @@ def _hidden_overlaps(
         False – hidden entities exist but none overlap
         None  – no hidden-layer entities at all (layer not used in this view)
     """
-    hidden = [e for e in pv.entities if _is_hidden_layer(e.layer)]
+    hidden = [e for e in pv.entities if _is_hidden_entity(e)]
     if not hidden:
         return None
     for e in hidden:
@@ -192,7 +324,12 @@ def infer_features(projected: Dict[str, ProjectedView],
         if pv is None:
             continue
         outline, holes = _make_outline(pv)
-        score = _outline_complexity(outline)
+        holes = _filter_hole_circles(outline, holes)
+        score = _candidate_score(outline, holes)
+        if view_name == "top" and holes and _is_polygonal_prismatic_profile(outline):
+            # Hex nuts and similar prismatic parts are best reconstructed by
+            # extruding the top-view polygon and cutting the true center hole.
+            score += 25
         candidates.append((score, view_name, outline, holes))
 
     chosen = None
@@ -208,9 +345,11 @@ def infer_features(projected: Dict[str, ProjectedView],
                 break
 
     profile_view: Optional[str] = None
+    profile_outline: Optional[Outline] = None
     profile_holes: List[DxfEntity] = []
     if chosen is not None:
         profile_view, outline, profile_holes = chosen
+        profile_outline = outline
         plane = _VIEW_PLANE[profile_view]
         if profile_view == "top":
             extrusion_depth = height
@@ -254,6 +393,32 @@ def infer_features(projected: Dict[str, ProjectedView],
     for hole in hole_candidates:
         if _hole_has_hidden_evidence(hole, projected):
             features.append(hole)
+
+    if profile_view == "top" and _is_polygonal_prismatic_profile(profile_outline):
+        chamfer_distance = _infer_end_chamfer_distance(projected, height)
+        if chamfer_distance is not None:
+            top_radius = None
+            top_pv = projected.get("top")
+            if top_pv is not None:
+                boundary_circles = _boundary_construction_circles(
+                    profile_outline,
+                    [e for e in top_pv.entities if e.kind == "CIRCLE"],
+                )
+                if boundary_circles:
+                    top_radius = max(
+                        float(circle.radius or 0.0)
+                        for circle in boundary_circles
+                    )
+            features.append(Feature(
+                kind="edge_chamfer",
+                params={
+                    "distance": chamfer_distance,
+                    "profile": "arc_revolve" if top_radius else "arc",
+                    "scope": "outer_z_edges",
+                    "source_views": ["front", "right"],
+                    **({"top_radius": top_radius} if top_radius else {}),
+                },
+            ))
 
     return features
 

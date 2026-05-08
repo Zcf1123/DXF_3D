@@ -14,7 +14,7 @@ import textwrap
 from typing import Any, Dict, List
 
 from .dxf_loader import DxfEntity
-from .feature_inference import Feature
+from .feature_inference import Feature, _is_hidden_entity
 from .view_classifier import ViewBundle
 
 
@@ -143,6 +143,230 @@ def export_preview_png(bundles: List[ViewBundle], png_path: str) -> str:
     return png_path
 
 
+def export_normalized_views_png(projected: Dict[str, Any], png_path: str) -> str:
+    """Render normalized FRONT / RIGHT / TOP views with per-view 0 origins."""
+    import matplotlib  # type: ignore
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # type: ignore
+
+    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+    layout = {"front": axes[0][0], "right": axes[0][1],
+              "top": axes[1][0]}
+    axes[1][1].axis("off")
+    axes[1][1].text(0.05, 0.95, "(empty)\nbottom-right reserved",
+                    fontsize=9, va="top", color="gray")
+
+    for name in ("front", "right", "top"):
+        pv = projected.get(name)
+        ax = layout[name]
+        if pv is None:
+            ax.axis("off")
+            continue
+        for e in pv.entities:
+            _draw_entity(ax, e)
+        ax.set_aspect("equal")
+        ax.set_title(f"{name.upper()} (0-origin)", fontsize=11)
+        ax.set_xlim(0.0, max(float(pv.width), 1e-6))
+        ax.set_ylim(0.0, max(float(pv.height), 1e-6))
+        ax.grid(True, linestyle=":", alpha=0.4)
+
+    fig.suptitle("DXF normalized three views", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=120)
+    plt.close(fig)
+    return png_path
+
+
+def export_model_views_png(fcstd_path: str, png_path: str) -> str:
+    """Render FRONT / RIGHT / TOP orthographic views from the final solid."""
+    import matplotlib  # type: ignore
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # type: ignore
+    from matplotlib.collections import LineCollection  # type: ignore
+    import FreeCAD as App  # type: ignore
+
+    doc = App.openDocument(fcstd_path)
+    try:
+        shape = _result_shape(doc)
+        views = {
+            "front": _project_shape_edges(shape, "front"),
+            "right": _project_shape_edges(shape, "right"),
+            "top": _project_shape_edges(shape, "top"),
+        }
+    finally:
+        App.closeDocument(doc.Name)
+
+    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+    layout = {"front": axes[0][0], "right": axes[0][1],
+              "top": axes[1][0]}
+    axes[1][1].axis("off")
+    axes[1][1].text(0.05, 0.95, "(empty)\nbottom-right reserved",
+                    fontsize=9, va="top", color="gray")
+
+    for name in ("front", "right", "top"):
+        ax = layout[name]
+        segs = _normalize_segments(views[name])
+        if segs:
+            lc = LineCollection(segs, colors="#1f3b73", linewidths=1.0,
+                                capstyle="round", joinstyle="round")
+            ax.add_collection(lc)
+            xs = [p[0] for s in segs for p in s]
+            ys = [p[1] for s in segs for p in s]
+            ax.set_xlim(0.0, max(max(xs), 1e-6))
+            ax.set_ylim(0.0, max(max(ys), 1e-6))
+        else:
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+        ax.set_aspect("equal")
+        ax.set_title(f"{name.upper()} model (0-origin)", fontsize=11)
+        ax.grid(True, linestyle=":", alpha=0.4)
+
+    fig.suptitle("Model orthographic three views", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=120)
+    plt.close(fig)
+    return png_path
+
+
+def _project_shape_edges(shape, view_name: str):
+    segs = []
+    artifact_tol = max(
+        float(shape.BoundBox.XLength),
+        float(shape.BoundBox.YLength),
+        float(shape.BoundBox.ZLength),
+        1.0,
+    ) * 0.075
+    for edge in shape.Edges:
+        try:
+            if _is_internal_right_center_line(edge, view_name, shape):
+                continue
+            if _is_short_projected_artifact_edge(edge, view_name, artifact_tol):
+                continue
+            length = max(float(edge.Length), 1e-9)
+            points = edge.discretize(max(2, int(length * 12)))
+        except Exception:
+            continue
+        for i in range(len(points) - 1):
+            a = _project_point(points[i], view_name)
+            b = _project_point(points[i + 1], view_name)
+            if abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) < 1e-9:
+                continue
+            segs.append((a, b))
+    return segs
+
+
+def _is_internal_right_center_line(edge, view_name: str, shape) -> bool:
+    if view_name != "right" or len(edge.Vertexes) != 2:
+        return False
+    p0 = edge.Vertexes[0].Point
+    p1 = edge.Vertexes[1].Point
+    chord_3d = p0.distanceToPoint(p1)
+    if chord_3d <= 1e-9:
+        return False
+    if abs(float(edge.Length) - chord_3d) > max(1e-6, chord_3d * 1e-5):
+        return False
+    # RIGHT view projects (world Y, world Z). The nut's hex vertex at the
+    # centre Y creates an internal vertical seam; it is not a silhouette.
+    span_y = max(float(shape.BoundBox.YLength), 1.0)
+    center_y = (float(shape.BoundBox.YMin) + float(shape.BoundBox.YMax)) * 0.5
+    if abs(float(p0.y) - center_y) > span_y * 0.01:
+        return False
+    if abs(float(p1.y) - center_y) > span_y * 0.01:
+        return False
+    z_min = float(shape.BoundBox.ZMin)
+    z_max = float(shape.BoundBox.ZMax)
+    touches_bottom = min(abs(float(p0.z) - z_min), abs(float(p1.z) - z_min)) <= span_y * 0.01
+    touches_top = min(abs(float(p0.z) - z_max), abs(float(p1.z) - z_max)) <= span_y * 0.01
+    if touches_bottom and touches_top:
+        return False
+    return abs(float(p0.z) - float(p1.z)) > span_y * 0.05
+
+
+def _is_short_3d_artifact_edge(edge, shape) -> bool:
+    curve_name = type(edge.Curve).__name__ if hasattr(edge, "Curve") else ""
+    if curve_name != "Circle":
+        return False
+    scale = max(
+        float(shape.BoundBox.XLength),
+        float(shape.BoundBox.YLength),
+        float(shape.BoundBox.ZLength),
+        1.0,
+    )
+    return float(edge.Length) <= scale * 0.09
+
+
+def _is_internal_3d_center_seam(edge, shape) -> bool:
+    if len(edge.Vertexes) != 2:
+        return False
+    curve_name = type(edge.Curve).__name__ if hasattr(edge, "Curve") else ""
+    if curve_name != "Line":
+        return False
+    p0 = edge.Vertexes[0].Point
+    p1 = edge.Vertexes[1].Point
+    chord_3d = p0.distanceToPoint(p1)
+    if chord_3d <= 1e-9:
+        return False
+    if abs(float(edge.Length) - chord_3d) > max(1e-6, chord_3d * 1e-5):
+        return False
+    bb = shape.BoundBox
+    span_x = max(float(bb.XLength), 1.0)
+    span_y = max(float(bb.YLength), 1.0)
+    span_z = max(float(bb.ZLength), 1.0)
+    center_y = (float(bb.YMin) + float(bb.YMax)) * 0.5
+    if abs(float(p0.y) - center_y) > span_y * 0.01:
+        return False
+    if abs(float(p1.y) - center_y) > span_y * 0.01:
+        return False
+    if abs(float(p0.x) - float(p1.x)) > span_x * 0.01:
+        return False
+    if abs(float(p0.z) - float(p1.z)) <= span_z * 0.1:
+        return False
+    # Keep silhouette vertex lines at the left/right extrema; remove only
+    # internal seams such as the boolean split through the middle of a face.
+    x = float(p0.x)
+    return (x - float(bb.XMin)) > span_x * 0.1 and (float(bb.XMax) - x) > span_x * 0.1
+
+
+def _is_short_projected_artifact_edge(edge, view_name: str, tol: float) -> bool:
+    if len(edge.Vertexes) != 2:
+        return False
+    p0 = edge.Vertexes[0].Point
+    p1 = edge.Vertexes[1].Point
+    chord_3d = p0.distanceToPoint(p1)
+    if chord_3d <= 1e-9:
+        return True
+    a = _project_point(p0, view_name)
+    b = _project_point(p1, view_name)
+    projected = ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+    curve_name = type(edge.Curve).__name__ if hasattr(edge, "Curve") else ""
+    if curve_name == "Circle" and float(edge.Length) <= tol * 1.1:
+        return 1e-9 < projected <= tol
+    if abs(float(edge.Length) - chord_3d) > max(1e-6, chord_3d * 1e-5):
+        return False
+    return 1e-9 < projected <= tol
+
+
+def _project_point(point, view_name: str):
+    if view_name == "front":
+        return (float(point.x), float(point.z))
+    if view_name == "top":
+        return (float(point.x), float(point.y))
+    if view_name == "right":
+        return (float(point.y), float(point.z))
+    raise ValueError(f"unknown view name: {view_name}")
+
+
+def _normalize_segments(segs):
+    if not segs:
+        return []
+    xs = [p[0] for s in segs for p in s]
+    ys = [p[1] for s in segs for p in s]
+    xmin = min(xs)
+    ymin = min(ys)
+    return [((a[0] - xmin, a[1] - ymin),
+             (b[0] - xmin, b[1] - ymin)) for a, b in segs]
+
+
 def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
     """Render an isometric edge-only overview of the solid.
 
@@ -195,6 +419,10 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
 
         segs = []
         for edge in compound.Edges:
+            if _is_short_3d_artifact_edge(edge, compound):
+                continue
+            if _is_internal_3d_center_seam(edge, compound):
+                continue
             L = max(edge.Length, 1e-9)
             n = max(2, int(L * 6))
             try:
@@ -234,17 +462,22 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
     return png_path
 
 
+
 def _draw_entity(ax, e: DxfEntity) -> None:
+    if _is_hidden_entity(e):
+        color, lw, ls = "#1f3b73", 0.8, "--"
+    else:
+        color, lw, ls = "#1f3b73", 1.0, "-"
     if e.kind == "LINE" and len(e.points) == 2:
         (x0, y0), (x1, y1) = e.points
-        ax.plot([x0, x1], [y0, y1], color="#1f3b73", linewidth=1.0)
+        ax.plot([x0, x1], [y0, y1], color=color, linewidth=lw, linestyle=ls)
     elif e.kind == "CIRCLE" and e.center is not None and e.radius is not None:
         import numpy as np  # type: ignore
         t = np.linspace(0, 2 * np.pi, 64)
         cx, cy = e.center
         ax.plot(cx + e.radius * np.cos(t),
                 cy + e.radius * np.sin(t),
-                color="#aa3333", linewidth=1.0)
+                color="#aa3333", linewidth=lw, linestyle=ls)
     elif e.kind == "ARC" and e.center is not None and e.radius is not None:
         import numpy as np  # type: ignore
         sa = (e.start_angle or 0.0) * np.pi / 180.0
@@ -255,13 +488,13 @@ def _draw_entity(ax, e: DxfEntity) -> None:
         cx, cy = e.center
         ax.plot(cx + e.radius * np.cos(t),
                 cy + e.radius * np.sin(t),
-                color="#1f3b73", linewidth=1.0)
+                color=color, linewidth=lw, linestyle=ls)
     elif e.kind in ("LWPOLYLINE", "POLYLINE") and len(e.points) >= 2:
         xs = [p[0] for p in e.points]
         ys = [p[1] for p in e.points]
         if e.extra.get("closed"):
             xs.append(xs[0]); ys.append(ys[0])
-        ax.plot(xs, ys, color="#1f3b73", linewidth=1.0)
+        ax.plot(xs, ys, color=color, linewidth=lw, linestyle=ls)
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +576,62 @@ def export_generated_python(features: List[Feature], py_path: str,
                  "Z": App.Vector(0,0,1)}}.get(axis, App.Vector(0,0,1))
             return Part.makeCylinder(r, length, App.Vector(x,y,z), v)
 
+        def _edge_chamfer(shape, p):
+            distance = float(p.get("distance", 0.0) or 0.0)
+            if distance <= 0 or p.get("scope", "outer_z_edges") != "outer_z_edges":
+                return shape
+            if p.get("profile") == "arc_revolve":
+                top_radius = float(p.get("top_radius", 0.0) or 0.0)
+                bb = shape.BoundBox
+                height = float(bb.ZLength)
+                outer_radius = max(float(bb.XLength), float(bb.YLength)) * 0.5
+                if top_radius <= 0 or top_radius >= outer_radius or distance >= height * 0.5:
+                    return shape
+                center_x = (float(bb.XMin) + float(bb.XMax)) * 0.5
+                center_y = (float(bb.YMin) + float(bb.YMax)) * 0.5
+                bottom_mid = App.Vector((top_radius + outer_radius) * 0.5, 0.0, distance * 0.35)
+                top_mid = App.Vector((top_radius + outer_radius) * 0.5, 0.0, height - distance * 0.35)
+                edges = [
+                    Part.LineSegment(App.Vector(0,0,0), App.Vector(top_radius,0,0)).toShape(),
+                    Part.Arc(App.Vector(top_radius,0,0), bottom_mid, App.Vector(outer_radius,0,distance)).toShape(),
+                    Part.LineSegment(App.Vector(outer_radius,0,distance), App.Vector(outer_radius,0,height-distance)).toShape(),
+                    Part.Arc(App.Vector(outer_radius,0,height-distance), top_mid, App.Vector(top_radius,0,height)).toShape(),
+                    Part.LineSegment(App.Vector(top_radius,0,height), App.Vector(0,0,height)).toShape(),
+                    Part.LineSegment(App.Vector(0,0,height), App.Vector(0,0,0)).toShape(),
+                ]
+                env = Part.Face(Part.Wire(edges)).revolve(
+                    App.Vector(0,0,0), App.Vector(0,0,1), 360.0)
+                if not env.Solids and env.Shells:
+                    env = Part.Solid(env.Shells[0])
+                env.translate(App.Vector(center_x, center_y, float(bb.ZMin)))
+                return shape.common(env).removeSplitter()
+            bb = shape.BoundBox
+            z_min = float(bb.ZMin); z_max = float(bb.ZMax)
+            scale = max(float(bb.XLength), float(bb.YLength), float(bb.ZLength), 1.0)
+            tol = max(scale * 1e-7, 1e-6)
+            profile = p.get("profile", "line")
+            edges = []
+            for edge in shape.Edges:
+                ebb = edge.BoundBox
+                same_end = ((abs(float(ebb.ZMin) - z_min) <= tol and abs(float(ebb.ZMax) - z_min) <= tol) or
+                            (abs(float(ebb.ZMin) - z_max) <= tol and abs(float(ebb.ZMax) - z_max) <= tol))
+                if not same_end:
+                    continue
+                if profile == "arc":
+                    edges.append(edge)
+                    continue
+                if len(edge.Vertexes) != 2:
+                    continue
+                p0 = edge.Vertexes[0].Point; p1 = edge.Vertexes[1].Point
+                chord = p0.distanceToPoint(p1)
+                if chord > tol and abs(float(edge.Length) - chord) <= max(tol, chord * 1e-6):
+                    edges.append(edge)
+            if not edges:
+                return shape
+            if profile == "arc":
+                return shape.makeFillet(distance, edges)
+            return shape.makeChamfer(distance, edges)
+
         doc = App.newDocument(BASE_NAME)
         solid = None
         for f in FEATURES:
@@ -361,6 +650,11 @@ def export_generated_python(features: List[Feature], py_path: str,
                         solid = solid.cut(cyl)
                     except Exception:
                         pass
+            elif kind == "edge_chamfer" and solid is not None:
+                try:
+                    solid = _edge_chamfer(solid, params)
+                except Exception:
+                    pass
         if solid is not None:
             obj = doc.addObject("Part::Feature", "Result")
             obj.Shape = solid

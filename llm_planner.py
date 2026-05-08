@@ -123,7 +123,8 @@ class LLMPlanner:
         return self.client is not None
 
     def refine_features(self, view_bboxes: Dict[str, Any],
-                        draft_features: List[Dict[str, Any]]
+                        draft_features: List[Dict[str, Any]],
+                        view_geometry: Optional[List[Dict[str, Any]]] = None,
                         ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
         """Return (refined_features_or_None, log_message)."""
         if not self.enabled:
@@ -136,6 +137,7 @@ class LLMPlanner:
 
         user_msg = _render(prompt.user_template, {
             "view_bboxes": view_bboxes,
+            "view_geometry": view_geometry or [],
             "draft_features": draft_features,
         })
         messages: List[Dict[str, str]] = [
@@ -183,12 +185,111 @@ class LLMPlanner:
         cleaned = _remove_duplicate_hole_features(cleaned)
         return cleaned, f"LLM 复核完成（{self.model}）：返回 {len(cleaned)} 个特征"
 
+    def review_views(self, view_summary: List[Dict[str, Any]]) \
+            -> Tuple[Optional[Dict[str, Any]], str]:
+        """Return semantic view cleanup instructions, or None on failure."""
+        if not self.enabled:
+            return None, f"LLM 已禁用：{self.disabled_reason}"
+
+        try:
+            prompt = load_prompt("drawing_view_reviewer")
+        except Exception as exc:
+            return None, f"提示词加载失败：{exc}"
+
+        user_msg = _render(prompt.user_template, {
+            "view_summary": view_summary,
+        })
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": prompt.system},
+        ]
+        for inp, out in prompt.examples:
+            messages.append({"role": "user", "content": inp})
+            messages.append({"role": "assistant", "content": out})
+        messages.append({"role": "user", "content": user_msg})
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.0,
+            )
+            content = (resp.choices[0].message.content or "").strip()
+        except Exception as exc:
+            return None, f"LLM 请求失败：{exc}"
+
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+
+        try:
+            data = json.loads(content)
+        except Exception as exc:
+            return None, f"LLM 返回非 JSON：{exc}：{content[:200]!r}"
+
+        ok, reason = _validate_view_review(view_summary, data)
+        if not ok:
+            return None, f"LLM 视图复核未通过程序校验：{reason}"
+        return data, f"LLM 视图语义复核完成（{self.model}）"
+
 
 # ---------------------------------------------------------------------------
 # Deterministic safety checks for LLM output
 # ---------------------------------------------------------------------------
 
-_ALLOWED_KINDS = {"extrude_profile", "base_block", "hole"}
+_ALLOWED_KINDS = {"extrude_profile", "base_block", "hole", "edge_chamfer"}
+_CANONICAL_VIEWS = {"front", "top", "right"}
+
+
+def _validate_view_review(
+    view_summary: List[Dict[str, Any]],
+    data: Dict[str, Any],
+) -> Tuple[bool, str]:
+    if not isinstance(data, dict):
+        return False, "top-level JSON is not an object"
+    views = data.get("views")
+    if not isinstance(views, list):
+        return False, "missing views list"
+
+    by_input = {
+        str(v.get("input_name")): v for v in view_summary
+        if isinstance(v, dict) and v.get("input_name") is not None
+    }
+    if len(views) != len(by_input):
+        return False, "view count changed"
+    used_names = set()
+    for item in views:
+        if not isinstance(item, dict):
+            return False, "view item is not an object"
+        input_name = str(item.get("input_name"))
+        if input_name not in by_input:
+            return False, f"unknown input_name {input_name!r}"
+        canonical_name = item.get("canonical_name")
+        if canonical_name not in _CANONICAL_VIEWS:
+            return False, f"invalid canonical_name {canonical_name!r}"
+        if canonical_name in used_names:
+            return False, f"duplicate canonical_name {canonical_name!r}"
+        used_names.add(canonical_name)
+
+        keep_ids = item.get("keep_entity_ids")
+        remove_ids = item.get("remove_entity_ids", [])
+        if keep_ids is not None and not isinstance(keep_ids, list):
+            return False, f"keep_entity_ids for {input_name} is not a list"
+        if not isinstance(remove_ids, list):
+            return False, f"remove_entity_ids for {input_name} is not a list"
+
+        valid_ids = {int(e.get("id")) for e in by_input[input_name].get("entities", [])
+                     if isinstance(e, dict) and isinstance(e.get("id"), int)}
+        for ids, label in ((keep_ids or [], "keep"), (remove_ids, "remove")):
+            for value in ids:
+                if not isinstance(value, int):
+                    return False, f"{label}_entity_ids contains non-int"
+                if value not in valid_ids:
+                    return False, f"{label}_entity_ids contains unknown id {value}"
+        if keep_ids is not None:
+            kept = set(keep_ids)
+            if len(kept) < max(3, int(len(valid_ids) * 0.35)):
+                return False, f"too many entities removed from {input_name}"
+    return True, "ok"
 
 
 def _validate_refined_features(
@@ -236,6 +337,14 @@ def _validate_refined_features(
             return False, "draft hole missing from refined features"
     if len(refined_holes) > len(draft_holes):
         return False, "new hole feature was added"
+
+    draft_chamfers = [f for f in draft if f.get("kind") == "edge_chamfer"]
+    refined_chamfers = [f for f in refined if f.get("kind") == "edge_chamfer"]
+    if len(draft_chamfers) != len(refined_chamfers):
+        return False, "edge_chamfer feature count changed"
+    for before, after in zip(draft_chamfers, refined_chamfers):
+        if before.get("params") != after.get("params"):
+            return False, "edge_chamfer params changed"
 
     return True, "ok"
 

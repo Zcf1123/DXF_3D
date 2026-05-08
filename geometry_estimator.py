@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .dxf_loader import DxfEntity
 from .view_classifier import ViewBundle
@@ -121,18 +121,23 @@ def _edge_to_dict(e: Edge) -> Dict:
 
 
 def extract_outline_and_holes(
-    bundle: ViewBundle, tol: float = 1e-3
+    bundle: ViewBundle,
+    tol: float = 1e-3,
+    hidden_pred: Optional[Callable[[DxfEntity], bool]] = None,
 ) -> Tuple[Optional[Outline], List[DxfEntity]]:
     """Return (outline, holes).
 
     outline: largest closed loop built from LINE / ARC / closed POLYLINE.
     holes:   CIRCLE entities (treated as interior through-holes).
     """
+    def visible(e: DxfEntity) -> bool:
+        return hidden_pred is None or not hidden_pred(e)
+
     circles = [e for e in bundle.entities if e.kind == "CIRCLE"]
     closed_polys = [
         e for e in bundle.entities
         if e.kind in ("LWPOLYLINE", "POLYLINE") and e.extra.get("closed")
-        and len(e.points) >= 3
+        and len(e.points) >= 3 and visible(e)
     ]
 
     # Prefer an explicit closed polyline if present.
@@ -156,6 +161,8 @@ def extract_outline_and_holes(
     # Otherwise build from individual line/arc segments.
     edges: List[Edge] = []
     for e in bundle.entities:
+        if not visible(e):
+            continue
         if e.kind == "LINE" and len(e.points) >= 2:
             a, b = e.points[0], e.points[1]
             if _pt_close(a, b, tol):
@@ -174,6 +181,7 @@ def extract_outline_and_holes(
                 "p1": _arc_endpoint(e, "end"),
             })
 
+    edges = _prune_dangling_edges(edges, tol)
     loops = _find_closed_loops(edges, tol)
     if not loops:
         return None, circles
@@ -191,6 +199,35 @@ def _arc_endpoint(arc: DxfEntity, which: str) -> Tuple[float, float]:
 
 def _pt_close(a, b, tol: float) -> bool:
     return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+def _prune_dangling_edges(edges: List[Edge], tol: float) -> List[Edge]:
+    """Remove edges that cannot be part of any closed loop.
+
+    A segment whose endpoint has degree 1 is a dangling construction,
+    projection, or center line for the purpose of outer-loop extraction.
+    Removing those can expose more dangling edges, so iterate to a fixed point.
+    """
+    remaining = list(edges)
+
+    def key(pt) -> Tuple[int, int]:
+        return (round(float(pt[0]) / tol), round(float(pt[1]) / tol))
+
+    changed = True
+    while changed:
+        degree: Dict[Tuple[int, int], int] = {}
+        for edge in remaining:
+            for pt in (edge["p0"], edge["p1"]):
+                k = key(pt)
+                degree[k] = degree.get(k, 0) + 1
+        kept = [
+            edge for edge in remaining
+            if degree.get(key(edge["p0"]), 0) >= 2
+            and degree.get(key(edge["p1"]), 0) >= 2
+        ]
+        changed = len(kept) != len(remaining)
+        remaining = kept
+    return remaining
 
 
 def _find_closed_loops(edges: List[Edge], tol: float) -> List[List[Edge]]:
@@ -266,7 +303,52 @@ def _loop_bbox_area(loop: List[Edge]) -> float:
     return max(b[2] - b[0], 0.0) * max(b[3] - b[1], 0.0)
 
 
+def _merge_collinear_edges(loop: List[Edge]) -> List[Edge]:
+    """Merge consecutive collinear LINE segments in a closed loop.
+
+    Two adjacent LINE edges are collinear when their direction vectors have
+    a cross-product magnitude below a relative tolerance.  ARC edges are
+    never merged.  The loop is iterated until no more merges can be done,
+    then the wrap-around pair (last → first) is also checked.
+    """
+    if len(loop) < 2:
+        return loop
+
+    def _collinear(e1: Edge, e2: Edge) -> bool:
+        if e1["kind"] != "LINE" or e2["kind"] != "LINE":
+            return False
+        dx0 = e1["p1"][0] - e1["p0"][0]
+        dy0 = e1["p1"][1] - e1["p0"][1]
+        dx1 = e2["p1"][0] - e2["p0"][0]
+        dy1 = e2["p1"][1] - e2["p0"][1]
+        cross = dx0 * dy1 - dy0 * dx1
+        norm = math.hypot(dx0, dy0) + math.hypot(dx1, dy1)
+        return norm > 0 and abs(cross) < 1e-6 * norm
+
+    merged: List[Edge] = list(loop)
+    changed = True
+    while changed:
+        changed = False
+        result: List[Edge] = []
+        for e in merged:
+            if result and _collinear(result[-1], e):
+                result[-1] = {"kind": "LINE",
+                               "p0": result[-1]["p0"], "p1": e["p1"]}
+                changed = True
+            else:
+                result.append(e)
+        # Check wrap-around: last edge merges into first
+        if len(result) >= 2 and _collinear(result[-1], result[0]):
+            result[0] = {"kind": "LINE",
+                          "p0": result[-1]["p0"], "p1": result[0]["p1"]}
+            result.pop()
+            changed = True
+        merged = result
+    return merged
+
+
 def _outline_from_loop(loop: List[Edge]) -> Outline:
+    loop = _merge_collinear_edges(loop)
     return Outline(edges=loop, bbox=_loop_bbox(loop))
 
 
