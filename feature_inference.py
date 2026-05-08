@@ -26,14 +26,15 @@ from typing import Dict, List, Optional, Tuple
 from .dxf_loader import DxfEntity
 from .projection_mapper import ProjectedView
 from .geometry_estimator import (
-    Outline, extract_outline_and_holes, estimate_part_size,
+    Outline, extract_outline_and_holes, extract_closed_outlines_and_circles,
+    estimate_part_size,
 )
 from .view_classifier import ViewBundle
 
 
 @dataclass
 class Feature:
-    kind: str   # "extrude_profile" | "base_block" | "sphere" | "hole" | "edge_chamfer"
+    kind: str   # "extrude_profile" | "base_block" | "sphere" | "cylinder_stack" | "hole" | "profile_cut" | "edge_chamfer"
     params: Dict = field(default_factory=dict)
 
     def to_dict(self):
@@ -387,9 +388,13 @@ def _hole_has_hidden_evidence(
 
 
 def infer_features(projected: Dict[str, ProjectedView],
-                   bundles: Optional[List[ViewBundle]] = None) -> List[Feature]:
+                   bundles: Optional[List[ViewBundle]] = None,
+                   single_view_extrude_depth: Optional[float] = None) -> List[Feature]:
     if not projected:
         return []
+
+    if single_view_extrude_depth is not None and len(projected) == 1:
+        return _infer_single_view_extrusion(projected, single_view_extrude_depth)
 
     width, depth, height = estimate_part_size(projected, bundles)
     features: List[Feature] = []
@@ -397,6 +402,14 @@ def infer_features(projected: Dict[str, ProjectedView],
     sphere = _infer_sphere_feature(projected, width, depth, height)
     if sphere is not None:
         return [sphere]
+
+    stepped_cylinder = _infer_stepped_cylinder_profile(projected, width, depth, height)
+    if stepped_cylinder is not None:
+        return [stepped_cylinder]
+
+    cylinder = _infer_top_cylindrical_profile(projected, width, depth, height)
+    if cylinder is not None:
+        return cylinder
 
     # -- 1. Pick the most informative outline as the extrusion profile.
     candidates = []  # list of (score, view_name, outline, holes)
@@ -469,6 +482,7 @@ def infer_features(projected: Dict[str, ProjectedView],
             hole = _circle_to_hole(view_name, cx, cy, ent.radius,
                                    width, depth, height)
             if hole is not None:
+                _apply_hidden_hole_extent(hole, projected, width, depth, height)
                 hole_candidates.append(hole)
 
     for hole in hole_candidates:
@@ -504,6 +518,440 @@ def infer_features(projected: Dict[str, ProjectedView],
     return features
 
 
+def _infer_stepped_cylinder_profile(
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+) -> Optional[Feature]:
+    top = projected.get("top")
+    front = projected.get("front")
+    right = projected.get("right")
+    if top is None or front is None or right is None:
+        return None
+    top_circles = [
+        entity for entity in top.entities
+        if entity.kind == "CIRCLE" and entity.center is not None and entity.radius is not None
+    ]
+    if not top_circles:
+        return None
+    outer = max(top_circles, key=lambda circle: float(circle.radius or 0.0))
+    if outer.center is None or outer.radius is None:
+        return None
+
+    front_bands = _stepped_side_bands(front)
+    right_bands = _stepped_side_bands(right)
+    if len(front_bands) < 2 or len(front_bands) != len(right_bands):
+        return None
+
+    scale = max(width, depth, height, float(outer.radius) * 2.0, 1.0)
+    tol = max(scale * 0.03, 1e-3)
+    segments: List[Dict] = []
+    for front_band, right_band in zip(front_bands, right_bands):
+        z0, z1, cx, radius_x = front_band
+        rz0, rz1, cy, radius_y = right_band
+        if abs(z0 - rz0) > tol or abs(z1 - rz1) > tol:
+            return None
+        if abs(radius_x - radius_y) > tol:
+            return None
+        segments.append({
+            "z_min": float((z0 + rz0) * 0.5),
+            "z_max": float((z1 + rz1) * 0.5),
+            "radius": float((radius_x + radius_y) * 0.5),
+        })
+
+    max_radius = max(segment["radius"] for segment in segments)
+    if abs(max_radius - float(outer.radius)) > tol:
+        return None
+    if max(segment["z_max"] for segment in segments) - min(segment["z_min"] for segment in segments) <= tol:
+        return None
+    if len({round(segment["radius"] / tol) for segment in segments}) < 2:
+        return None
+    if not _top_circles_support_radii(top_circles, [s["radius"] for s in segments], tol):
+        return None
+
+    top_cx, top_cy = outer.center
+    center_x = sum(band[2] for band in front_bands) / len(front_bands)
+    center_y = sum(band[2] for band in right_bands) / len(right_bands)
+    if abs(float(top_cx) - center_x) > tol or abs(float(top_cy) - center_y) > tol:
+        return None
+
+    return Feature(
+        kind="cylinder_stack",
+        params={
+            "axis": "Z",
+            "center": [float(center_x), float(center_y)],
+            "segments": segments,
+            "source_views": ["top", "front", "right"],
+        },
+    )
+
+
+def _stepped_side_bands(pv: ProjectedView) -> List[Tuple[float, float, float, float]]:
+    edges = _visible_line_segments_2d(pv)
+    if not edges:
+        return []
+    scale = max(pv.width, pv.height, 1.0)
+    tol = max(scale * 0.01, 1e-3)
+    z_values: List[float] = []
+    verticals: List[Tuple[float, float, float]] = []
+    for (x0, z0), (x1, z1) in edges:
+        if abs(z0 - z1) <= tol and abs(x0 - x1) > tol:
+            z_values.append((z0 + z1) * 0.5)
+        elif abs(x0 - x1) <= tol and abs(z0 - z1) > tol:
+            verticals.append(((x0 + x1) * 0.5, min(z0, z1), max(z0, z1)))
+    levels = _cluster_values(z_values, tol)
+    if len(levels) < 2:
+        return []
+    bands: List[Tuple[float, float, float, float]] = []
+    for z0, z1 in zip(levels, levels[1:]):
+        if z1 - z0 <= tol:
+            continue
+        mid = (z0 + z1) * 0.5
+        xs = [x for x, lo, hi in verticals if lo <= mid + tol and hi >= mid - tol]
+        xs = _cluster_values(xs, tol)
+        if len(xs) < 2:
+            continue
+        x_min = min(xs)
+        x_max = max(xs)
+        radius = (x_max - x_min) * 0.5
+        if radius <= tol:
+            continue
+        bands.append((float(z0), float(z1), float((x_min + x_max) * 0.5), float(radius)))
+    return bands
+
+
+def _visible_line_segments_2d(pv: ProjectedView) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    for entity in pv.entities:
+        if _is_hidden_entity(entity):
+            continue
+        if entity.kind == "LINE" and len(entity.points) >= 2:
+            segments.append((tuple(entity.points[0]), tuple(entity.points[1])))
+        elif entity.kind in ("LWPOLYLINE", "POLYLINE") and len(entity.points) >= 2:
+            points = entity.points
+            closed = bool(entity.extra.get("closed", False))
+            end = len(points) if closed else len(points) - 1
+            for idx in range(end):
+                segments.append((tuple(points[idx]), tuple(points[(idx + 1) % len(points)])))
+    return segments
+
+
+def _cluster_values(values: List[float], tol: float) -> List[float]:
+    if not values:
+        return []
+    values = sorted(float(value) for value in values)
+    clusters: List[List[float]] = [[values[0]]]
+    for value in values[1:]:
+        if abs(value - clusters[-1][-1]) <= tol:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+    return [sum(cluster) / len(cluster) for cluster in clusters]
+
+
+def _top_circles_support_radii(
+    circles: List[DxfEntity],
+    radii: List[float],
+    tol: float,
+) -> bool:
+    circle_radii = [float(circle.radius or 0.0) for circle in circles]
+    unique_radii = _cluster_values(radii, tol)
+    for radius in unique_radii:
+        if not any(abs(radius - circle_radius) <= tol for circle_radius in circle_radii):
+            return False
+    return True
+
+
+def _infer_top_cylindrical_profile(
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+) -> Optional[List[Feature]]:
+    top = projected.get("top")
+    if top is None:
+        return None
+    visible = [e for e in top.entities if not _is_hidden_entity(e)]
+    circles = _visible_circles(top)
+    if not circles or len(circles) != len(visible):
+        return None
+    outer = max(circles, key=lambda circle: float(circle.radius or 0.0))
+    if outer.center is None or outer.radius is None:
+        return None
+    cx, cy = outer.center
+    outer_radius = float(outer.radius)
+    scale = max(width, depth, height, outer_radius * 2.0, 1.0)
+    tol = max(scale * 0.03, 1e-3)
+    if abs(width - 2.0 * outer_radius) > tol:
+        return None
+    if abs(depth - 2.0 * outer_radius) > tol:
+        return None
+
+    features: List[Feature] = [Feature(
+        kind="extrude_profile",
+        params={
+            "plane": "XY",
+            "depth": float(height),
+            "source_view": "top",
+            "edges": [{
+                "kind": "CIRCLE",
+                "center": [float(cx), float(cy)],
+                "radius": outer_radius,
+            }],
+            "bbox_2d": [
+                float(cx) - outer_radius,
+                float(cy) - outer_radius,
+                float(cx) + outer_radius,
+                float(cy) + outer_radius,
+            ],
+            "cylindrical_profile": True,
+        },
+    )]
+
+    for circle in circles:
+        if circle is outer or circle.center is None or circle.radius is None:
+            continue
+        inner_cx, inner_cy = circle.center
+        if abs(float(inner_cx) - float(cx)) > tol or abs(float(inner_cy) - float(cy)) > tol:
+            continue
+        radius = float(circle.radius)
+        if radius >= outer_radius - tol:
+            continue
+        hole = _circle_to_hole("top", float(inner_cx), float(inner_cy), radius,
+                               width, depth, height)
+        if hole is None:
+            continue
+        _apply_hidden_hole_extent(hole, projected, width, depth, height)
+        if _hole_has_hidden_evidence(hole, projected):
+            features.append(hole)
+
+    return features
+
+
+def _apply_hidden_hole_extent(
+    hole: Feature,
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+) -> None:
+    span = _hidden_hole_axis_span(hole, projected)
+    if span is None:
+        return
+    axis = hole.params.get("axis", "Z")
+    axis_length = {"X": width, "Y": depth, "Z": height}.get(axis, height)
+    axis_length = float(axis_length)
+    tol = max(axis_length * 0.01, 1e-3)
+    start = max(0.0, min(float(span[0]), axis_length))
+    end = max(0.0, min(float(span[1]), axis_length))
+    if end - start <= tol:
+        return
+    if start <= tol and end >= axis_length - tol:
+        return
+    pos = list(hole.params.get("position", [0.0, 0.0, 0.0]))
+    axis_index = {"X": 0, "Y": 1, "Z": 2}.get(axis, 2)
+    pos[axis_index] = start
+    hole.params["position"] = pos
+    hole.params["through_length"] = end - start
+    hole.params["blind"] = True
+    hole.params["hidden_span"] = [start, end]
+
+
+def _hidden_hole_axis_span(
+    hole: Feature,
+    projected: Dict[str, ProjectedView],
+) -> Optional[Tuple[float, float]]:
+    p = hole.params
+    axis = p.get("axis", "Z")
+    hx, hy, hz = p.get("position", [0.0, 0.0, 0.0])
+    r = float(p.get("radius", 1.0))
+    tol = max(r * 0.15, 0.5)
+    if axis == "Z":
+        checks = [("front", "x", hx, "y"), ("right", "x", hy, "y")]
+    elif axis == "Y":
+        checks = [("top", "x", hx, "y"), ("right", "y", hz, "x")]
+    else:
+        checks = [("top", "y", hy, "x"), ("front", "y", hz, "x")]
+
+    spans: List[Tuple[float, float]] = []
+    for view_name, overlap_axis, center, span_axis in checks:
+        pv = projected.get(view_name)
+        if pv is None:
+            continue
+        span = _hidden_span_for_projection(
+            pv, overlap_axis, float(center) - r - tol,
+            float(center) + r + tol, span_axis,
+        )
+        if span is not None:
+            spans.append(span)
+    if not spans:
+        return None
+    return min(span[0] for span in spans), max(span[1] for span in spans)
+
+
+def _hidden_span_for_projection(
+    pv: ProjectedView,
+    overlap_axis: str,
+    lo: float,
+    hi: float,
+    span_axis: str,
+) -> Optional[Tuple[float, float]]:
+    spans: List[Tuple[float, float]] = []
+    for entity in pv.entities:
+        if not _is_hidden_entity(entity):
+            continue
+        overlap = _bbox_range(entity, overlap_axis)
+        span = _bbox_range(entity, span_axis)
+        if overlap is None or span is None:
+            continue
+        if _interval_overlaps(lo, hi, overlap[0], overlap[1]):
+            spans.append(span)
+    if not spans:
+        return None
+    return min(span[0] for span in spans), max(span[1] for span in spans)
+
+
+def _infer_single_view_extrusion(
+    projected: Dict[str, ProjectedView],
+    depth: float,
+) -> List[Feature]:
+    if depth <= 0:
+        return []
+    view_name, pv = next(iter(projected.items()))
+    bundle = ViewBundle(
+        name=pv.name,
+        bbox=(0.0, 0.0, pv.width, pv.height),
+        entities=pv.entities,
+    )
+    outlines, circles = extract_closed_outlines_and_circles(bundle)
+    outline = outlines[0] if outlines else None
+    features: List[Feature] = []
+    if outline is not None:
+        features.append(Feature(
+            kind="extrude_profile",
+            params={
+                "plane": "XY",
+                "depth": float(depth),
+                "source_view": view_name,
+                "edges": [_serialize_edge(e) for e in outline.edges],
+                "bbox_2d": list(outline.bbox),
+                "single_view_extrude": True,
+            },
+        ))
+        outer_bbox = outline.bbox
+        inner_outlines = [
+            candidate for candidate in outlines[1:]
+            if _outline_inside_bbox(candidate, outer_bbox)
+            and not _same_bbox(candidate.bbox, outer_bbox)
+        ]
+        hole_circles = circles
+    else:
+        visible_circles = _visible_circles(pv)
+        if not visible_circles:
+            return []
+        outer = max(visible_circles, key=lambda e: float(e.radius or 0.0))
+        if outer.center is None or outer.radius is None:
+            return []
+        cx, cy = outer.center
+        radius = float(outer.radius)
+        outer_bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
+        features.append(Feature(
+            kind="extrude_profile",
+            params={
+                "plane": "XY",
+                "depth": float(depth),
+                "source_view": view_name,
+                "edges": [{
+                    "kind": "CIRCLE",
+                    "center": [float(cx), float(cy)],
+                    "radius": radius,
+                }],
+                "bbox_2d": list(outer_bbox),
+                "single_view_extrude": True,
+            },
+        ))
+        inner_outlines = []
+        hole_circles = [circle for circle in visible_circles if circle is not outer]
+
+    for inner in inner_outlines:
+        features.append(Feature(
+            kind="profile_cut",
+            params={
+                "plane": "XY",
+                "depth": float(depth),
+                "source_view": view_name,
+                "edges": [_serialize_edge(edge) for edge in inner.edges],
+                "bbox_2d": list(inner.bbox),
+                "axis": "Z",
+                "through_length": float(depth),
+                "single_view_extrude": True,
+            },
+        ))
+
+    for circle in hole_circles:
+        if circle.center is None or circle.radius is None:
+            continue
+        if _looks_like_boundary_construction_circle(circle, outline):
+            continue
+        cx, cy = circle.center
+        radius = float(circle.radius)
+        if not _circle_inside_bbox(cx, cy, radius, outer_bbox):
+            continue
+        features.append(Feature(
+            kind="hole",
+            params={
+                "diameter": 2.0 * radius,
+                "radius": radius,
+                "axis": "Z",
+                "position": [float(cx), float(cy), 0.0],
+                "through_length": float(depth),
+                "source_view": view_name,
+            },
+        ))
+    return features
+
+
+def _outline_inside_bbox(
+    outline: Outline,
+    bbox: Tuple[float, float, float, float],
+) -> bool:
+    min_x, min_y, max_x, max_y = bbox
+    bx0, by0, bx1, by1 = outline.bbox
+    scale = max(max_x - min_x, max_y - min_y, 1.0)
+    tol = max(scale * 0.01, 1e-3)
+    return (
+        bx0 >= min_x - tol and bx1 <= max_x + tol
+        and by0 >= min_y - tol and by1 <= max_y + tol
+    )
+
+
+def _same_bbox(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> bool:
+    scale = max(abs(v) for v in (*a, *b, 1.0))
+    tol = max(scale * 1e-6, 1e-3)
+    return all(abs(float(x) - float(y)) <= tol for x, y in zip(a, b))
+
+
+def _circle_inside_bbox(
+    cx: float,
+    cy: float,
+    radius: float,
+    bbox: Tuple[float, float, float, float],
+) -> bool:
+    min_x, min_y, max_x, max_y = bbox
+    scale = max(max_x - min_x, max_y - min_y, radius, 1.0)
+    tol = max(scale * 0.01, 1e-3)
+    return (
+        cx - radius >= min_x - tol
+        and cx + radius <= max_x + tol
+        and cy - radius >= min_y - tol
+        and cy + radius <= max_y + tol
+    )
+
+
 def _serialize_edge(e: Dict) -> Dict:
     out = {"kind": e["kind"], "p0": list(e["p0"]), "p1": list(e["p1"])}
     if e["kind"] == "ARC":
@@ -511,6 +959,8 @@ def _serialize_edge(e: Dict) -> Dict:
         out["radius"] = e["radius"]
         out["start_angle"] = e.get("start_angle")
         out["end_angle"] = e.get("end_angle")
+        if e.get("clockwise"):
+            out["clockwise"] = True
     return out
 
 

@@ -179,7 +179,8 @@ def _make_logger(run_dir: str) -> logging.Logger:
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
+def process_dxf(dxf_path: str, llm,
+                single_view_extrude_depth: Optional[float] = None) -> Dict[str, Any]:
     base = os.path.splitext(os.path.basename(dxf_path))[0]
     run_dir = _make_run_dir(base)
     log = _make_logger(run_dir)
@@ -224,6 +225,11 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         banner("阶段 2 ─ 三视图分类")
         from .view_classifier import classify_views
         bundles = classify_views(entities)
+        single_view_mode = single_view_extrude_depth is not None and len(bundles) == 1
+        if single_view_mode:
+            bundles[0].name = "top"
+            log.info("单视图拉伸    : 检测到单一视图，按 TOP/XY 轮廓拉伸 %.3f",
+                     single_view_extrude_depth)
         for b in bundles:
             log.info("视图 %-18s bbox=(%.3f, %.3f) — (%.3f, %.3f)  实体数=%d",
                      b.name, b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3],
@@ -238,8 +244,12 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         with open(os.path.join(run_dir, "views_semantic_input.json"), "w",
                   encoding="utf-8") as f:
             json.dump(view_review_summary, f, indent=2, ensure_ascii=False)
-        review, review_msg = llm.review_views(view_review_summary)
-        log.info("视图语义复核  : %s", review_msg)
+        if single_view_mode:
+            review = None
+            log.info("视图语义复核  : 单视图拉伸模式，跳过 LLM 视图重命名")
+        else:
+            review, review_msg = llm.review_views(view_review_summary)
+            log.info("视图语义复核  : %s", review_msg)
         if review is not None:
             applied_review = _apply_view_review(bundles, review)
             with open(os.path.join(run_dir, "views_semantic.json"), "w",
@@ -272,7 +282,7 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
         for name, pv in projected.items():
             log.info("投影 %-6s -> 平面 %s, 尺寸 %.3f × %.3f, 实体数=%d",
                      name, pv.plane, pv.width, pv.height, len(pv.entities))
-        draft = infer_features(projected, bundles)
+        draft = infer_features(projected, bundles, single_view_extrude_depth)
         # Log dimension-source breakdown for W/D/H
         from .geometry_estimator import _dim_measurements_by_axis
         dim_info = _dim_measurements_by_axis(bundles)
@@ -310,10 +320,20 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
                 log.info("  · 球体: r=%.3f center=%s (来自 %s)",
                          p.get("radius", 0), p.get("center"),
                          ",".join(p.get("source_views", [])))
+            elif f.kind == "cylinder_stack":
+                log.info("  · 同轴阶梯圆柱: center=%s segments=%d (来自 %s)",
+                         p.get("center"), len(p.get("segments", [])),
+                         ",".join(p.get("source_views", [])))
             elif f.kind == "hole":
-                log.info("  · 通孔: axis=%s r=%.3f pos=%s 长度=%.3f (来自 %s)",
-                         p.get("axis"), p.get("radius", 0), p.get("position"),
-                         p.get("through_length", 0), p.get("source_view"))
+                hole_label = "盲孔" if p.get("blind") else "通孔"
+                log.info("  · %s: axis=%s r=%.3f pos=%s 长度=%.3f (来自 %s)",
+                         hole_label, p.get("axis"), p.get("radius", 0),
+                         p.get("position"), p.get("through_length", 0),
+                         p.get("source_view"))
+            elif f.kind == "profile_cut":
+                log.info("  · 异形贯穿孔: plane=%s depth=%.3f edges=%d (来自 %s)",
+                         p.get("plane"), p.get("depth", 0),
+                         len(p.get("edges", [])), p.get("source_view"))
             elif f.kind == "edge_chamfer":
                 log.info("  · 边倒角/圆弧过渡: profile=%s distance=%.3f scope=%s top_radius=%s",
                          p.get("profile", "line"), p.get("distance", 0),
@@ -391,7 +411,7 @@ def process_dxf(dxf_path: str, llm) -> Dict[str, Any]:
             ("归一化三视图 PNG", lambda: export_normalized_views_png(
                 projected, normalized_png)),
             ("模型三视图 PNG",  lambda: export_model_views_png(
-                fcstd_path, model_views_png)),
+                fcstd_path, model_views_png, features)),
             ("3D 总览 PNG",      lambda: export_iso_overview_png(
                 fcstd_path, overview_png)),
             ("model.json",      lambda: export_model_json(
@@ -441,6 +461,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="DXF file(s). Defaults to all *.dxf in DXF_3D/dxf_files/")
     p.add_argument("--config", default="config.json",
                    help="Path to config.json (default: ./config.json)")
+    p.add_argument("--extrude-depth", type=float, default=None,
+                   help="Depth for single-view TOP/XY extrusion mode")
     args = p.parse_args(argv)
 
     if args.dxf:
@@ -461,7 +483,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     rc = 0
     for t in targets:
-        s = process_dxf(t, llm)
+        s = process_dxf(t, llm, single_view_extrude_depth=args.extrude_depth)
         _say(f"Output dir  : {s['output_dir']}")
         _say(f"Status      : {s['status']}"
               + (f" — {s.get('error')}" if s["status"] != "OK" else ""))

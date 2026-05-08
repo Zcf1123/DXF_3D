@@ -51,6 +51,19 @@
 - `linetype` 或 `linetype_desc` 中含 CENTER / CENTRO，通常是中心线。
 - 普通 `LINE` 且没有线型说明、又跨越分割边界或悬空，才更可能是辅助线。
 
+【判断图层】
+
+输入实体包含 `layer` 字段。若 DXF 做了分层，图层名通常比几何形状更可靠；
+若所有实体都在 `0` / `Defpoints` 等默认层，则不得仅凭图层判断语义。
+
+- 图层名含 OUTLINE / VISIBLE / OBJECT / SOLID / PROFILE / CONTOUR / 外形 / 轮廓 / 实线：通常是零件真实可见边，优先保留。
+- 图层名含 HIDDEN / DASH / PHANTOM / 虚线 / 隐藏：通常是隐藏边，保留为建模证据，不要仅因其为虚线而删除。
+- 图层名含 CENTER / CENTRE / AXIS / CENTRO / 中心 / 轴线：通常是中心线，除非明显跨视图或超长辅助线，否则保留。
+- 图层名含 DIM / ANNO / TEXT / NOTE / HATCH / DEFPOINTS / 标注 / 尺寸 / 文字 / 剖面：通常是标注或制图辅助。若这类实体混入 `entities`，可删除；若在 `annotations` 中，仅作为尺寸/说明参考。
+- 图层名含 CONSTRUCTION / PROJECTION / AUX / GUIDE / REF / 辅助 / 投影 / 参考：通常不是零件实体边；若它不参与闭合外轮廓或隐藏特征，可删除。
+- 当 `layer` 与 `linetype` 冲突时，按更具体的信息判断：实体级 `linetype` 和 `linetype_desc` 优先于笼统图层名；但明确的标注/辅助图层仍应谨慎排除。
+- 无分层或图层全为默认层时，回退到几何关系、线型、bbox、端点连接和三视图布局判断。
+
 ## USER
 
 下面是算法粗分类后的三视图摘要。每个实体都有稳定的 `id`，只在所属输入视图内有效。

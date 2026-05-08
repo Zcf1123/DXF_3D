@@ -4,6 +4,8 @@
 # 用法：
 #     ./run.sh                         # 处理 ./dxf_files/ 下所有 DXF
 #     ./run.sh path/to/file.dxf [...]  # 处理指定 DXF
+#     ./run.sh --extrude-depth 20 path/to/top_view.dxf
+#                                      # 单一俯视图按给定长度直接拉伸
 #     ./run.sh -d [file ...]           # 开发模式：挂载本地源码，无需重建镜像
 #
 # 镜像名可以用环境变量 DXF_3D_IMAGE 覆盖（默认 dxf-3d）。
@@ -53,7 +55,7 @@ fi
 # freecadcmd writes progress noise to stdout; run.py writes the concise
 # pipeline summary to stderr, so it remains visible.
 exec docker run --rm \
-    -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e HOME=/tmp -e TZ="${TZ_NAME}" \
+    -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e HOME=/var/tmp -e TZ="${TZ_NAME}" \
     -e DXF_3D_OUTPUT_SUBDIR="${DXF_3D_OUTPUT_SUBDIR:-}" \
     -v "${HERE}/dxf_files:/app/DXF_3D/dxf_files" \
     -v "${HERE}/outputs:/app/DXF_3D/outputs" \

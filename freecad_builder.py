@@ -67,6 +67,8 @@ def _direct_build(features: List[Feature], out_dir: str,
             x, y, z = p.get("center", [0, 0, 0])
             solid = Part.makeSphere(float(p["radius"]),
                                     App.Vector(float(x), float(y), float(z)))
+        elif f.kind == "cylinder_stack":
+            solid = _make_cylinder_stack(f.params)
         elif f.kind == "hole" and solid is not None:
             cyl = _make_hole_cylinder(f.params)
             if cyl is not None:
@@ -78,6 +80,17 @@ def _direct_build(features: List[Feature], out_dir: str,
                     )
             else:
                 warnings.append(f"hole cylinder could not be created: {f.params}")
+        elif f.kind == "profile_cut" and solid is not None:
+            cutter = _extrude_profile(f.params)
+            if cutter is not None:
+                try:
+                    solid = solid.cut(cutter)
+                except Exception as exc:
+                    warnings.append(
+                        f"profile cut failed for {f.params}: {exc}"
+                    )
+            else:
+                warnings.append(f"profile cutter could not be created: {f.params}")
         elif f.kind == "edge_chamfer" and solid is not None:
             try:
                 chamfered = _apply_edge_chamfer(solid, f.params)
@@ -98,6 +111,8 @@ def _direct_build(features: List[Feature], out_dir: str,
     # Embed the original 2D three-view drawings as named edge compounds.
     if projected is not None:
         _add_2d_views(doc, projected)
+        if _is_single_view_extrude(features):
+            _add_model_projection_views(doc, solid, set(projected.keys()))
 
     doc.recompute()
     doc.saveAs(fc_path)
@@ -154,6 +169,65 @@ def _add_2d_views(doc, projected: Dict[str, Any]) -> None:
         label = f"DXF_{view_name.upper()}"
         obj = doc.addObject("Part::Feature", label)
         obj.Shape = compound
+
+
+def _is_single_view_extrude(features: List[Feature]) -> bool:
+    return any(
+        f.kind == "extrude_profile"
+        and f.params.get("single_view_extrude") is True
+        for f in features
+    )
+
+
+def _add_model_projection_views(doc, solid, existing: set) -> None:
+    """Add generated FRONT/TOP/RIGHT view linework from the final solid.
+
+    Single-view inputs only contain TOP linework, but downstream inspection is
+    easier when the FCStd also contains generated orthographic projections.
+    Existing input views are left untouched.
+    """
+    import FreeCAD as App
+    import Part
+
+    def project(point, view_name: str):
+        if view_name == "front":
+            return float(point.x), float(point.z)
+        if view_name == "top":
+            return float(point.x), float(point.y)
+        return float(point.y), float(point.z)
+
+    def lift_for(view_name: str, u: float, v: float):
+        if view_name == "front":
+            return App.Vector(u, 0.0, v)
+        if view_name == "top":
+            return App.Vector(u, v, 0.0)
+        return App.Vector(0.0, u, v)
+
+    for view_name in ("front", "top", "right"):
+        if view_name in existing:
+            continue
+        edges = []
+        for edge in solid.Edges:
+            try:
+                pts = edge.discretize(Deflection=0.5)
+            except Exception:
+                pts = [vertex.Point for vertex in edge.Vertexes]
+            if len(pts) < 2:
+                continue
+            for a, b in zip(pts, pts[1:]):
+                u0, v0 = project(a, view_name)
+                u1, v1 = project(b, view_name)
+                p0 = lift_for(view_name, u0, v0)
+                p1 = lift_for(view_name, u1, v1)
+                if p0.distanceToPoint(p1) < 1e-7:
+                    continue
+                try:
+                    edges.append(Part.LineSegment(p0, p1).toShape())
+                except Exception:
+                    pass
+        if edges:
+            obj = doc.addObject("Part::Feature", f"DXF_{view_name.upper()}_GENERATED")
+            obj.Shape = Part.Compound(edges)
 
 
 def _entities_to_fc_edges(entities, lift, axis) -> List:
@@ -251,6 +325,13 @@ def _extrude_profile(params: Dict):
 
     fc_edges = []
     for e in edges_def:
+        if e["kind"] == "CIRCLE":
+            cx, cy = e["center"]
+            c3d = lift(float(cx), float(cy))
+            axis = App.Vector(*_PLANE_AXIS.get(plane, (0, 0, 1)))
+            wire = Part.Wire(Part.Circle(c3d, axis, float(e["radius"])).toShape())
+            face = Part.Face(wire)
+            return face.extrude(extrude_vec)
         if e["kind"] == "LINE":
             x0, y0 = e["p0"]
             x1, y1 = e["p1"]
@@ -264,12 +345,17 @@ def _extrude_profile(params: Dict):
             r = float(e["radius"])
             sa = math.radians(float(e["start_angle"] or 0.0))
             ea = math.radians(float(e["end_angle"] or 0.0))
-            if ea < sa:
+            if e.get("clockwise"):
+                if ea > sa:
+                    ea -= 2 * math.pi
+            elif ea < sa:
                 ea += 2 * math.pi
             mid = (sa + ea) * 0.5
-            sp = lift(cx + r * math.cos(sa), cy + r * math.sin(sa))
+            x0, y0 = e.get("p0", [cx + r * math.cos(sa), cy + r * math.sin(sa)])
+            x1, y1 = e.get("p1", [cx + r * math.cos(ea), cy + r * math.sin(ea)])
+            sp = lift(x0, y0)
             mp = lift(cx + r * math.cos(mid), cy + r * math.sin(mid))
-            ep = lift(cx + r * math.cos(ea), cy + r * math.sin(ea))
+            ep = lift(x1, y1)
             try:
                 fc_edges.append(Part.Arc(sp, mp, ep).toShape())
             except Exception:
@@ -323,6 +409,39 @@ def _make_hole_cylinder(params: Dict):
         cyl.rotate(App.Vector(x, y, z), App.Vector(1, 0, 0), 180.0)
         return cyl
     return None
+
+
+def _make_cylinder_stack(params: Dict):
+    import FreeCAD as App
+    import Part
+
+    axis = params.get("axis", "Z")
+    if axis != "Z":
+        return None
+    cx, cy = params.get("center", [0.0, 0.0])
+    solids = []
+    for segment in params.get("segments", []):
+        z_min = float(segment.get("z_min", 0.0))
+        z_max = float(segment.get("z_max", z_min))
+        radius = float(segment.get("radius", 0.0))
+        height = z_max - z_min
+        if radius <= 0 or height <= 0:
+            continue
+        solids.append(Part.makeCylinder(
+            radius,
+            height,
+            App.Vector(float(cx), float(cy), z_min),
+            App.Vector(0, 0, 1),
+        ))
+    if not solids:
+        return None
+    solid = solids[0]
+    for item in solids[1:]:
+        solid = solid.fuse(item)
+    try:
+        return solid.removeSplitter()
+    except Exception:
+        return solid
 
 
 def _apply_edge_chamfer(solid, params: Dict):

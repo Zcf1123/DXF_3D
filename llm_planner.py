@@ -95,9 +95,9 @@ class LLMPlanner:
             self.disabled_reason = f"config load failed: {exc}"
             return
 
-        api_key = self.config.get("openai_api_key")
+        api_key = self.config.get("api_key") or self.config.get("openai_api_key")
         if not api_key:
-            self.disabled_reason = "openai_api_key missing in config"
+            self.disabled_reason = "api_key missing in config"
             return
 
         try:
@@ -107,7 +107,7 @@ class LLMPlanner:
             return
 
         kwargs: Dict[str, Any] = {"api_key": api_key}
-        base_url = self.config.get("openai_base_url") or self.config.get("base_url")
+        base_url = self.config.get("base_url") or self.config.get("openai_base_url")
         if base_url:
             kwargs["base_url"] = base_url
         try:
@@ -116,7 +116,7 @@ class LLMPlanner:
             self.disabled_reason = f"OpenAI client init failed: {exc}"
             return
 
-        self.model = self.config.get("openai_model", "(unknown)")
+        self.model = self.config.get("model") or self.config.get("openai_model", "(unknown)")
 
     @property
     def enabled(self) -> bool:
@@ -129,6 +129,8 @@ class LLMPlanner:
         """Return (refined_features_or_None, log_message)."""
         if _is_deterministic_sphere_draft(draft_features):
             return draft_features, "算法已确定为球体，跳过 LLM 特征改写"
+        if _is_single_view_extrusion_draft(draft_features):
+            return draft_features, "单视图拉伸由命令行深度确定，跳过 LLM 特征改写"
         if not self.enabled:
             return None, f"LLM 已禁用：{self.disabled_reason}"
 
@@ -241,7 +243,7 @@ class LLMPlanner:
 # Deterministic safety checks for LLM output
 # ---------------------------------------------------------------------------
 
-_ALLOWED_KINDS = {"extrude_profile", "base_block", "sphere", "hole", "edge_chamfer"}
+_ALLOWED_KINDS = {"extrude_profile", "base_block", "sphere", "cylinder_stack", "hole", "profile_cut", "edge_chamfer"}
 _CANONICAL_VIEWS = {"front", "top", "right"}
 
 
@@ -317,11 +319,11 @@ def _validate_refined_features(
 
     draft_base = [
         f for f in draft
-        if f.get("kind") in {"extrude_profile", "base_block", "sphere"}
+        if f.get("kind") in {"extrude_profile", "base_block", "sphere", "cylinder_stack"}
     ]
     refined_base = [
         f for f in refined
-        if f.get("kind") in {"extrude_profile", "base_block", "sphere"}
+        if f.get("kind") in {"extrude_profile", "base_block", "sphere", "cylinder_stack"}
     ]
     if len(draft_base) != len(refined_base):
         return False, "base/profile feature count changed"
@@ -344,6 +346,14 @@ def _validate_refined_features(
             return False, "draft hole missing from refined features"
     if len(refined_holes) > len(draft_holes):
         return False, "new hole feature was added"
+
+    draft_cuts = [f for f in draft if f.get("kind") == "profile_cut"]
+    refined_cuts = [f for f in refined if f.get("kind") == "profile_cut"]
+    if len(draft_cuts) != len(refined_cuts):
+        return False, "profile_cut feature count changed"
+    for before, after in zip(draft_cuts, refined_cuts):
+        if before.get("params") != after.get("params"):
+            return False, "profile_cut params changed"
 
     draft_chamfers = [f for f in draft if f.get("kind") == "edge_chamfer"]
     refined_chamfers = [f for f in refined if f.get("kind") == "edge_chamfer"]
@@ -368,6 +378,16 @@ def _is_deterministic_sphere_draft(features: List[Dict[str, Any]]) -> bool:
         and isinstance(features[0], dict)
         and features[0].get("kind") == "sphere"
         and isinstance(features[0].get("params"), dict)
+    )
+
+
+def _is_single_view_extrusion_draft(features: List[Dict[str, Any]]) -> bool:
+    return any(
+        isinstance(feature, dict)
+        and feature.get("kind") == "extrude_profile"
+        and isinstance(feature.get("params"), dict)
+        and feature["params"].get("single_view_extrude") is True
+        for feature in features
     )
 
 
@@ -471,6 +491,10 @@ def _validate_base_feature(
                 return False, "sphere center changed"
         except Exception:
             return False, "sphere center invalid"
+    elif kind == "cylinder_stack":
+        for key in ("axis", "center", "segments"):
+            if bp.get(key) != ap.get(key):
+                return False, f"cylinder_stack {key} changed"
     return True, "ok"
 
 
@@ -501,7 +525,7 @@ def _remove_duplicate_hole_features(
 def _order_features_for_builder(
     features: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    order = {"extrude_profile": 0, "base_block": 0, "sphere": 0, "hole": 1, "edge_chamfer": 2}
+    order = {"extrude_profile": 0, "base_block": 0, "sphere": 0, "cylinder_stack": 0, "hole": 1, "profile_cut": 1, "edge_chamfer": 2}
     return sorted(
         features,
         key=lambda feature: order.get(str(feature.get("kind")), 99),
@@ -522,6 +546,10 @@ def _same_hole(a: Dict[str, Any], b: Dict[str, Any], tol: float = 0.1) -> bool:
         bpos = bp.get("position", [])
         if len(apos) != 3 or len(bpos) != 3:
             return False
-        return all(abs(float(apos[i]) - float(bpos[i])) <= tol for i in range(3))
+        if not all(abs(float(apos[i]) - float(bpos[i])) <= tol for i in range(3)):
+            return False
+        if abs(float(ap.get("through_length", 0.0)) - float(bp.get("through_length", 0.0))) > tol:
+            return False
+        return bool(ap.get("blind", False)) == bool(bp.get("blind", False))
     except Exception:
         return False

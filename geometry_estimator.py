@@ -117,6 +117,8 @@ def _edge_to_dict(e: Edge) -> Dict:
         out["radius"] = e["radius"]
         out["start_angle"] = e.get("start_angle")
         out["end_angle"] = e.get("end_angle")
+        if e.get("clockwise"):
+            out["clockwise"] = True
     return out
 
 
@@ -133,21 +135,35 @@ def extract_outline_and_holes(
     def visible(e: DxfEntity) -> bool:
         return hidden_pred is None or not hidden_pred(e)
 
+    outlines, circles = extract_closed_outlines_and_circles(bundle, tol, hidden_pred)
+    if not outlines:
+        return None, circles
+    return outlines[0], circles
+
+
+def extract_closed_outlines_and_circles(
+    bundle: ViewBundle,
+    tol: float = 1e-3,
+    hidden_pred: Optional[Callable[[DxfEntity], bool]] = None,
+) -> Tuple[List[Outline], List[DxfEntity]]:
+    """Return all closed LINE/ARC/POLYLINE outlines sorted by bbox area.
+
+    The largest outline is normally the outside profile. Smaller outlines are
+    useful in single-view extrusion mode, where they represent non-circular
+    through-holes such as slots or keyed bores.
+    """
+    def visible(e: DxfEntity) -> bool:
+        return hidden_pred is None or not hidden_pred(e)
+
     circles = [e for e in bundle.entities if e.kind == "CIRCLE"]
+    outlines: List[Outline] = []
+
     closed_polys = [
         e for e in bundle.entities
         if e.kind in ("LWPOLYLINE", "POLYLINE") and e.extra.get("closed")
         and len(e.points) >= 3 and visible(e)
     ]
-
-    # Prefer an explicit closed polyline if present.
-    if closed_polys:
-        # pick the polyline with the largest bbox
-        def area(p):
-            xs = [pt[0] for pt in p.points]
-            ys = [pt[1] for pt in p.points]
-            return (max(xs) - min(xs)) * (max(ys) - min(ys))
-        pl = max(closed_polys, key=area)
+    for pl in closed_polys:
         edges = []
         for i in range(len(pl.points)):
             a = pl.points[i]
@@ -156,7 +172,8 @@ def extract_outline_and_holes(
                 continue
             edges.append({"kind": "LINE", "p0": (float(a[0]), float(a[1])),
                           "p1": (float(b[0]), float(b[1]))})
-        return _outline_from_loop(edges), circles
+        if len(edges) >= 3:
+            outlines.append(_outline_from_loop(edges))
 
     # Otherwise build from individual line/arc segments.
     edges: List[Edge] = []
@@ -183,12 +200,9 @@ def extract_outline_and_holes(
 
     edges = _prune_dangling_edges(edges, tol)
     loops = _find_closed_loops(edges, tol)
-    if not loops:
-        return None, circles
-
-    # Outer loop = largest bbox area.
-    outer = max(loops, key=_loop_bbox_area)
-    return _outline_from_loop(outer), circles
+    outlines.extend(_outline_from_loop(loop) for loop in loops)
+    outlines.sort(key=lambda outline: outline.width * outline.height, reverse=True)
+    return outlines, circles
 
 
 def _arc_endpoint(arc: DxfEntity, which: str) -> Tuple[float, float]:
@@ -280,6 +294,7 @@ def _reverse_edge(e: Edge) -> Edge:
         "radius": e["radius"],
         "start_angle": e.get("end_angle"),
         "end_angle": e.get("start_angle"),
+        "clockwise": True,
         "p0": e["p1"],
         "p1": e["p0"],
     }

@@ -17,9 +17,26 @@
 # 或指定文件（路径可在 DXF_3D 内或宿主机任意位置）
 ./run.sh dxf_files/Drawing1.dxf
 ./run.sh /path/to/some.dxf
+
+# 单一俯视图：按给定长度沿 Z 方向直接拉伸
+./run.sh --extrude-depth 20 dxf_files/top_view_only.dxf
 ```
 
 镜像名可用环境变量 `DXF_3D_IMAGE` 覆盖（默认 `dxf-3d`）。
+
+### 单一俯视图拉伸
+
+如果 DXF 中只包含一个俯视图轮廓，可以在命令行提供拉伸长度：
+
+```bash
+./run.sh --extrude-depth 20 dxf_files/top_view_only.dxf
+```
+
+该模式只在识别到单一几何视图时触发，会把该视图固定按 TOP/XY 平面处理并沿 Z
+方向拉伸；标准 FRONT/TOP/RIGHT 三视图输入仍走原有建模逻辑。闭合线框、多段线、
+弧线轮廓会作为外轮廓，内部圆会作为贯穿孔，内部闭合线/弧轮廓会作为异形贯穿孔；
+只有一个圆时会拉伸为圆柱。输出仍会导出模型三视图 PNG，并在 `.FCStd` 中补充
+由 3D 模型生成的 FRONT/RIGHT 投影视图线框。
 
 ---
 
@@ -195,7 +212,7 @@ dxf_loader → view_classifier → projection_mapper → feature_inference
 | `view_classifier.py`    | 按象限把实体分到 FRONT/TOP/RIGHT 三个 `ViewBundle` |
 | `projection_mapper.py`  | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
 | `geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
-| `feature_inference.py`  | 推断拉伸轮廓、球体、孔和可确定的边倒角，输出 `Feature` 列表 |
+| `feature_inference.py`  | 推断拉伸轮廓、球体、同轴阶梯圆柱、圆孔/盲孔、异形贯穿孔和可确定的边倒角，输出 `Feature` 列表 |
 | `llm_planner.py`        | 读 `config.json` 调用 OpenAI 兼容 API，复核视图语义和特征草案；证据充分时可补充受支持的 `edge_chamfer` |
 | `freecad_builder.py`    | 按特征列表用 FreeCAD `Part` 建模并保存 `.FCStd` |
 | `exporters.py`          | STEP / OBJ / PNG / 总览 PNG / model.json / 可复现 Python |
@@ -209,9 +226,9 @@ dxf_loader → view_classifier → projection_mapper → feature_inference
 
 ```json
 {
-  "openai_api_key": "...",
-  "openai_base_url": "http://10.191.46.2:3000/v1",
-  "openai_model": "qwen3.5-35b-a3b"
+  "api_key": "...",
+  "base_url": "http://10.191.46.2:3000/v1",
+  "model": "qwen3.5-35b-a3b"
 }
 ```
 

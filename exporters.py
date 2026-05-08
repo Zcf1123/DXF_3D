@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import textwrap
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .dxf_loader import DxfEntity
 from .feature_inference import Feature, _is_hidden_entity
@@ -177,7 +177,8 @@ def export_normalized_views_png(projected: Dict[str, Any], png_path: str) -> str
     return png_path
 
 
-def export_model_views_png(fcstd_path: str, png_path: str) -> str:
+def export_model_views_png(fcstd_path: str, png_path: str,
+                           features: Optional[List[Feature]] = None) -> str:
     """Render FRONT / RIGHT / TOP orthographic views from the final solid."""
     import matplotlib  # type: ignore
     matplotlib.use("Agg")
@@ -185,16 +186,18 @@ def export_model_views_png(fcstd_path: str, png_path: str) -> str:
     from matplotlib.collections import LineCollection  # type: ignore
     import FreeCAD as App  # type: ignore
 
-    doc = App.openDocument(fcstd_path)
-    try:
-        shape = _result_shape(doc)
-        views = {
-            "front": _project_shape_edges(shape, "front"),
-            "right": _project_shape_edges(shape, "right"),
-            "top": _project_shape_edges(shape, "top"),
-        }
-    finally:
-        App.closeDocument(doc.Name)
+    views = _feature_model_view_segments(features or [])
+    if views is None:
+        doc = App.openDocument(fcstd_path)
+        try:
+            shape = _result_shape(doc)
+            views = {
+                "front": _project_shape_edges(shape, "front"),
+                "right": _project_shape_edges(shape, "right"),
+                "top": _project_shape_edges(shape, "top"),
+            }
+        finally:
+            App.closeDocument(doc.Name)
 
     fig, axes = plt.subplots(2, 2, figsize=(8, 8))
     layout = {"front": axes[0][0], "right": axes[0][1],
@@ -207,13 +210,24 @@ def export_model_views_png(fcstd_path: str, png_path: str) -> str:
         ax = layout[name]
         segs = _normalize_segments(views[name])
         if segs:
-            lc = LineCollection(segs, colors="#1f3b73", linewidths=1.0,
-                                capstyle="round", joinstyle="round")
-            ax.add_collection(lc)
-            xs = [p[0] for s in segs for p in s]
-            ys = [p[1] for s in segs for p in s]
-            ax.set_xlim(0.0, max(max(xs), 1e-6))
-            ax.set_ylim(0.0, max(max(ys), 1e-6))
+            solid_segs = [s[:2] for s in segs if len(s) < 3 or s[2] != "hidden"]
+            hidden_segs = [s[:2] for s in segs if len(s) >= 3 and s[2] == "hidden"]
+            if solid_segs:
+                lc = LineCollection(solid_segs, colors="#1f3b73", linewidths=1.0,
+                                    capstyle="round", joinstyle="round")
+                ax.add_collection(lc)
+            if hidden_segs:
+                lc_hidden = LineCollection(hidden_segs, colors="#1f3b73", linewidths=0.9,
+                                           linestyles="dashed",
+                                           capstyle="round", joinstyle="round")
+                ax.add_collection(lc_hidden)
+            xs = [p[0] for s in segs for p in s[:2]]
+            ys = [p[1] for s in segs for p in s[:2]]
+            x_max = max(max(xs), 1e-6)
+            y_max = max(max(ys), 1e-6)
+            pad = max(x_max, y_max, 1.0) * 0.04
+            ax.set_xlim(-pad, x_max + pad)
+            ax.set_ylim(-pad, y_max + pad)
         else:
             ax.set_xlim(0.0, 1.0)
             ax.set_ylim(0.0, 1.0)
@@ -226,6 +240,119 @@ def export_model_views_png(fcstd_path: str, png_path: str) -> str:
     fig.savefig(png_path, dpi=120)
     plt.close(fig)
     return png_path
+
+
+def _feature_model_view_segments(features: List[Feature]):
+    if not features:
+        return None
+    stack = next((f for f in features if f.kind == "cylinder_stack"), None)
+    if stack is not None:
+        return _cylinder_stack_view_segments(stack, features)
+    base = next((f for f in features if f.kind == "extrude_profile"), None)
+    if base is None:
+        return None
+    params = base.params
+    edges = params.get("edges", [])
+    if params.get("plane") != "XY" or len(edges) != 1 or edges[0].get("kind") != "CIRCLE":
+        return None
+    circle = edges[0]
+    cx, cy = circle.get("center", [0.0, 0.0])
+    radius = float(circle.get("radius", 0.0) or 0.0)
+    height = float(params.get("depth", 0.0) or 0.0)
+    if radius <= 0 or height <= 0:
+        return None
+    front = [
+        ((cx - radius, 0.0), (cx + radius, 0.0)),
+        ((cx + radius, 0.0), (cx + radius, height)),
+        ((cx + radius, height), (cx - radius, height)),
+        ((cx - radius, height), (cx - radius, 0.0)),
+    ]
+    right = [
+        ((cy - radius, 0.0), (cy + radius, 0.0)),
+        ((cy + radius, 0.0), (cy + radius, height)),
+        ((cy + radius, height), (cy - radius, height)),
+        ((cy - radius, height), (cy - radius, 0.0)),
+    ]
+    top = _circle_segments(cx, cy, radius)
+    for feature in features:
+        if feature.kind != "hole":
+            continue
+        hp = feature.params
+        if hp.get("axis") != "Z":
+            continue
+        hx, hy, hz = hp.get("position", [cx, cy, 0.0])
+        hr = float(hp.get("radius", 0.0) or 0.0)
+        length = float(hp.get("through_length", height) or 0.0)
+        if hr <= 0 or length <= 0:
+            continue
+        z0 = float(hz)
+        z1 = z0 + length
+        front.extend([
+            ((hx - hr, z0), (hx - hr, z1), "hidden"),
+            ((hx + hr, z0), (hx + hr, z1), "hidden"),
+        ])
+        right.extend([
+            ((hy - hr, z0), (hy - hr, z1), "hidden"),
+            ((hy + hr, z0), (hy + hr, z1), "hidden"),
+        ])
+        if hp.get("blind"):
+            front.append(((hx - hr, z0), (hx + hr, z0), "hidden"))
+            right.append(((hy - hr, z0), (hy + hr, z0), "hidden"))
+        else:
+            front.append(((hx - hr, z1), (hx + hr, z1), "hidden"))
+            right.append(((hy - hr, z1), (hy + hr, z1), "hidden"))
+        top.extend(_circle_segments(float(hx), float(hy), hr))
+    return {"front": front, "right": right, "top": top}
+
+
+def _cylinder_stack_view_segments(stack: Feature, features: List[Feature]):
+    params = stack.params
+    if params.get("axis") != "Z":
+        return None
+    cx, cy = params.get("center", [0.0, 0.0])
+    segments = params.get("segments", [])
+    if not segments:
+        return None
+    front = []
+    right = []
+    top = []
+    max_radius = 0.0
+    for segment in segments:
+        z0 = float(segment.get("z_min", 0.0))
+        z1 = float(segment.get("z_max", z0))
+        radius = float(segment.get("radius", 0.0))
+        if radius <= 0 or z1 <= z0:
+            continue
+        max_radius = max(max_radius, radius)
+        front.extend([
+            ((cx - radius, z0), (cx + radius, z0)),
+            ((cx + radius, z0), (cx + radius, z1)),
+            ((cx + radius, z1), (cx - radius, z1)),
+            ((cx - radius, z1), (cx - radius, z0)),
+        ])
+        right.extend([
+            ((cy - radius, z0), (cy + radius, z0)),
+            ((cy + radius, z0), (cy + radius, z1)),
+            ((cy + radius, z1), (cy - radius, z1)),
+            ((cy - radius, z1), (cy - radius, z0)),
+        ])
+    if max_radius <= 0:
+        return None
+    top.extend(_circle_segments(float(cx), float(cy), max_radius))
+    for radius in sorted({round(float(s.get("radius", 0.0)), 6) for s in segments}):
+        if radius > 0 and abs(radius - max_radius) > 1e-6:
+            top.extend((a, b, "hidden") for a, b in _circle_segments(float(cx), float(cy), radius))
+    return {"front": front, "right": right, "top": top}
+
+
+def _circle_segments(cx: float, cy: float, radius: float, steps: int = 96):
+    import math
+    pts = [
+        (cx + radius * math.cos(2.0 * math.pi * i / steps),
+         cy + radius * math.sin(2.0 * math.pi * i / steps))
+        for i in range(steps + 1)
+    ]
+    return list(zip(pts, pts[1:]))
 
 
 def _project_shape_edges(shape, view_name: str):
@@ -420,6 +547,8 @@ def _is_short_projected_artifact_edge(edge, view_name: str, tol: float) -> bool:
     a = _project_point(p0, view_name)
     b = _project_point(p1, view_name)
     projected = ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+    if view_name == "top":
+        return False
     curve_name = type(edge.Curve).__name__ if hasattr(edge, "Curve") else ""
     if curve_name == "Circle" and float(edge.Length) <= tol * 1.1:
         return 1e-9 < projected <= tol
@@ -441,12 +570,20 @@ def _project_point(point, view_name: str):
 def _normalize_segments(segs):
     if not segs:
         return []
-    xs = [p[0] for s in segs for p in s]
-    ys = [p[1] for s in segs for p in s]
+    xs = [p[0] for s in segs for p in s[:2]]
+    ys = [p[1] for s in segs for p in s[:2]]
     xmin = min(xs)
     ymin = min(ys)
-    return [((a[0] - xmin, a[1] - ymin),
-             (b[0] - xmin, b[1] - ymin)) for a, b in segs]
+    normalized = []
+    for seg in segs:
+        a, b = seg[:2]
+        item = ((a[0] - xmin, a[1] - ymin),
+                (b[0] - xmin, b[1] - ymin))
+        if len(seg) >= 3:
+            normalized.append((item[0], item[1], seg[2]))
+        else:
+            normalized.append(item)
+    return normalized
 
 
 def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
@@ -650,6 +787,12 @@ def export_generated_python(features: List[Feature], py_path: str,
                 raise ValueError("unknown plane: " + plane)
             fc_edges = []
             for e in edges_def:
+                if e["kind"] == "CIRCLE":
+                    cx, cy = e["center"]
+                    c = lift(cx, cy)
+                    axis_v = {{"XY": App.Vector(0,0,1), "XZ": App.Vector(0,1,0),
+                              "YZ": App.Vector(1,0,0)}}.get(plane, App.Vector(0,0,1))
+                    return Part.Face(Part.Wire(Part.Circle(c, axis_v, float(e["radius"])).toShape())).extrude(ev)
                 if e["kind"] == "LINE":
                     x0, y0 = e["p0"]; x1, y1 = e["p1"]
                     a = lift(x0, y0); b = lift(x1, y1)
@@ -660,11 +803,15 @@ def export_generated_python(features: List[Feature], py_path: str,
                     cx, cy = e["center"]; r = float(e["radius"])
                     sa = math.radians(float(e["start_angle"] or 0.0))
                     ea = math.radians(float(e["end_angle"] or 0.0))
-                    if ea < sa: ea += 2 * math.pi
+                    if e.get("clockwise"):
+                        if ea > sa: ea -= 2 * math.pi
+                    elif ea < sa: ea += 2 * math.pi
                     mid = (sa + ea) * 0.5
-                    sp = lift(cx + r*math.cos(sa), cy + r*math.sin(sa))
+                    x0, y0 = e.get("p0", [cx + r*math.cos(sa), cy + r*math.sin(sa)])
+                    x1, y1 = e.get("p1", [cx + r*math.cos(ea), cy + r*math.sin(ea)])
+                    sp = lift(x0, y0)
                     mp = lift(cx + r*math.cos(mid), cy + r*math.sin(mid))
-                    ep = lift(cx + r*math.cos(ea), cy + r*math.sin(ea))
+                    ep = lift(x1, y1)
                     try:
                         fc_edges.append(Part.Arc(sp, mp, ep).toShape())
                     except Exception:
@@ -690,6 +837,27 @@ def export_generated_python(features: List[Feature], py_path: str,
             cyl = Part.makeCylinder(r, length, App.Vector(x,y,z), v)
             cyl.rotate(App.Vector(x,y,z), v, 180.0)
             return cyl
+
+        def _cylinder_stack(p):
+            if p.get("axis", "Z") != "Z":
+                return None
+            cx, cy = p.get("center", [0.0, 0.0])
+            solids = []
+            for seg in p.get("segments", []):
+                z0 = float(seg.get("z_min", 0.0)); z1 = float(seg.get("z_max", z0))
+                r = float(seg.get("radius", 0.0)); h = z1 - z0
+                if r <= 0 or h <= 0:
+                    continue
+                solids.append(Part.makeCylinder(r, h, App.Vector(float(cx), float(cy), z0), App.Vector(0,0,1)))
+            if not solids:
+                return None
+            out = solids[0]
+            for item in solids[1:]:
+                out = out.fuse(item)
+            try:
+                return out.removeSplitter()
+            except Exception:
+                return out
 
         def _edge_chamfer(shape, p):
             distance = float(p.get("distance", 0.0) or 0.0)
@@ -763,11 +931,20 @@ def export_generated_python(features: List[Feature], py_path: str,
                 x, y, z = params.get("center", [0,0,0])
                 solid = Part.makeSphere(float(params["radius"]),
                                         App.Vector(float(x), float(y), float(z)))
+            elif kind == "cylinder_stack":
+                solid = _cylinder_stack(params)
             elif kind == "hole" and solid is not None:
                 cyl = _hole_cyl(params)
                 if cyl is not None:
                     try:
                         solid = solid.cut(cyl)
+                    except Exception:
+                        pass
+            elif kind == "profile_cut" and solid is not None:
+                cutter = _extrude_profile(params)
+                if cutter is not None:
+                    try:
+                        solid = solid.cut(cutter)
                     except Exception:
                         pass
             elif kind == "edge_chamfer" and solid is not None:
