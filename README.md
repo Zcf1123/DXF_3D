@@ -20,9 +20,16 @@
 
 # 单一俯视图：按给定长度沿 Z 方向直接拉伸
 ./run.sh --extrude-depth 20 dxf_files/top_view_only.dxf
+
+# 跳过 LLM，走纯算法路径（复杂图纸调试时更快）
+./run.sh --no-llm dxf_files/Drawing1.dxf
+
+# 给 LLM 受控建模意图，辅助理解隐藏线较多的复杂零件
+./run.sh --model-intent "先拉伸圆柱；侧面矩形孔贯穿切除；上端圆孔盲切" dxf_files/part.dxf
 ```
 
 镜像名可用环境变量 `DXF_3D_IMAGE` 覆盖（默认 `dxf-3d`）。
+开发调试时可加 `-d`，让容器挂载当前源码目录，避免每次改代码后重建镜像。
 
 ### 单一俯视图拉伸
 
@@ -127,7 +134,8 @@ DXF_3D_DISABLE_LLM=1 ./run.sh dxf_files/Drawing1.dxf
 ```
 
 如果复杂零件靠三视图隐藏线仍容易歧义，可以给 LLM 一段受控建模意图，帮助它把
-图纸线段整理成 builder 支持的 `hole` / `profile_cut` 特征：
+图纸线段整理成 builder 支持的 `hole` / `profile_cut` 特征。该意图只用于受校验的
+特征精修，不能让 LLM 输出当前 builder 不支持的自由特征：
 
 ```bash
 ./run.sh --model-intent "先拉伸一个圆柱；侧面矩形孔贯穿切除；上底面圆孔切除但不贯穿；中间再做一个不贯穿矩形切除" dxf_files/00996032.dxf
@@ -178,11 +186,14 @@ DXF_3D_DISABLE_LLM=1 ./run.sh dxf_files/Drawing1.dxf
 | 图层名               | 含义     | 处理       |
 | -------------------- | -------- | ---------- |
 | `OUTLINE` / `0`      | 可见轮廓 | 用于建模   |
-| `HIDDEN` / `*_HID`   | 虚线     | 忽略       |
+| `HIDDEN` / `*_HID`   | 虚线     | 作为孔、盲孔、内部切除等隐藏结构证据，不直接作为实体轮廓 |
 | `CENTER`             | 中心线   | 忽略       |
 | `DIM`                | 标注     | 忽略       |
 
 如果不区分图层，则所有几何视为可见轮廓。
+
+`*_HID` 是推荐的隐藏线命名方式，例如 `FRONT_HID` / `RIGHT_HID` / `TOP_HID`。
+隐藏线不会被当成外轮廓直接拉伸，但会参与跨视图验证，帮助区分通孔、盲孔和内部切除。
 
 ### 4. 不支持的内容
 
@@ -208,7 +219,7 @@ DXF_3D_DISABLE_LLM=1 ./run.sh dxf_files/Drawing1.dxf
 | `<base>.png`               | DXF 三视图预览（matplotlib） |
 | `<base>_views_normalized.png` | 归一化后的输入三视图，坐标从 0 开始，便于排查视图映射 |
 | `<base>_model_views.png`   | 最终 3D 模型重新投影得到的 FRONT/RIGHT/TOP 三视图 |
-| `<base>_overview.png`      | 3D 等轴侧线框总览（白底黑线，无坐标轴） |
+| `<base>_overview.png`      | 3D 等轴侧快速总览 PNG；用于粗略预览，复杂切除件的准确性以 `.FCStd` / `.step` / `<base>_model_views.png` 为准 |
 | `entities.json`            | DXF 解析后的实体 + 元数据 |
 | `views_algorithm.json`     | 纯算法阶段的原始视图归类结果 |
 | `views_semantic_input.json` | 提交给 LLM 视图语义复核的结构化输入摘要 |
@@ -241,8 +252,8 @@ dxf_loader → view_classifier → projection_mapper → feature_inference
 | `view_classifier.py`    | 按象限把实体分到 FRONT/TOP/RIGHT 三个 `ViewBundle` |
 | `projection_mapper.py`  | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
 | `geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
-| `feature_inference.py`  | 推断拉伸轮廓、球体、同轴阶梯圆柱、圆孔/盲孔、异形贯穿孔和可确定的边倒角，输出 `Feature` 列表 |
-| `llm_planner.py`        | 读 `config.json` 调用 OpenAI 兼容 API，复核视图语义和特征草案；证据充分时可补充受支持的 `edge_chamfer` |
+| `feature_inference.py`  | 推断拉伸轮廓、球体、同轴阶梯圆柱、圆孔/盲孔、异形贯穿孔、矩形/闭合轮廓切除和可确定的边倒角，输出 `Feature` 列表 |
+| `llm_planner.py`        | 读 `config.json` 调用 OpenAI 兼容 API，复核视图语义和特征草案；证据充分或提供 `--model-intent` 时，可在校验范围内精修受支持的特征 |
 | `freecad_builder.py`    | 按特征列表用 FreeCAD `Part` 建模并保存 `.FCStd` |
 | `exporters.py`          | STEP / OBJ / PNG / 总览 PNG / model.json / 可复现 Python |
 | `run.py`                | CLI 编排器 |
@@ -269,9 +280,9 @@ LLM 当前分两步介入：
 1. `drawing_view_reviewer.md`：复核 FRONT / TOP / RIGHT 视图命名，保守删除明显
    辅助线、标注线或跨视图线。
 2. `feature_refiner.md`：复核 `features_draft.json`。默认不能重写主体轮廓、孔、
-   edges 或尺寸；唯一允许新增的是有 TOP 多边形 + 侧视 ARC 等证据支撑的
-   `edge_chamfer`，用于提升六角螺母、带圆弧端面过渡的多边形棱柱等相似形状
-   的泛化能力。
+   edges 或尺寸；未提供建模意图时，主要允许新增有 TOP 多边形 + 侧视 ARC 等证据
+   支撑的 `edge_chamfer`。提供 `--model-intent` 后，可在代码校验允许的范围内精修
+   `hole` / `profile_cut` 等受支持特征，例如把明确描述的矩形孔改为贯穿切除或盲切。
 
 prompt 文件遵循 [prompts/PROMPT_SPEC.md](prompts/PROMPT_SPEC.md) 的二级
 标题分块约定，目前启用的 prompt 是
