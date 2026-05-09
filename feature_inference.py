@@ -489,6 +489,9 @@ def infer_features(projected: Dict[str, ProjectedView],
         if _hole_has_hidden_evidence(hole, projected):
             features.append(hole)
 
+    if profile_view == "top":
+        features.extend(_infer_side_taper_cuts(projected, width, depth))
+
     if profile_view == "top" and _is_polygonal_prismatic_profile(profile_outline):
         chamfer_distance = _infer_end_chamfer_distance(projected, height)
         if chamfer_distance is not None:
@@ -516,6 +519,125 @@ def infer_features(projected: Dict[str, ProjectedView],
             ))
 
     return features
+
+
+def _infer_side_taper_cuts(
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+) -> List[Feature]:
+    """Infer triangular through-cuts from chamfered side-view corners.
+
+    A top-view extrusion preserves a constant Z height. If a side view's outer
+    silhouette is a rectangle with one or more diagonal corner clips, those
+    clips are missing wedge cuts in the base model. Represent each clipped
+    corner as a triangular profile_cut in the side-view plane and extrude it
+    through the perpendicular direction.
+    """
+    cuts: List[Feature] = []
+    specs = {
+        "right": ("YZ", "X", width),
+        "front": ("XZ", "Y", depth),
+    }
+    for view_name, (plane, axis, through_length) in specs.items():
+        pv = projected.get(view_name)
+        if pv is None or through_length <= 0:
+            continue
+        outline, _holes = _make_outline(pv)
+        if outline is None:
+            continue
+        for triangle in _corner_clip_triangles(outline):
+            cuts.append(Feature(
+                kind="profile_cut",
+                params={
+                    "plane": plane,
+                    "depth": float(through_length),
+                    "source_view": view_name,
+                    "edges": _triangle_edges(triangle),
+                    "bbox_2d": list(_points_bbox(triangle)),
+                    "axis": axis,
+                    "through_length": float(through_length),
+                    "reason": "side_view_corner_clip",
+                },
+            ))
+    return cuts
+
+
+def _corner_clip_triangles(outline: Outline) -> List[List[Tuple[float, float]]]:
+    min_x, min_y, max_x, max_y = outline.bbox
+    scale = max(max_x - min_x, max_y - min_y, 1.0)
+    tol = max(scale * 0.01, 1e-3)
+    corners = [
+        (min_x, min_y, "left", "bottom"),
+        (min_x, max_y, "left", "top"),
+        (max_x, min_y, "right", "bottom"),
+        (max_x, max_y, "right", "top"),
+    ]
+    triangles: List[List[Tuple[float, float]]] = []
+    seen = set()
+    for edge in outline.edges:
+        if edge.get("kind") != "LINE":
+            continue
+        p0 = tuple(float(v) for v in edge.get("p0", []))
+        p1 = tuple(float(v) for v in edge.get("p1", []))
+        if len(p0) != 2 or len(p1) != 2:
+            continue
+        if abs(p0[0] - p1[0]) <= tol or abs(p0[1] - p1[1]) <= tol:
+            continue
+        for cx, cy, x_side, y_side in corners:
+            on_x_side = [p for p in (p0, p1) if _near(p[0], cx, tol)]
+            on_y_side = [p for p in (p0, p1) if _near(p[1], cy, tol)]
+            if len(on_x_side) != 1 or len(on_y_side) != 1 or on_x_side[0] == on_y_side[0]:
+                continue
+            x_point = on_x_side[0]
+            y_point = on_y_side[0]
+            if not _point_between_bbox(x_point, outline.bbox, tol):
+                continue
+            if not _point_between_bbox(y_point, outline.bbox, tol):
+                continue
+            x_inset = abs(float(y_point[0]) - float(cx))
+            y_inset = abs(float(x_point[1]) - float(cy))
+            if x_inset <= tol or y_inset <= tol:
+                continue
+            if x_inset > scale * 0.35 or y_inset > scale * 0.35:
+                continue
+            key = (round(cx, 6), round(cy, 6), round(x_point[0], 6), round(x_point[1], 6), round(y_point[0], 6), round(y_point[1], 6))
+            if key in seen:
+                continue
+            seen.add(key)
+            if x_side == "left":
+                corner_x = min_x
+            else:
+                corner_x = max_x
+            if y_side == "bottom":
+                corner_y = min_y
+            else:
+                corner_y = max_y
+            triangles.append([(corner_x, corner_y), x_point, y_point])
+    return triangles
+
+
+def _triangle_edges(points: List[Tuple[float, float]]) -> List[Dict]:
+    return [
+        {"kind": "LINE", "p0": list(points[i]), "p1": list(points[(i + 1) % 3])}
+        for i in range(3)
+    ]
+
+
+def _points_bbox(points: List[Tuple[float, float]]) -> Tuple[float, float, float, float]:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _near(a: float, b: float, tol: float) -> bool:
+    return abs(float(a) - float(b)) <= tol
+
+
+def _point_between_bbox(point: Tuple[float, float], bbox: Tuple[float, float, float, float], tol: float) -> bool:
+    min_x, min_y, max_x, max_y = bbox
+    x, y = point
+    return min_x - tol <= x <= max_x + tol and min_y - tol <= y <= max_y + tol
 
 
 def _infer_stepped_cylinder_profile(

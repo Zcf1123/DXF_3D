@@ -9,6 +9,7 @@ STEP / OBJ / model.json need an open FreeCAD document.
 from __future__ import annotations
 
 import json
+import math
 import os
 import textwrap
 from typing import Any, Dict, List, Optional
@@ -166,8 +167,11 @@ def export_normalized_views_png(projected: Dict[str, Any], png_path: str) -> str
             _draw_entity(ax, e)
         ax.set_aspect("equal")
         ax.set_title(f"{name.upper()} (0-origin)", fontsize=11)
-        ax.set_xlim(0.0, max(float(pv.width), 1e-6))
-        ax.set_ylim(0.0, max(float(pv.height), 1e-6))
+        x_max = max(float(pv.width), 1e-6)
+        y_max = max(float(pv.height), 1e-6)
+        pad = max(x_max, y_max, 1.0) * 0.04
+        ax.set_xlim(-pad, x_max + pad)
+        ax.set_ylim(-pad, y_max + pad)
         ax.grid(True, linestyle=":", alpha=0.4)
 
     fig.suptitle("DXF normalized three views", fontsize=13)
@@ -175,6 +179,55 @@ def export_normalized_views_png(projected: Dict[str, Any], png_path: str) -> str
     fig.savefig(png_path, dpi=120)
     plt.close(fig)
     return png_path
+
+
+def validate_projection_against_views(
+    fcstd_path: str,
+    projected: Dict[str, Any],
+    features: Optional[List[Feature]] = None,
+    report_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Compare final-model orthographic projections against input views.
+
+    The report is intentionally geometric and lightweight: each input/model
+    segment is sampled, then samples are matched by distance in normalized
+    view coordinates. It is a diagnostic score, not a replacement for exact
+    topological proof.
+    """
+    import FreeCAD as App  # type: ignore
+
+    model_views = _feature_model_view_segments(features or [])
+    if model_views is None:
+        doc = App.openDocument(fcstd_path)
+        try:
+            shape = _result_shape(doc)
+            model_views = {
+                "front": _project_shape_edges(shape, "front"),
+                "right": _project_shape_edges(shape, "right"),
+                "top": _project_shape_edges(shape, "top"),
+            }
+        finally:
+            App.closeDocument(doc.Name)
+
+    view_reports: Dict[str, Any] = {}
+    for view_name in ("front", "right", "top"):
+        pv = projected.get(view_name)
+        if pv is None:
+            continue
+        input_segments = _segments_from_entities(pv.entities)
+        model_segments = _strip_segment_styles(_normalize_segments(model_views.get(view_name, [])))
+        view_reports[view_name] = _compare_segment_sets(
+            input_segments,
+            model_segments,
+            max(float(pv.width), float(pv.height), 1.0),
+        )
+
+    overall_ok = all(report.get("status") == "OK" for report in view_reports.values())
+    result = {"status": "OK" if overall_ok else "WARN", "views": view_reports}
+    if report_path:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, indent=2, ensure_ascii=False)
+    return result
 
 
 def export_model_views_png(fcstd_path: str, png_path: str,
@@ -346,13 +399,151 @@ def _cylinder_stack_view_segments(stack: Feature, features: List[Feature]):
 
 
 def _circle_segments(cx: float, cy: float, radius: float, steps: int = 96):
-    import math
     pts = [
         (cx + radius * math.cos(2.0 * math.pi * i / steps),
          cy + radius * math.sin(2.0 * math.pi * i / steps))
         for i in range(steps + 1)
     ]
     return list(zip(pts, pts[1:]))
+
+
+def _segments_from_entities(entities: List[DxfEntity]):
+    segments = []
+    for entity in entities:
+        if entity.kind == "LINE" and len(entity.points) >= 2:
+            segments.append((tuple(entity.points[0]), tuple(entity.points[1])))
+        elif entity.kind == "CIRCLE" and entity.center is not None and entity.radius is not None:
+            cx, cy = entity.center
+            segments.extend(_circle_segments(float(cx), float(cy), float(entity.radius)))
+        elif entity.kind == "ARC" and entity.center is not None and entity.radius is not None:
+            segments.extend(_arc_segments(entity))
+        elif entity.kind in ("LWPOLYLINE", "POLYLINE") and len(entity.points) >= 2:
+            points = entity.points
+            closed = bool(entity.extra.get("closed", False))
+            end = len(points) if closed else len(points) - 1
+            for idx in range(end):
+                segments.append((tuple(points[idx]), tuple(points[(idx + 1) % len(points)])))
+    return segments
+
+
+def _arc_segments(entity: DxfEntity, steps: int = 48):
+    cx, cy = entity.center or (0.0, 0.0)
+    radius = float(entity.radius or 0.0)
+    start = math.radians(float(entity.start_angle or 0.0))
+    end = math.radians(float(entity.end_angle or 0.0))
+    if end < start:
+        end += 2.0 * math.pi
+    count = max(4, int(abs(end - start) / (2.0 * math.pi) * steps))
+    pts = [
+        (cx + radius * math.cos(start + (end - start) * i / count),
+         cy + radius * math.sin(start + (end - start) * i / count))
+        for i in range(count + 1)
+    ]
+    return list(zip(pts, pts[1:]))
+
+
+def _strip_segment_styles(segments):
+    return [segment[:2] for segment in segments]
+
+
+def _compare_segment_sets(input_segments, model_segments, scale: float) -> Dict[str, Any]:
+    tolerance = max(scale * 0.02, 1.0)
+    input_samples = _sample_segments(input_segments, tolerance)
+    model_samples = _sample_segments(model_segments, tolerance)
+    input_covered = _coverage_ratio(input_samples, model_segments, tolerance)
+    model_matched = _coverage_ratio(model_samples, input_segments, tolerance)
+    bbox_error = _bbox_error(input_segments, model_segments)
+    status = "OK" if input_covered >= 0.88 and model_matched >= 0.75 else "WARN"
+    return {
+        "status": status,
+        "tolerance": tolerance,
+        "input_segments": len(input_segments),
+        "model_segments": len(model_segments),
+        "input_samples": len(input_samples),
+        "model_samples": len(model_samples),
+        "input_coverage": round(input_covered, 4),
+        "model_match": round(model_matched, 4),
+        "model_extra_ratio": round(1.0 - model_matched, 4),
+        "bbox_error": bbox_error,
+        "unmatched_input_segments": _unmatched_segments(input_segments, model_segments, tolerance),
+    }
+
+
+def _sample_segments(segments, spacing: float):
+    samples = []
+    for a, b in segments:
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        length = math.hypot(bx - ax, by - ay)
+        count = max(1, int(math.ceil(length / max(spacing, 1e-6))))
+        for idx in range(count + 1):
+            t = idx / count
+            samples.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+    return samples
+
+
+def _coverage_ratio(samples, segments, tolerance: float) -> float:
+    if not samples:
+        return 1.0 if not segments else 0.0
+    if not segments:
+        return 0.0
+    matched = 0
+    tol_sq = tolerance * tolerance
+    for point in samples:
+        if any(_point_segment_distance_sq(point, segment) <= tol_sq for segment in segments):
+            matched += 1
+    return matched / len(samples)
+
+
+def _unmatched_segments(input_segments, model_segments, tolerance: float, limit: int = 12):
+    unmatched = []
+    for index, segment in enumerate(input_segments):
+        samples = _sample_segments([segment], tolerance)
+        if not samples:
+            continue
+        coverage = _coverage_ratio(samples, model_segments, tolerance)
+        if coverage >= 0.75:
+            continue
+        (x0, y0), (x1, y1) = segment
+        unmatched.append({
+            "index": index,
+            "p0": [round(float(x0), 4), round(float(y0), 4)],
+            "p1": [round(float(x1), 4), round(float(y1), 4)],
+            "coverage": round(coverage, 4),
+        })
+    unmatched.sort(key=lambda item: item["coverage"])
+    return unmatched[:limit]
+
+
+def _point_segment_distance_sq(point, segment) -> float:
+    px, py = point
+    (ax, ay), (bx, by) = segment
+    ax = float(ax); ay = float(ay); bx = float(bx); by = float(by)
+    dx = bx - ax
+    dy = by - ay
+    denom = dx * dx + dy * dy
+    if denom <= 1e-12:
+        return (px - ax) ** 2 + (py - ay) ** 2
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / denom))
+    qx = ax + dx * t
+    qy = ay + dy * t
+    return (px - qx) ** 2 + (py - qy) ** 2
+
+
+def _bbox_error(input_segments, model_segments):
+    input_bbox = _segments_bbox(input_segments)
+    model_bbox = _segments_bbox(model_segments)
+    if input_bbox is None or model_bbox is None:
+        return None
+    return [round(abs(float(a) - float(b)), 4) for a, b in zip(input_bbox, model_bbox)]
+
+
+def _segments_bbox(segments):
+    if not segments:
+        return None
+    xs = [float(point[0]) for segment in segments for point in segment[:2]]
+    ys = [float(point[1]) for segment in segments for point in segment[:2]]
+    return [min(xs), min(ys), max(xs), max(ys)]
 
 
 def _project_shape_edges(shape, view_name: str):

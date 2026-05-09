@@ -393,6 +393,7 @@ def process_dxf(dxf_path: str, llm,
             export_model_views_png,
             export_iso_overview_png, export_model_json,
             export_generated_python,
+            validate_projection_against_views,
         )
         step_path = os.path.join(run_dir, f"{base}.step")
         obj_path = os.path.join(run_dir, f"{base}.obj")
@@ -402,6 +403,39 @@ def process_dxf(dxf_path: str, llm,
         overview_png = os.path.join(run_dir, f"{base}_overview.png")
         json_path = os.path.join(run_dir, "model.json")
         py_path = os.path.join(run_dir, "generated_model.py")
+        validation_path = os.path.join(run_dir, "projection_validation.json")
+
+        try:
+            validation = validate_projection_against_views(
+                fcstd_path, projected, features, validation_path)
+            log.info("反投影验证    : %s", validation.get("status"))
+            _say(f"Projection   : {validation.get('status')}")
+            for view_name in ("front", "right", "top"):
+                report = validation.get("views", {}).get(view_name)
+                if not report:
+                    continue
+                log.info(
+                    "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
+                    view_name,
+                    report.get("status"),
+                    float(report.get("input_coverage", 0.0)) * 100.0,
+                    float(report.get("model_match", 0.0)) * 100.0,
+                    float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                    report.get("bbox_error"),
+                )
+                _say(
+                    "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
+                        name=view_name.upper(),
+                        status=str(report.get("status", "")),
+                        input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
+                        model_match=float(report.get("model_match", 0.0)) * 100.0,
+                        extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                    )
+                )
+            log.info("已写出        : projection_validation.json")
+        except Exception as exc:
+            log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
+            _say(f"Projection   : WARN — validation failed: {exc}")
 
         for name, fn in (
             ("STEP",            lambda: export_step(fcstd_path, step_path)),
