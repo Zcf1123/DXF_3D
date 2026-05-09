@@ -267,8 +267,8 @@ dxf_loader → view_classifier → projection_mapper → feature_inference
 ```json
 {
   "api_key": "...",
-  "base_url": "http://10.191.46.2:3000/v1",
-  "model": "qwen3.5-35b-a3b"
+  "base_url": "...",
+  "model": "..."
 }
 ```
 
