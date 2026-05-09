@@ -100,16 +100,38 @@ cd /path/to/DXF_3D
 
 ## 三、终端输出 / 日志
 
-终端只有三行核心信息：
+终端只打印核心摘要：
 
 ```
 LLM         : qwen3.5-35b-a3b
+Projection   : WARN
+   FRONT WARN input= 82.1% model=100.0% extra=  0.0%
+   RIGHT WARN input= 75.6% model=100.0% extra=  0.0%
+   TOP   OK   input=100.0% model= 99.6% extra=  0.4%
 Output dir  : DXF_3D/outputs/20260507_095610_Drawing1
 Status      : OK
 ```
 
-其余阶段日志（实体统计、视图归类、特征草案、LLM 返回、产物清单等）
-全部以中文写入 `<output_dir>/run.log`。
+其中 `Projection` 是反投影验证摘要：把最终 3D 模型重新投影回 FRONT/RIGHT/TOP，
+再与输入三视图比对。`input` 表示输入视图被模型覆盖的比例，`model` 表示模型
+投影能被输入视图解释的比例，`extra` 表示模型投影中的多余线比例。
+其余阶段日志（实体统计、视图归类、特征草案、LLM 返回、产物清单等）全部以中文
+写入 `<output_dir>/run.log`。
+
+如果只想走确定性算法、跳过 LLM 复核以缩短复杂图纸的运行时间，可以使用：
+
+```bash
+./run.sh --no-llm dxf_files/Drawing1.dxf
+# 或
+DXF_3D_DISABLE_LLM=1 ./run.sh dxf_files/Drawing1.dxf
+```
+
+如果复杂零件靠三视图隐藏线仍容易歧义，可以给 LLM 一段受控建模意图，帮助它把
+图纸线段整理成 builder 支持的 `hole` / `profile_cut` 特征：
+
+```bash
+./run.sh --model-intent "先拉伸一个圆柱；侧面矩形孔贯穿切除；上底面圆孔切除但不贯穿；中间再做一个不贯穿矩形切除" dxf_files/00996032.dxf
+```
 
 ---
 
@@ -156,7 +178,7 @@ Status      : OK
 | 图层名               | 含义     | 处理       |
 | -------------------- | -------- | ---------- |
 | `OUTLINE` / `0`      | 可见轮廓 | 用于建模   |
-| `HIDDEN`             | 虚线     | 忽略       |
+| `HIDDEN` / `*_HID`   | 虚线     | 忽略       |
 | `CENTER`             | 中心线   | 忽略       |
 | `DIM`                | 标注     | 忽略       |
 
@@ -165,7 +187,8 @@ Status      : OK
 ### 4. 不支持的内容
 
 - 多于三视图、剖视图、局部放大图、辅助视图、断面视图。
-- 仅靠 RIGHT/TOP 推断的斜面。
+- 一般斜面/自由斜切仍不保证；当前仅支持从 FRONT/RIGHT 外轮廓中明确出现的角部
+   直线削角推断三角楔切。
 - 螺纹、沉孔、阵列孔、自由曲面和复杂圆角。
 - 没有 TOP 多边形轮廓 + 侧视 ARC 证据的任意倒角/圆角。
 - 缺少明显视图布局的对称图。
@@ -183,11 +206,17 @@ Status      : OK
 | `<base>.step`              | STEP（`Part.export`） |
 | `<base>.obj`               | OBJ 网格（`MeshPart` 三角化） |
 | `<base>.png`               | DXF 三视图预览（matplotlib） |
+| `<base>_views_normalized.png` | 归一化后的输入三视图，坐标从 0 开始，便于排查视图映射 |
+| `<base>_model_views.png`   | 最终 3D 模型重新投影得到的 FRONT/RIGHT/TOP 三视图 |
 | `<base>_overview.png`      | 3D 等轴侧线框总览（白底黑线，无坐标轴） |
 | `entities.json`            | DXF 解析后的实体 + 元数据 |
-| `views.json`               | 视图归类结果 |
+| `views_algorithm.json`     | 纯算法阶段的原始视图归类结果 |
+| `views_semantic_input.json` | 提交给 LLM 视图语义复核的结构化输入摘要 |
+| `views_semantic.json`      | LLM 对视图命名、保留/删除实体的复核结果 |
+| `views.json`               | 最终使用的视图归类结果；启用 LLM 且校验通过时为语义复核后的结果，否则为算法结果 |
 | `features_draft.json`      | LLM 介入**前**的特征草案 |
 | `features.json`            | LLM 介入**后**的最终特征（未启用 LLM 时与草案相同） |
+| `projection_validation.json` | 反投影验证报告：模型三视图与输入三视图的覆盖率、匹配率、bbox 差异和未覆盖线段 |
 | `model.json`               | FreeCAD 文档对象信息 |
 | `generated_model.py`       | 独立可重跑脚本：`freecadcmd generated_model.py` |
 | `run.log`                  | 详细中文日志（每一阶段、警告、栈追踪） |

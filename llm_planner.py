@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import copy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -79,11 +80,16 @@ def _render(template: str, vars: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 class LLMPlanner:
-    def __init__(self, config_path: str = "config.json"):
+    def __init__(self, config_path: str = "config.json", disabled: bool = False):
         self.config: Dict[str, Any] = {}
         self.client = None
         self.model: str = "(none)"
         self.disabled_reason: Optional[str] = None
+
+        env_disabled = os.environ.get("DXF_3D_DISABLE_LLM", "").strip().lower()
+        if disabled or env_disabled in {"1", "true", "yes", "on"}:
+            self.disabled_reason = "disabled by option"
+            return
 
         if not os.path.exists(config_path):
             self.disabled_reason = f"config not found: {config_path}"
@@ -125,6 +131,7 @@ class LLMPlanner:
     def refine_features(self, view_bboxes: Dict[str, Any],
                         draft_features: List[Dict[str, Any]],
                         view_geometry: Optional[List[Dict[str, Any]]] = None,
+                        model_intent: str = "",
                         ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
         """Return (refined_features_or_None, log_message)."""
         if _is_deterministic_sphere_draft(draft_features):
@@ -139,10 +146,13 @@ class LLMPlanner:
         except Exception as exc:
             return None, f"提示词加载失败：{exc}"
 
+        prompt_draft = (_compact_features_for_prompt(draft_features)
+                        if model_intent.strip() else draft_features)
         user_msg = _render(prompt.user_template, {
             "view_bboxes": view_bboxes,
             "view_geometry": view_geometry or [],
-            "draft_features": draft_features,
+            "draft_features": prompt_draft,
+            "model_intent": model_intent or "（无）",
         })
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": prompt.system},
@@ -176,6 +186,8 @@ class LLMPlanner:
         if not isinstance(feats, list):
             return None, f"LLM JSON 缺少 features 列表：keys={list(data)}"
 
+        feats = _expand_feature_copy_refs(feats, draft_features)
+
         # Light validation: drop any item without kind/params.
         cleaned: List[Dict[str, Any]] = []
         for f in feats:
@@ -184,7 +196,7 @@ class LLMPlanner:
                 cleaned.append({"kind": f["kind"], "params": f["params"]})
 
         ok, reason = _validate_refined_features(
-            draft_features, cleaned, view_geometry or []
+            draft_features, cleaned, view_geometry or [], bool(model_intent.strip())
         )
         if not ok:
             return None, f"LLM 结果未通过程序校验：{reason}；沿用算法草案"
@@ -247,6 +259,89 @@ _ALLOWED_KINDS = {"extrude_profile", "base_block", "sphere", "cylinder_stack", "
 _CANONICAL_VIEWS = {"front", "top", "right"}
 
 
+def _compact_features_for_prompt(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compact = copy.deepcopy(features)
+    for idx, feature in enumerate(compact):
+        params = feature.get("params")
+        if not isinstance(params, dict):
+            continue
+        edges = params.get("edges")
+        if isinstance(edges, list) and len(edges) > 8:
+            params["edges"] = f"<omitted {len(edges)} edges; preserve with copy_from_draft={idx}>"
+    return compact
+
+
+def _expand_feature_copy_refs(
+    features: List[Any],
+    draft: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    expanded: List[Dict[str, Any]] = []
+    for item in features:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "copy_from_draft":
+            params = item.get("params", {})
+            try:
+                idx = int(params.get("index"))
+            except Exception:
+                continue
+            if 0 <= idx < len(draft):
+                expanded.append(copy.deepcopy(draft[idx]))
+            continue
+
+        params = item.get("params")
+        if not isinstance(params, dict):
+            expanded.append(item)
+            continue
+        if "copy_from_draft" in params:
+            try:
+                idx = int(params.get("copy_from_draft"))
+            except Exception:
+                expanded.append(item)
+                continue
+            if 0 <= idx < len(draft):
+                merged = copy.deepcopy(draft[idx])
+                merged_params = merged.setdefault("params", {})
+                for key, value in params.items():
+                    if key != "copy_from_draft":
+                        merged_params[key] = value
+                expanded.append(merged)
+                continue
+        if "copy_edges_from_draft" in params and "edges" not in params:
+            try:
+                idx = int(params.get("copy_edges_from_draft"))
+                params = dict(params)
+                params["edges"] = copy.deepcopy(draft[idx].get("params", {}).get("edges", []))
+                params.pop("copy_edges_from_draft", None)
+                item = {"kind": item.get("kind"), "params": params}
+            except Exception:
+                pass
+        elif isinstance(params.get("edges"), str) and str(params.get("edges")).startswith("<omitted"):
+            source = _matching_draft_feature_for_edges(item, draft)
+            if source is not None:
+                params = dict(params)
+                params["edges"] = copy.deepcopy(source.get("params", {}).get("edges", []))
+                item = {"kind": item.get("kind"), "params": params}
+        expanded.append(item)
+    return expanded
+
+
+def _matching_draft_feature_for_edges(
+    feature: Dict[str, Any],
+    draft: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    kind = feature.get("kind")
+    params = feature.get("params", {})
+    for candidate in draft:
+        if candidate.get("kind") != kind:
+            continue
+        cp = candidate.get("params", {})
+        if kind in {"extrude_profile", "profile_cut"}:
+            if cp.get("plane") == params.get("plane") and cp.get("source_view") == params.get("source_view"):
+                return candidate
+    return None
+
+
 def _validate_view_review(
     view_summary: List[Dict[str, Any]],
     data: Dict[str, Any],
@@ -304,6 +399,7 @@ def _validate_refined_features(
     draft: List[Dict[str, Any]],
     refined: List[Dict[str, Any]],
     view_geometry: Optional[List[Dict[str, Any]]] = None,
+    allow_feature_edits: bool = False,
 ) -> Tuple[bool, str]:
     """Validate that the LLM only made safe, minimal edits.
 
@@ -316,6 +412,9 @@ def _validate_refined_features(
         kind = item.get("kind")
         if kind not in _ALLOWED_KINDS:
             return False, f"unknown feature kind {kind!r}"
+        ok, reason = _validate_feature_schema(item)
+        if not ok:
+            return False, reason
 
     draft_base = [
         f for f in draft
@@ -336,24 +435,26 @@ def _validate_refined_features(
 
     draft_holes = _dedupe_holes([f for f in draft if f.get("kind") == "hole"])
     refined_holes = _dedupe_holes([f for f in refined if f.get("kind") == "hole"])
-    if len(refined_holes) < len(draft_holes):
+    if not allow_feature_edits and len(refined_holes) < len(draft_holes):
         return False, (
             f"hole count decreased from {len(draft_holes)} "
             f"to {len(refined_holes)}"
         )
-    for hole in draft_holes:
-        if not any(_same_hole(hole, candidate) for candidate in refined_holes):
-            return False, "draft hole missing from refined features"
-    if len(refined_holes) > len(draft_holes):
+    if not allow_feature_edits:
+        for hole in draft_holes:
+            if not any(_same_hole(hole, candidate) for candidate in refined_holes):
+                return False, "draft hole missing from refined features"
+    if not allow_feature_edits and len(refined_holes) > len(draft_holes):
         return False, "new hole feature was added"
 
     draft_cuts = [f for f in draft if f.get("kind") == "profile_cut"]
     refined_cuts = [f for f in refined if f.get("kind") == "profile_cut"]
-    if len(draft_cuts) != len(refined_cuts):
+    if not allow_feature_edits and len(draft_cuts) != len(refined_cuts):
         return False, "profile_cut feature count changed"
-    for before, after in zip(draft_cuts, refined_cuts):
-        if before.get("params") != after.get("params"):
-            return False, "profile_cut params changed"
+    if not allow_feature_edits:
+        for before, after in zip(draft_cuts, refined_cuts):
+            if before.get("params") != after.get("params"):
+                return False, "profile_cut params changed"
 
     draft_chamfers = [f for f in draft if f.get("kind") == "edge_chamfer"]
     refined_chamfers = [f for f in refined if f.get("kind") == "edge_chamfer"]
@@ -369,6 +470,46 @@ def _validate_refined_features(
         if not _edge_chamfer_has_view_evidence(draft, added, view_geometry or []):
             return False, "added edge_chamfer lacks view evidence"
 
+    return True, "ok"
+
+
+def _validate_feature_schema(feature: Dict[str, Any]) -> Tuple[bool, str]:
+    kind = feature.get("kind")
+    params = feature.get("params", {})
+    if not isinstance(params, dict):
+        return False, f"{kind} params is not an object"
+    if kind == "hole":
+        if params.get("axis") not in {"X", "Y", "Z"}:
+            return False, "hole axis invalid"
+        if params.get("source_view") not in _CANONICAL_VIEWS:
+            return False, "hole source_view invalid"
+        if {"top": "Z", "front": "Y", "right": "X"}.get(params.get("source_view")) != params.get("axis"):
+            return False, "hole axis/source_view mismatch"
+        try:
+            radius = float(params.get("radius"))
+            length = float(params.get("through_length"))
+            position = params.get("position")
+            if radius <= 0 or length <= 0 or not isinstance(position, list) or len(position) != 3:
+                return False, "hole numeric params invalid"
+            [float(v) for v in position]
+        except Exception:
+            return False, "hole numeric params invalid"
+    elif kind == "profile_cut":
+        if params.get("plane") not in {"XY", "XZ", "YZ"}:
+            return False, "profile_cut plane invalid"
+        if params.get("source_view") not in _CANONICAL_VIEWS:
+            return False, "profile_cut source_view invalid"
+        if {"top": "XY", "front": "XZ", "right": "YZ"}.get(params.get("source_view")) != params.get("plane"):
+            return False, "profile_cut plane/source_view mismatch"
+        edges = params.get("edges")
+        if not isinstance(edges, list) or len(edges) < 3:
+            return False, "profile_cut edges invalid"
+        try:
+            if float(params.get("depth")) <= 0:
+                return False, "profile_cut depth invalid"
+            float(params.get("offset", 0.0) or 0.0)
+        except Exception:
+            return False, "profile_cut depth invalid"
     return True, "ok"
 
 

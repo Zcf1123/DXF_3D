@@ -276,9 +276,6 @@ def convert(input_path, output_path):
     H = bb.ZMax - bb.ZMin   # Z 方向高度
     print(f"  包围盒  W={W:.2f}  D={D:.2f}  H={H:.2f}")
 
-    # 视图间距自适应（最小 15mm，按零件尺寸比例适当放大）
-    GAP = max(15.0, (W + D + H) / 30.0)
-
     # 三视图投影
     # TechDraw.projectEx 投影结果均在 Z=0 平面：
     #   沿 +Y（front）: result.x=worldZ, result.y=worldX → ax=1,ay=0
@@ -300,6 +297,11 @@ def convert(input_path, output_path):
     front, fw, fh = normalize(front)
     top,   tw, th = normalize(top)
     right, rw, rh = normalize(right)
+
+    # 视图间距：视图最大尺寸的 20%，至少 1 单位
+    max_dim = max(fw, fh, tw, th, rw, rh, 1e-6)
+    GAP = max(max_dim * 0.2, 1e-3)
+    print(f"  视图尺寸 front={fw:.3f}x{fh:.3f}  top={tw:.3f}x{th:.3f}  right={rw:.3f}x{rh:.3f}  GAP={GAP:.3f}")
 
     # 布局（第一角投影，与本项目 FRONT/RIGHT/TOP 约定一致）：
     #   FRONT（左上）  RIGHT（右上）

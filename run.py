@@ -180,7 +180,8 @@ def _make_logger(run_dir: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 def process_dxf(dxf_path: str, llm,
-                single_view_extrude_depth: Optional[float] = None) -> Dict[str, Any]:
+                single_view_extrude_depth: Optional[float] = None,
+                model_intent: str = "") -> Dict[str, Any]:
     base = os.path.splitext(os.path.basename(dxf_path))[0]
     run_dir = _make_run_dir(base)
     log = _make_logger(run_dir)
@@ -201,6 +202,8 @@ def process_dxf(dxf_path: str, llm,
         log.info("输入 DXF 文件 : %s", dxf_path)
         log.info("输出目录      : %s", run_dir)
         log.info("LLM 状态      : %s", summary["llm"])
+        if model_intent:
+            log.info("建模意图      : %s", model_intent)
 
         # 1. Parse
         banner("阶段 1 ─ 解析 DXF 实体")
@@ -349,7 +352,7 @@ def process_dxf(dxf_path: str, llm,
         if llm.enabled:
             log.info("调用模型      : %s", llm.model)
             refined, msg = llm.refine_features(
-                view_bboxes, draft_dicts, feature_view_summary
+                view_bboxes, draft_dicts, feature_view_summary, model_intent
             )
             log.info("LLM 返回      : %s", msg)
             if refined is not None:
@@ -497,6 +500,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Path to config.json (default: ./config.json)")
     p.add_argument("--extrude-depth", type=float, default=None,
                    help="Depth for single-view TOP/XY extrusion mode")
+    p.add_argument("--no-llm", action="store_true",
+                   help="Disable LLM view review and feature refinement")
+    p.add_argument("--model-intent", default=os.environ.get("DXF_3D_MODEL_INTENT", ""),
+                   help="Natural-language modeling intent for constrained LLM feature refinement")
     args = p.parse_args(argv)
 
     if args.dxf:
@@ -511,13 +518,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     from .llm_planner import LLMPlanner
-    llm = LLMPlanner(config_path=args.config)
+    llm = LLMPlanner(config_path=args.config, disabled=args.no_llm)
     llm_label = llm.model if llm.enabled else f"disabled ({llm.disabled_reason})"
     _say(f"LLM         : {llm_label}")
 
     rc = 0
     for t in targets:
-        s = process_dxf(t, llm, single_view_extrude_depth=args.extrude_depth)
+        s = process_dxf(t, llm, single_view_extrude_depth=args.extrude_depth,
+                        model_intent=args.model_intent)
         _say(f"Output dir  : {s['output_dir']}")
         _say(f"Status      : {s['status']}"
               + (f" — {s.get('error')}" if s["status"] != "OK" else ""))

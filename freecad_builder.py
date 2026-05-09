@@ -116,7 +116,7 @@ def _direct_build(features: List[Feature], out_dir: str,
 
     doc.recompute()
     doc.saveAs(fc_path)
-    App.closeDocument(base_name)
+    App.closeDocument(doc.Name)
     return {"fcstd": fc_path, "warnings": warnings}
 
 
@@ -307,18 +307,19 @@ def _extrude_profile(params: Dict):
     edges_def = params["edges"]
     depth = float(params["depth"])
     plane = params.get("plane", "XZ")
+    offset = float(params.get("offset", 0.0) or 0.0)
 
     if plane == "XY":
         def lift(u, v):
-            return App.Vector(float(u), float(v), 0.0)
+            return App.Vector(float(u), float(v), offset)
         extrude_vec = App.Vector(0.0, 0.0, depth)
     elif plane == "XZ":
         def lift(u, v):
-            return App.Vector(float(u), 0.0, float(v))
+            return App.Vector(float(u), offset, float(v))
         extrude_vec = App.Vector(0.0, depth, 0.0)
     elif plane == "YZ":
         def lift(u, v):
-            return App.Vector(0.0, float(u), float(v))
+            return App.Vector(offset, float(u), float(v))
         extrude_vec = App.Vector(depth, 0.0, 0.0)
     else:
         raise ValueError(f"unknown plane {plane!r}")

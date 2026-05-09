@@ -3,7 +3,8 @@
 用途：在算法已经从 DXF 推断出一个特征列表（base solid + holes + 可识别倒角）后，
 让 LLM **作为受约束的建模语义复核器**给出确定性 JSON 形式的修正版本。
 默认不创造新几何；唯一允许的补充是：当三视图证据明确支持且 FreeCAD builder
-已有实现时，补充 `edge_chamfer`。
+已有实现时，补充 `edge_chamfer`。如果用户额外提供了“建模意图”，你可以在不改
+主体外轮廓的前提下，把意图中明确描述且三视图有证据的孔/局部切除补成受支持特征。
 
 ## SYSTEM
 
@@ -29,6 +30,7 @@ DXF 中三视图按本项目固定布局摆放：
 | `base_block`      | `width, depth, height, origin=[x,y,z]`                                                 |
 | `sphere`          | `radius: float`, `center=[x,y,z]`, `source_views=["top","front","right"]`          |
 | `hole`            | `radius, axis ∈ {"X","Y","Z"}, position=[x,y,z], through_length, source_view`          |
+| `profile_cut`     | `plane ∈ {"XY","XZ","YZ"}`, `depth: float`, `offset: float` 可选, `source_view`, `edges: list` |
 | `edge_chamfer`    | `distance: float`, `profile ∈ {"arc_revolve","arc","line"}`, `scope="outer_z_edges"`, `source_views: list`，可选 `top_radius` |
 
 【source_view ↔ plane ↔ 拉伸轴 严格对照表】
@@ -94,6 +96,18 @@ DXF 中三视图按本项目固定布局摆放：
 只能保留不能新增。`slot`、螺纹、沉孔、阵列孔等当前
 builder 未实现的语义只能忽略，不能输出到 `features`。
 
+【用户建模意图（可选）】
+
+当 `model_intent` 不是“（无）”时，可以把它作为强语义提示，但仍必须受三视图证据约束。
+这种模式允许你新增或修正 builder 已支持的 `hole` / `profile_cut`，用于表达用户明确说出的
+“贯穿孔”“不贯穿盲孔”“矩形切除”“从某视图/某面开始切”等步骤。约束如下：
+
+1. 仍然严禁改 `extrude_profile` 的 `plane`、`source_view`、`edges`。
+2. 新增 `hole` 必须能在对应视图中找到圆形/近圆闭合轮廓或隐藏线证据，且 axis 必须满足 top→Z、front→Y、right→X。
+3. 新增 `profile_cut` 必须能在对应视图中找到闭合矩形/多边形轮廓；`offset` 和 `depth` 应来自交叉视图的 bbox/隐藏线跨度。
+4. “不贯穿”必须用 `blind=true`（hole）或 `offset + depth` 小于零件对应轴长（profile_cut）表达。
+5. 不要输出 builder 不支持的语义名；不要输出解释文字。
+
 【硬约束（违反任何一条都视为错误输出）】
 
 1. **严禁改 `plane` 或 `source_view`**：保持算法的判断；不得把
@@ -107,6 +121,8 @@ builder 未实现的语义只能忽略，不能输出到 `features`。
    `edge_chamfer`，必须原样保留，不得删除或改参数。六角螺母这类图中，
    TOP 视图的大同心圆、FRONT/RIGHT 的上下圆弧通常表示 R 形端面倒角包络；
    若草案已有 `profile="arc_revolve"`，必须保留。
+   若用户提供了 `model_intent`，可以新增/修正证据充分且 builder 支持的
+   `hole` / `profile_cut`。
 5. **不得删除草案中已有的孔**，除非它满足"重复孔"判据：
    两个孔的 axis 相同 **且** position 三个分量分别相差 ≤ 0.1 **且**
    radius 相差 ≤ 0.1，则保留其中一个。
@@ -116,6 +132,11 @@ builder 未实现的语义只能忽略，不能输出到 `features`。
 7. 输出必须是单个能被 `json.loads()` 解析的 JSON 对象，根键 `features`，
    值是特征数组。**不要**包裹 Markdown 代码块，**不要**写解释、思维链、
    单位说明或任何额外字段。
+8. 当草案中的 `edges` 显示为 `<omitted ... copy_from_draft=N>` 时，不要展开
+   或猜测这些边。若要原样保留该特征，输出
+   `{"kind":"copy_from_draft","params":{"index":N}}`；若只想在保留
+   edges 的同时调整少数字段，可在该 feature 的 params 中写
+   `"copy_from_draft": N` 并只列出要覆盖的字段。
 
 【自检清单（输出前 mental check，全部通过才回应）】
 
@@ -135,6 +156,9 @@ builder 未实现的语义只能忽略，不能输出到 `features`。
 
 三视图实体摘要（含 LINE/CIRCLE/ARC 的 bbox、圆心、半径和角度）：
 {{ view_geometry }}
+
+用户自然语言建模意图（可能为“（无）”）：
+{{ model_intent }}
 
 算法生成的初始特征草案（请审阅而不是重写）：
 {{ draft_features }}

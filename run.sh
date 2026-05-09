@@ -6,6 +6,10 @@
 #     ./run.sh path/to/file.dxf [...]  # 处理指定 DXF
 #     ./run.sh --extrude-depth 20 path/to/top_view.dxf
 #                                      # 单一俯视图按给定长度直接拉伸
+#     ./run.sh --no-llm path/to/file.dxf
+#                                      # 跳过 LLM 复核，优先提升速度
+#     ./run.sh --model-intent "先拉伸圆柱，再切孔" path/to/file.dxf
+#                                      # 给 LLM 一段受控建模意图
 #     ./run.sh -d [file ...]           # 开发模式：挂载本地源码，无需重建镜像
 #
 # 镜像名可以用环境变量 DXF_3D_IMAGE 覆盖（默认 dxf-3d）。
@@ -57,6 +61,8 @@ fi
 exec docker run --rm \
     -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e HOME=/var/tmp -e TZ="${TZ_NAME}" \
     -e DXF_3D_OUTPUT_SUBDIR="${DXF_3D_OUTPUT_SUBDIR:-}" \
+    -e DXF_3D_DISABLE_LLM="${DXF_3D_DISABLE_LLM:-}" \
+    -e DXF_3D_MODEL_INTENT="${DXF_3D_MODEL_INTENT:-}" \
     -v "${HERE}/dxf_files:/app/DXF_3D/dxf_files" \
     -v "${HERE}/outputs:/app/DXF_3D/outputs" \
     -v "${HERE}/config.json:/app/DXF_3D/config.json:ro" \

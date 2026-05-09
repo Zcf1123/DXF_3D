@@ -368,7 +368,7 @@ def _looks_hidden_or_center(e: DxfEntity) -> bool:
         e.layer or "",
     ]).upper()
     return any(tok in text for tok in (
-        "HIDDEN", "DASH", "PHANTOM", "CENTER", "CENTRO", "JIS_02",
+        "HIDDEN", "_HID", "DASH", "PHANTOM", "CENTER", "CENTRO", "JIS_02",
     ))
 
 

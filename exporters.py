@@ -196,7 +196,7 @@ def validate_projection_against_views(
     """
     import FreeCAD as App  # type: ignore
 
-    model_views = _feature_model_view_segments(features or [])
+    model_views = _feature_model_view_segments(features or [], include_cuts=False)
     if model_views is None:
         doc = App.openDocument(fcstd_path)
         try:
@@ -219,7 +219,7 @@ def validate_projection_against_views(
         view_reports[view_name] = _compare_segment_sets(
             input_segments,
             model_segments,
-            max(float(pv.width), float(pv.height), 1.0),
+            max(float(pv.width), float(pv.height), 1e-6),
         )
 
     overall_ok = all(report.get("status") == "OK" for report in view_reports.values())
@@ -237,9 +237,10 @@ def export_model_views_png(fcstd_path: str, png_path: str,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # type: ignore
     from matplotlib.collections import LineCollection  # type: ignore
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # type: ignore
     import FreeCAD as App  # type: ignore
 
-    views = _feature_model_view_segments(features or [])
+    views = _feature_model_view_segments(features or [], include_cuts=True)
     if views is None:
         doc = App.openDocument(fcstd_path)
         try:
@@ -295,8 +296,10 @@ def export_model_views_png(fcstd_path: str, png_path: str,
     return png_path
 
 
-def _feature_model_view_segments(features: List[Feature]):
+def _feature_model_view_segments(features: List[Feature], include_cuts: bool = False):
     if not features:
+        return None
+    if any(f.kind == "profile_cut" for f in features) and not include_cuts:
         return None
     stack = next((f for f in features if f.kind == "cylinder_stack"), None)
     if stack is not None:
@@ -307,7 +310,7 @@ def _feature_model_view_segments(features: List[Feature]):
     params = base.params
     edges = params.get("edges", [])
     if params.get("plane") != "XY" or len(edges) != 1 or edges[0].get("kind") != "CIRCLE":
-        return None
+        return _generic_extrude_view_segments(base, features if include_cuts else [])
     circle = edges[0]
     cx, cy = circle.get("center", [0.0, 0.0])
     radius = float(circle.get("radius", 0.0) or 0.0)
@@ -356,6 +359,175 @@ def _feature_model_view_segments(features: List[Feature]):
             right.append(((hy - hr, z1), (hy + hr, z1), "hidden"))
         top.extend(_circle_segments(float(hx), float(hy), hr))
     return {"front": front, "right": right, "top": top}
+
+
+def _generic_extrude_view_segments(base: Feature, features: Optional[List[Feature]] = None):
+    params = base.params
+    plane = params.get("plane")
+    depth = float(params.get("depth", 0.0) or 0.0)
+    profile = _profile_edge_segments(params.get("edges", []))
+    if not profile or depth <= 0:
+        return None
+    bbox = _segments_bbox(profile)
+    if bbox is None:
+        return None
+    u0, v0, u1, v1 = bbox
+
+    def rect(a0, b0, a1, b1):
+        return [
+            ((a0, b0), (a1, b0)),
+            ((a1, b0), (a1, b1)),
+            ((a1, b1), (a0, b1)),
+            ((a0, b1), (a0, b0)),
+        ]
+
+    if plane == "XY":
+        views = {
+            "front": rect(u0, 0.0, u1, depth),
+            "right": rect(v0, 0.0, v1, depth),
+            "top": profile,
+        }
+    elif plane == "XZ":
+        views = {
+            "front": profile,
+            "right": rect(0.0, v0, depth, v1),
+            "top": rect(u0, 0.0, u1, depth),
+        }
+    elif plane == "YZ":
+        views = {
+            "front": rect(0.0, v0, depth, v1),
+            "right": profile,
+            "top": rect(0.0, u0, depth, u1),
+        }
+    else:
+        return None
+    _overlay_feature_segments(views, features or [])
+    return views
+
+
+def _overlay_feature_segments(views, features: List[Feature]) -> None:
+    for feature in features:
+        if feature.kind == "hole":
+            _overlay_hole_segments(views, feature.params)
+        elif feature.kind == "profile_cut":
+            _overlay_profile_cut_segments(views, feature.params)
+
+
+def _overlay_hole_segments(views, params) -> None:
+    radius = float(params.get("radius", 0.0) or 0.0)
+    if radius <= 0:
+        return
+    x, y, z = [float(v) for v in params.get("position", [0.0, 0.0, 0.0])]
+    length = float(params.get("through_length", 0.0) or 0.0)
+    axis = params.get("axis")
+    if axis == "Y":
+        views.setdefault("front", []).extend(_circle_segments(x, z, radius, steps=96))
+        y0, y1 = y, y + length
+        views.setdefault("top", []).extend([
+            ((x - radius, y0), (x - radius, y1), "hidden"),
+            ((x + radius, y0), (x + radius, y1), "hidden"),
+        ])
+        views.setdefault("right", []).extend([
+            ((y0, z - radius), (y1, z - radius), "hidden"),
+            ((y0, z + radius), (y1, z + radius), "hidden"),
+        ])
+    elif axis == "Z":
+        views.setdefault("top", []).extend(_circle_segments(x, y, radius, steps=96))
+        z0, z1 = z, z + length
+        views.setdefault("front", []).extend([
+            ((x - radius, z0), (x - radius, z1), "hidden"),
+            ((x + radius, z0), (x + radius, z1), "hidden"),
+        ])
+        views.setdefault("right", []).extend([
+            ((y - radius, z0), (y - radius, z1), "hidden"),
+            ((y + radius, z0), (y + radius, z1), "hidden"),
+        ])
+    elif axis == "X":
+        views.setdefault("right", []).extend(_circle_segments(y, z, radius, steps=96))
+        x0, x1 = x, x + length
+        views.setdefault("top", []).extend([
+            ((x0, y - radius), (x1, y - radius), "hidden"),
+            ((x0, y + radius), (x1, y + radius), "hidden"),
+        ])
+        views.setdefault("front", []).extend([
+            ((x0, z - radius), (x1, z - radius), "hidden"),
+            ((x0, z + radius), (x1, z + radius), "hidden"),
+        ])
+
+
+def _overlay_profile_cut_segments(views, params) -> None:
+    plane = params.get("plane")
+    profile = _profile_edge_segments(params.get("edges", []))
+    if not profile:
+        return
+    offset = float(params.get("offset", 0.0) or 0.0)
+    depth = float(params.get("depth", 0.0) or 0.0)
+    bbox = _segments_bbox(profile)
+    if bbox is None:
+        return
+    u0, v0, u1, v1 = bbox
+    if plane == "XY":
+        views.setdefault("top", []).extend(profile)
+        for z in (offset, offset + depth):
+            views.setdefault("front", []).extend([
+                ((u0, z), (u1, z), "hidden"),
+                ((u0, z), (u0, z), "hidden"),
+                ((u1, z), (u1, z), "hidden"),
+            ])
+            views.setdefault("right", []).extend([
+                ((v0, z), (v1, z), "hidden"),
+            ])
+    elif plane == "XZ":
+        views.setdefault("front", []).extend(profile)
+        for y in (offset, offset + depth):
+            views.setdefault("top", []).extend([
+                ((u0, y), (u1, y), "hidden"),
+            ])
+            views.setdefault("right", []).extend([
+                ((y, v0), (y, v1), "hidden"),
+            ])
+    elif plane == "YZ":
+        views.setdefault("right", []).extend(profile)
+        for x in (offset, offset + depth):
+            views.setdefault("top", []).extend([
+                ((x, u0), (x, u1), "hidden"),
+            ])
+            views.setdefault("front", []).extend([
+                ((x, v0), (x, v1), "hidden"),
+            ])
+
+
+def _profile_edge_segments(edges):
+    segments = []
+    for edge in edges:
+        kind = edge.get("kind")
+        if kind == "LINE":
+            p0 = edge.get("p0")
+            p1 = edge.get("p1")
+            if p0 is not None and p1 is not None:
+                segments.append(((float(p0[0]), float(p0[1])),
+                                 (float(p1[0]), float(p1[1]))))
+        elif kind == "CIRCLE":
+            cx, cy = edge.get("center", [0.0, 0.0])
+            radius = float(edge.get("radius", 0.0) or 0.0)
+            if radius > 0:
+                segments.extend(_circle_segments(float(cx), float(cy), radius))
+        elif kind == "ARC":
+            cx, cy = edge.get("center", [0.0, 0.0])
+            radius = float(edge.get("radius", 0.0) or 0.0)
+            start = math.radians(float(edge.get("start_angle", 0.0) or 0.0))
+            end = math.radians(float(edge.get("end_angle", 0.0) or 0.0))
+            if end < start:
+                end += 2.0 * math.pi
+            if radius > 0:
+                steps = max(8, int(abs(end - start) / (2.0 * math.pi) * 96))
+                points = [
+                    (float(cx) + radius * math.cos(start + (end - start) * i / steps),
+                     float(cy) + radius * math.sin(start + (end - start) * i / steps))
+                    for i in range(steps + 1)
+                ]
+                segments.extend(zip(points, points[1:]))
+    return segments
 
 
 def _cylinder_stack_view_segments(stack: Feature, features: List[Feature]):
@@ -447,7 +619,7 @@ def _strip_segment_styles(segments):
 
 
 def _compare_segment_sets(input_segments, model_segments, scale: float) -> Dict[str, Any]:
-    tolerance = max(scale * 0.02, 1.0)
+    tolerance = max(scale * 0.02, 1e-6)
     input_samples = _sample_segments(input_segments, tolerance)
     model_samples = _sample_segments(model_segments, tolerance)
     input_covered = _coverage_ratio(input_samples, model_segments, tolerance)
@@ -550,12 +722,15 @@ def _project_shape_edges(shape, view_name: str):
     if _is_sphere_shape(shape):
         return _project_sphere_outline(shape, view_name)
     segs = []
-    artifact_tol = max(
+    model_scale = max(
         float(shape.BoundBox.XLength),
         float(shape.BoundBox.YLength),
         float(shape.BoundBox.ZLength),
-        1.0,
-    ) * 0.075
+    )
+    artifact_tol = max(
+        model_scale * 0.075,
+        1e-6,
+    )
     for edge in shape.Edges:
         try:
             if _is_full_height_internal_seam_line(edge, view_name, shape):
@@ -690,9 +865,8 @@ def _is_short_3d_artifact_edge(edge, shape) -> bool:
         float(shape.BoundBox.XLength),
         float(shape.BoundBox.YLength),
         float(shape.BoundBox.ZLength),
-        1.0,
     )
-    return float(edge.Length) <= scale * 0.09
+    return float(edge.Length) <= max(scale * 0.09, 1e-6)
 
 
 def _is_internal_3d_center_seam(edge, shape) -> bool:
@@ -789,14 +963,21 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
     import matplotlib  # type: ignore
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # type: ignore
-    from matplotlib.collections import LineCollection  # type: ignore
+    from matplotlib.collections import LineCollection, PolyCollection  # type: ignore
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # type: ignore
     import FreeCAD as App  # type: ignore
     import Part  # type: ignore
 
     doc = App.openDocument(fcstd_path)
     try:
         shapes = []
+        result = doc.getObject("Result")
+        result_shape = getattr(result, "Shape", None) if result is not None else None
+        if result_shape is not None and not result_shape.isNull() and result_shape.Solids:
+            shapes.append(result_shape)
         for o in doc.Objects:
+            if shapes:
+                break
             s = getattr(o, "Shape", None)
             if s is not None and not s.isNull() and s.Solids:
                 shapes.append(s)
@@ -808,6 +989,12 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
         if not shapes:
             raise RuntimeError("no usable shape in fcstd")
         compound = Part.Compound(shapes)
+        bb = compound.BoundBox
+        bbox_vals = (
+            float(bb.XMin), float(bb.XMax),
+            float(bb.YMin), float(bb.YMax),
+            float(bb.ZMin), float(bb.ZMax),
+        )
 
         # Isometric-ish view basis (same convention as qwen renderer).
         def _norm(v):
@@ -826,6 +1013,38 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
         def proj(p):
             return (p.x * u[0] + p.y * u[1] + p.z * u[2],
                     p.x * v[0] + p.y * v[1] + p.z * v[2])
+
+        def depth(p):
+            return p.x * d[0] + p.y * d[1] + p.z * d[2]
+
+        face_polys = []
+        face_verts = []
+        try:
+            verts, facets = compound.tessellate(0.01)
+        except Exception:
+            verts, facets = [], []
+        for facet in facets:
+            if len(facet) < 3:
+                continue
+            points = [verts[int(idx)] for idx in facet]
+            p0, p1, p2 = points[0], points[1], points[2]
+            ax1 = p1.x - p0.x; ay1 = p1.y - p0.y; az1 = p1.z - p0.z
+            ax2 = p2.x - p0.x; ay2 = p2.y - p0.y; az2 = p2.z - p0.z
+            nx = ay1 * az2 - az1 * ay2
+            ny = az1 * ax2 - ax1 * az2
+            nz = ax1 * ay2 - ay1 * ax2
+            normal_len = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+            shade = abs((nx * d[0] + ny * d[1] + nz * d[2]) / normal_len)
+            gray = 0.68 - 0.16 * shade
+            face_polys.append((
+                sum(depth(point) for point in points) / len(points),
+                [proj(point) for point in points],
+                (gray, gray, gray, 1.0),
+            ))
+            face_verts.append((
+                [(float(point.x), float(point.y), float(point.z)) for point in points],
+                (gray, gray, gray, 1.0),
+            ))
 
         segs = []
         if _is_sphere_shape(compound):
@@ -859,17 +1078,30 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
                 for i in range(len(pts) - 1):
                     segs.append((proj(pts[i]), proj(pts[i + 1])))
         else:
+            bb = compound.BoundBox
+            model_diag = max(
+                math.sqrt(float(bb.XLength) ** 2 + float(bb.YLength) ** 2 + float(bb.ZLength) ** 2),
+                1e-9,
+            )
             for edge in compound.Edges:
                 if _is_short_3d_artifact_edge(edge, compound):
                     continue
                 if _is_internal_3d_center_seam(edge, compound):
                     continue
-                L = max(edge.Length, 1e-9)
-                n = max(2, int(L * 6))
+                curve = getattr(edge, "Curve", None)
+                curve_type = getattr(curve, "TypeId", "")
+                is_line = curve_type == "Part::GeomLine"
+                if is_line:
+                    n = 2
+                else:
+                    n = max(32, min(160, int((float(edge.Length) / model_diag) * 160)))
                 try:
-                    pts = edge.discretize(n)
+                    pts = edge.discretize(Number=n)
                 except Exception:
-                    continue
+                    try:
+                        pts = edge.discretize(n)
+                    except Exception:
+                        continue
                 for i in range(len(pts) - 1):
                     a = proj(pts[i])
                     b = proj(pts[i + 1])
@@ -879,8 +1111,54 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
     finally:
         App.closeDocument(doc.Name)
 
-    xs = [p[0] for s in segs for p in s]
-    ys = [p[1] for s in segs for p in s]
+    if face_verts:
+        xmin3, xmax3, ymin3, ymax3, zmin3, zmax3 = bbox_vals
+        sx = max(xmax3 - xmin3, 1e-3)
+        sy = max(ymax3 - ymin3, 1e-3)
+        sz = max(zmax3 - zmin3, 1e-3)
+        span = max(sx, sy, sz)
+        cx = (xmin3 + xmax3) * 0.5
+        cy = (ymin3 + ymax3) * 0.5
+        cz = (zmin3 + zmax3) * 0.5
+        margin3 = span * 0.02
+
+        fig = plt.figure(figsize=(10, 7), facecolor="white")
+        ax3 = fig.add_subplot(111, projection="3d")
+        ax3.set_position([0.0, 0.0, 1.0, 1.0])
+        ax3.set_facecolor("white")
+        collection = Poly3DCollection(
+            [poly for poly, _ in face_verts],
+            facecolors=[color for _, color in face_verts],
+            edgecolors="none",
+            linewidths=0.0,
+            antialiaseds=True,
+            zsort="average",
+        )
+        ax3.add_collection3d(collection)
+        ax3.set_xlim(cx - span * 0.5 - margin3, cx + span * 0.5 + margin3)
+        ax3.set_ylim(cy - span * 0.5 - margin3, cy + span * 0.5 + margin3)
+        ax3.set_zlim(cz - span * 0.5 - margin3, cz + span * 0.5 + margin3)
+        try:
+            ax3.set_box_aspect((sx, sy, sz), zoom=1.65)
+            ax3.set_proj_type("ortho")
+        except Exception:
+            try:
+                ax3.set_box_aspect((sx, sy, sz))
+                ax3.dist = 6
+            except Exception:
+                pass
+        ax3.view_init(elev=22, azim=-55)
+        ax3.set_axis_off()
+        fig.savefig(png_path, dpi=150, facecolor="white", bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+        return png_path
+
+    if face_polys:
+        xs = [p[0] for _, poly, _ in face_polys for p in poly]
+        ys = [p[1] for _, poly, _ in face_polys for p in poly]
+    else:
+        xs = [p[0] for s in segs for p in s]
+        ys = [p[1] for s in segs for p in s]
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
     W = max(xmax - xmin, 1e-3)
@@ -890,9 +1168,17 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
     fig, ax = plt.subplots(figsize=(9, 9 * H / W))
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
-    lc = LineCollection(segs, colors="black", linewidths=0.8,
-                        capstyle="round", joinstyle="round")
-    ax.add_collection(lc)
+    if face_polys:
+        ordered = sorted(face_polys, key=lambda item: item[0])
+        pc = PolyCollection([poly for _, poly, _ in ordered],
+                            facecolors=[color for _, _, color in ordered],
+                            edgecolors="none", linewidths=0.0,
+                            antialiaseds=True)
+        ax.add_collection(pc)
+    else:
+        lc = LineCollection(segs, colors="black", linewidths=0.8,
+                            capstyle="round", joinstyle="round")
+        ax.add_collection(lc)
     ax.set_xlim(xmin - margin, xmax + margin)
     ax.set_ylim(ymin - margin, ymax + margin)
     ax.set_aspect("equal")
@@ -965,14 +1251,15 @@ def export_generated_python(features: List[Feature], py_path: str,
             edges_def = params["edges"]
             depth = float(params["depth"])
             plane = params.get("plane", "XZ")
+            offset = float(params.get("offset", 0.0) or 0.0)
             if plane == "XY":
-                lift = lambda u, v: App.Vector(float(u), float(v), 0.0)
+                lift = lambda u, v: App.Vector(float(u), float(v), offset)
                 ev = App.Vector(0.0, 0.0, depth)
             elif plane == "XZ":
-                lift = lambda u, v: App.Vector(float(u), 0.0, float(v))
+                lift = lambda u, v: App.Vector(float(u), offset, float(v))
                 ev = App.Vector(0.0, depth, 0.0)
             elif plane == "YZ":
-                lift = lambda u, v: App.Vector(0.0, float(u), float(v))
+                lift = lambda u, v: App.Vector(offset, float(u), float(v))
                 ev = App.Vector(depth, 0.0, 0.0)
             else:
                 raise ValueError("unknown plane: " + plane)

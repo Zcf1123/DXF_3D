@@ -257,6 +257,7 @@ _HIDDEN_LAYER_TOKENS: frozenset = frozenset({
     "HIDDEN", "HIDE", "DASH", "DASHED", "PHANTOM",
     "VERDECKT", "MASQUE", "NASCOSTA", "虚线",
 })
+_HIDDEN_LAYER_EXACT_TOKENS: frozenset = frozenset({"HID"})
 
 # Standard AutoCAD linetype names (group code 6) that represent dashed/hidden lines.
 _HIDDEN_LINETYPE_TOKENS: frozenset = frozenset({
@@ -287,14 +288,27 @@ def _is_hidden_entity(e: DxfEntity) -> bool:
         desc = (e.extra.get("linetype_desc") or "").upper()
         if desc and any(tok in desc for tok in _HIDDEN_LINETYPE_TOKENS):
             return True
-    upper = e.layer.upper()
-    return any(tok in upper for tok in _HIDDEN_LAYER_TOKENS)
+    return _is_hidden_layer(e.layer)
 
 
 # Keep old name as alias so any external callers still work.
 def _is_hidden_layer(layer: str) -> bool:
-    upper = layer.upper()
-    return any(tok in upper for tok in _HIDDEN_LAYER_TOKENS)
+    upper = (layer or "").upper()
+    if any(tok in upper for tok in _HIDDEN_LAYER_TOKENS):
+        return True
+
+    parts: List[str] = []
+    cur: List[str] = []
+    for ch in upper:
+        if ch.isalnum():
+            cur.append(ch)
+        else:
+            if cur:
+                parts.append("".join(cur))
+                cur = []
+    if cur:
+        parts.append("".join(cur))
+    return any(part in _HIDDEN_LAYER_EXACT_TOKENS for part in parts)
 
 
 def _bbox_range(e: DxfEntity, axis: str) -> Optional[Tuple[float, float]]:
@@ -451,14 +465,28 @@ def infer_features(projected: Dict[str, ProjectedView],
             extrusion_depth = depth
         else:  # right
             extrusion_depth = width
+        circular_profile = _outline_as_circle(
+            outline,
+            max(max(outline.width, outline.height, 1e-6) * 0.01, 1e-6),
+        )
+        if circular_profile is not None:
+            cx, cy, radius = circular_profile
+            edges = [{
+                "kind": "CIRCLE",
+                "center": [float(cx), float(cy)],
+                "radius": float(radius),
+            }]
+        else:
+            edges = [_serialize_edge(e) for e in outline.edges]
         features.append(Feature(
             kind="extrude_profile",
             params={
                 "plane": plane,
                 "depth": extrusion_depth,
                 "source_view": profile_view,
-                "edges": [_serialize_edge(e) for e in outline.edges],
+                "edges": edges,
                 "bbox_2d": list(outline.bbox),
+                **({"cylindrical_profile": True} if circular_profile is not None else {}),
             },
         ))
     else:
@@ -488,6 +516,9 @@ def infer_features(projected: Dict[str, ProjectedView],
     for hole in hole_candidates:
         if _hole_has_hidden_evidence(hole, projected):
             features.append(hole)
+
+    features.extend(_infer_internal_profile_cuts(
+        projected, profile_view, width, depth, height))
 
     if profile_view == "top":
         features.extend(_infer_side_taper_cuts(projected, width, depth))
@@ -519,6 +550,167 @@ def infer_features(projected: Dict[str, ProjectedView],
             ))
 
     return features
+
+
+def _infer_internal_profile_cuts(
+    projected: Dict[str, ProjectedView],
+    profile_view: Optional[str],
+    width: float,
+    depth: float,
+    height: float,
+) -> List[Feature]:
+    axis_depth = {"top": height, "front": depth, "right": width}
+    cuts: List[Feature] = []
+    seen: set = set()
+    for view_name in ("front", "top", "right"):
+        pv = projected.get(view_name)
+        if pv is None:
+            continue
+        bundle = ViewBundle(
+            name=pv.name,
+            bbox=(0.0, 0.0, pv.width, pv.height),
+            entities=pv.entities,
+        )
+        outlines, _circles = extract_closed_outlines_and_circles(
+            bundle, hidden_pred=_is_hidden_entity)
+        if len(outlines) < 2:
+            continue
+        outer = outlines[0]
+        scale = max(pv.width, pv.height, 1e-6)
+        tol = max(scale * 0.01, 1e-6)
+        for outline in outlines[1:]:
+            if not _outline_inside_outline(outline, outer, tol):
+                continue
+            if min(outline.width, outline.height) <= scale * 0.01:
+                continue
+            circular = _outline_as_circle(outline, tol)
+            if circular is not None:
+                cx, cy, radius = circular
+                hole = _circle_to_hole(view_name, cx, cy, radius,
+                                       width, depth, height)
+                if hole is not None:
+                    _apply_hidden_hole_extent(hole, projected, width, depth, height)
+                    if _hole_has_hidden_evidence(hole, projected):
+                        cuts.append(hole)
+                    continue
+            depth_value = float(axis_depth.get(view_name, 0.0) or 0.0)
+            offset = 0.0
+            span = None
+            if not _is_visible_internal_top_rectangle(view_name, outline):
+                span = _internal_cut_span_from_cross_view(
+                    view_name, outline, projected, width, depth, height, tol)
+            if span is not None:
+                offset, end = span
+                depth_value = max(0.0, end - offset)
+            if depth_value <= 0:
+                continue
+            key = (
+                view_name,
+                tuple(round(float(v) / tol) for v in outline.bbox),
+                len(outline.edges),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            cuts.append(Feature(
+                kind="profile_cut",
+                params={
+                    "plane": _VIEW_PLANE[view_name],
+                    "depth": depth_value,
+                    "offset": offset,
+                    "source_view": view_name,
+                    "edges": [_serialize_edge(edge) for edge in outline.edges],
+                    "bbox_2d": list(outline.bbox),
+                    "internal_profile_cut": True,
+                    "source_hidden": False,
+                },
+            ))
+    return cuts
+
+
+def _internal_cut_span_from_cross_view(
+    view_name: str,
+    outline: Outline,
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+    tol: float,
+) -> Optional[Tuple[float, float]]:
+    if view_name == "top":
+        front = projected.get("front")
+        if front is None:
+            return None
+        bundle = ViewBundle(
+            name=front.name,
+            bbox=(0.0, 0.0, front.width, front.height),
+            entities=front.entities,
+        )
+        outlines, _circles = extract_closed_outlines_and_circles(
+            bundle, hidden_pred=_is_hidden_entity)
+        candidates: List[Tuple[float, float]] = []
+        ox0, _oy0, ox1, _oy1 = outline.bbox
+        for candidate in outlines[1:]:
+            circular = _outline_as_circle(candidate, tol)
+            if circular is None:
+                continue
+            cx0, cz0, cx1, cz1 = candidate.bbox
+            if _interval_overlaps(ox0, ox1, cx0, cx1):
+                candidates.append((float(cz0), float(cz1)))
+        if not candidates:
+            return None
+        return min(span[0] for span in candidates), max(span[1] for span in candidates)
+    return None
+
+
+def _outline_inside_outline(inner: Outline, outer: Outline, tol: float) -> bool:
+    ix0, iy0, ix1, iy1 = inner.bbox
+    ox0, oy0, ox1, oy1 = outer.bbox
+    return (
+        ix0 >= ox0 + tol
+        and iy0 >= oy0 + tol
+        and ix1 <= ox1 - tol
+        and iy1 <= oy1 - tol
+    )
+
+
+def _is_visible_internal_top_rectangle(view_name: str, outline: Outline) -> bool:
+    if view_name != "top" or len(outline.edges) != 4:
+        return False
+    for edge in outline.edges:
+        if edge.get("kind") != "LINE":
+            return False
+        x0, y0 = edge["p0"]
+        x1, y1 = edge["p1"]
+        if abs(float(x0) - float(x1)) > 1e-6 and abs(float(y0) - float(y1)) > 1e-6:
+            return False
+    return True
+
+
+def _outline_as_circle(outline: Outline, tol: float) -> Optional[Tuple[float, float, float]]:
+    if len(outline.edges) < 12:
+        return None
+    min_x, min_y, max_x, max_y = outline.bbox
+    width = max_x - min_x
+    height = max_y - min_y
+    radius = (width + height) * 0.25
+    if radius <= tol:
+        return None
+    if abs(width - height) > max(radius * 0.08, tol * 2.0):
+        return None
+    cx = (min_x + max_x) * 0.5
+    cy = (min_y + max_y) * 0.5
+    samples: List[Tuple[float, float]] = []
+    for edge in outline.edges:
+        samples.append((float(edge["p0"][0]), float(edge["p0"][1])))
+        samples.append((float(edge["p1"][0]), float(edge["p1"][1])))
+    if not samples:
+        return None
+    max_error = max(abs(((x - cx) ** 2 + (y - cy) ** 2) ** 0.5 - radius)
+                    for x, y in samples)
+    if max_error > max(radius * 0.06, tol * 3.0):
+        return None
+    return float(cx), float(cy), float(radius)
 
 
 def _infer_side_taper_cuts(
@@ -926,6 +1118,8 @@ def _hidden_span_for_projection(
         overlap = _bbox_range(entity, overlap_axis)
         span = _bbox_range(entity, span_axis)
         if overlap is None or span is None:
+            continue
+        if abs(float(span[1]) - float(span[0])) <= max((hi - lo) * 0.05, 1e-3):
             continue
         if _interval_overlaps(lo, hi, overlap[0], overlap[1]):
             spans.append(span)
