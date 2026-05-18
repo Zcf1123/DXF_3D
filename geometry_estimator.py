@@ -28,11 +28,12 @@ from .projection_mapper import ProjectedView
 # Per-view mapping:  (horizontal_axis, vertical_axis)
 # FRONT (XZ): horizontal = W (along X), vertical = H (along Z)
 # TOP   (XY): horizontal = W (along X), vertical = D (along Y)
-# RIGHT (YZ): horizontal = D (along Y), vertical = H (along Z)
+# LEFT (YZ): horizontal = D (along Y), vertical = H (along Z)
 _VIEW_AXIS_MAP: Dict[str, Tuple[str, str]] = {
     "front": ("W", "H"),
     "top":   ("W", "D"),
-    "right": ("D", "H"),
+    "left":  ("D", "H"),
+    "right": ("D", "H"),  # backward compatibility
 }
 
 
@@ -385,7 +386,7 @@ def estimate_part_size(
     """
     front = projected.get("front")
     top   = projected.get("top")
-    right = projected.get("right")
+    left = projected.get("left") or projected.get("right")
 
     # --- 1. Attempt dimension-based estimates ---
     dim_W: Optional[float] = None
@@ -407,8 +408,8 @@ def estimate_part_size(
         Ws.append(front.width); Hs.append(front.height)
     if top is not None:
         Ws.append(top.width); Ds.append(top.height)
-    if right is not None:
-        Ds.append(right.width); Hs.append(right.height)
+    if left is not None:
+        Ds.append(left.width); Hs.append(left.height)
 
     bbox_W = sum(Ws) / len(Ws) if Ws else 10.0
     bbox_D = sum(Ds) / len(Ds) if Ds else 10.0

@@ -285,7 +285,7 @@ def process_dxf(dxf_path: str, llm,
         for name, pv in projected.items():
             log.info("投影 %-6s -> 平面 %s, 尺寸 %.3f × %.3f, 实体数=%d",
                      name, pv.plane, pv.width, pv.height, len(pv.entities))
-        draft = infer_features(projected, bundles, single_view_extrude_depth)
+        draft = infer_features(projected, bundles, single_view_extrude_depth, model_intent)
         # Log dimension-source breakdown for W/D/H
         from .geometry_estimator import _dim_measurements_by_axis
         dim_info = _dim_measurements_by_axis(bundles)
@@ -413,13 +413,14 @@ def process_dxf(dxf_path: str, llm,
                 fcstd_path, projected, features, validation_path)
             log.info("反投影验证    : %s", validation.get("status"))
             _say(f"Projection   : {validation.get('status')}")
-            for view_name in ("front", "right", "top"):
+            view_display = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}
+            for view_name in ("front", "left", "top"):
                 report = validation.get("views", {}).get(view_name)
                 if not report:
                     continue
                 log.info(
                     "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
-                    view_name,
+                    view_display.get(view_name, view_name.upper()),
                     report.get("status"),
                     float(report.get("input_coverage", 0.0)) * 100.0,
                     float(report.get("model_match", 0.0)) * 100.0,
@@ -428,7 +429,7 @@ def process_dxf(dxf_path: str, llm,
                 )
                 _say(
                     "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
-                        name=view_name.upper(),
+                        name=view_display.get(view_name, view_name.upper()),
                         status=str(report.get("status", "")),
                         input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
                         model_match=float(report.get("model_match", 0.0)) * 100.0,
@@ -448,7 +449,7 @@ def process_dxf(dxf_path: str, llm,
             ("归一化三视图 PNG", lambda: export_normalized_views_png(
                 projected, normalized_png)),
             ("模型三视图 PNG",  lambda: export_model_views_png(
-                fcstd_path, model_views_png, features)),
+                fcstd_path, model_views_png, features, projected)),
             ("3D 总览 PNG",      lambda: export_iso_overview_png(
                 fcstd_path, overview_png)),
             ("model.json",      lambda: export_model_json(

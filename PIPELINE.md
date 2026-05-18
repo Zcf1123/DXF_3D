@@ -103,7 +103,7 @@ outputs/<YYYYMMDD>_<HHMMSS>_<文件名>/
 ```
 cluster.center.x ≤ mx  且  cluster.center.y ≥ my  →  front（左上）
 cluster.center.x ≤ mx  且  cluster.center.y < my   →  top  （左下）
-cluster.center.x > mx  且  cluster.center.y ≥ my   →  right（右上）
+cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 右下象限                                            →  不使用
 ```
 
@@ -148,7 +148,7 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  right（右上）
 |------|--------|--------------|--------------|
 | front | XZ | X | Z |
 | top | XY | X | Y |
-| right | YZ | Y | Z |
+| left | YZ | Y | Z |
 
 ### 3b — 零件尺寸估算（`geometry_estimator.py`）
 
@@ -174,13 +174,13 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  right（右上）
 | 每条 ARC 边 | +11（+1 边 +10 加成） |
 | TOP 视图有圆孔且轮廓是多边形（六角形等） | 额外 +25 |
 
-取分值最高的视图作为拉伸基面（首选 top，次选 front，次次选 right）：
+取分值最高的视图作为拉伸基面（首选 top，次选 front，次次选 left）：
 
 | source_view | plane | 拉伸轴 | depth 含义 |
 |-------------|-------|--------|-----------|
 | top | XY | +Z | 高度 H |
 | front | XZ | +Y | 进深 D |
-| right | YZ | +X | 宽度 W |
+| left（LEFT 左视图） | YZ | +X | 宽度 W |
 
 若无任何闭合轮廓，退化为 `base_block`（包围盒长方体）。
 
@@ -192,11 +192,11 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  right（右上）
 - 检查 HIDDEN 实体的 bbox 是否与孔投影范围重叠（容差 = max(r×15%, 0.5mm)）
 - 有重叠 → 保留；无重叠但无 HIDDEN 层 → 默认保留（DXF 可能省略虚线）；有 HIDDEN 层但无重叠 → 过滤
 
-孔轴方向由来源视图决定：top→Z，front→Y，right→X
+孔轴方向由来源视图决定：top→Z，front→Y，left→X。
 
 #### ④ 倒角识别
 
-若 front / right 视图顶部或底部边有 ARC，推断存在 `edge_chamfer`。
+若 front / left 视图顶部或底部边有 ARC，推断存在 `edge_chamfer`。
 
 **输出：** `features_draft.json`
 
@@ -271,7 +271,7 @@ FreeCAD 文档中包含以下对象：
 | `Result` | 最终 3D 实体（唯一的 solid） |
 | `DXF_FRONT` | 前视图原始边线（edge compound，供对照） |
 | `DXF_TOP` | 俯视图原始边线 |
-| `DXF_RIGHT` | 侧视图原始边线 |
+| `DXF_LEFT` | 左视图原始边线 |
 
 **输出：** `<base>.FCStd`
 

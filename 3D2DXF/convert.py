@@ -102,7 +102,7 @@ class DXFWriter:
 def edge_to_ents(edge, ax, ay, sx=1.0, sy=1.0, layer="0", lt=""):
     """
     把 FreeCAD 投影边（TechDraw.projectEx 返回，均在 Z=0 平面）转为 DXF 实体。
-    ax, ay : 从投影点读取的轴索引（0=x,1=y）；front/right 用 ax=1,ay=0；top 用 ax=0,ay=1
+    ax, ay : 从投影点读取的轴索引（0=x,1=y）；front/left 用 ax=1,ay=0；top 用 ax=0,ay=1
     sx, sy : 方向缩放（-1 翻转）
     """
     import Part
@@ -165,7 +165,7 @@ def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
     TechDraw.projectEx 返回的投影边均在 Z=0 平面：
       - 沿 +Y 投影（front）: result.x=worldZ, result.y=worldX  → ax=1, ay=0
       - 沿 +Z 投影（top）  : result.x=worldX, result.y=worldY  → ax=0, ay=1
-      - 沿 +X 投影（right）: result.x=worldZ, result.y=worldY  → ax=1, ay=0
+    - 沿 +X 投影（left） : result.x=worldZ, result.y=worldY  → ax=1, ay=0
     """
     import FreeCAD
     import TechDraw
@@ -280,7 +280,7 @@ def convert(input_path, output_path):
     # TechDraw.projectEx 投影结果均在 Z=0 平面：
     #   沿 +Y（front）: result.x=worldZ, result.y=worldX → ax=1,ay=0
     #   沿 +Z（top）  : result.x=worldX, result.y=worldY → ax=0,ay=1
-    #   沿 +X（right）: result.x=worldZ, result.y=worldY → ax=1,ay=0
+    #   沿 +X（left） : result.x=worldZ, result.y=worldY → ax=1,ay=0
     print("  投影主视图 (front) ...")
     front = project_view(shape, (0, 1, 0), ax=1, ay=0,
                          lvis="FRONT", lhid="FRONT_HID")
@@ -289,26 +289,26 @@ def convert(input_path, output_path):
     top = project_view(shape, (0, 0, 1), ax=0, ay=1,
                        lvis="TOP", lhid="TOP_HID")
 
-    print("  投影右视图 (right) ...")
-    right = project_view(shape, (1, 0, 0), ax=1, ay=0,
-                         lvis="RIGHT", lhid="RIGHT_HID")
+    print("  投影左视图 (left, 从左向右看) ...")
+    left = project_view(shape, (1, 0, 0), ax=1, ay=0,
+                        lvis="LEFT", lhid="LEFT_HID")
 
     # 各视图归零到左下角原点
     front, fw, fh = normalize(front)
     top,   tw, th = normalize(top)
-    right, rw, rh = normalize(right)
+    left,  lw, lh = normalize(left)
 
     # 视图间距：视图最大尺寸的 20%，至少 1 单位
-    max_dim = max(fw, fh, tw, th, rw, rh, 1e-6)
+    max_dim = max(fw, fh, tw, th, lw, lh, 1e-6)
     GAP = max(max_dim * 0.2, 1e-3)
-    print(f"  视图尺寸 front={fw:.3f}x{fh:.3f}  top={tw:.3f}x{th:.3f}  right={rw:.3f}x{rh:.3f}  GAP={GAP:.3f}")
+    print(f"  视图尺寸 front={fw:.3f}x{fh:.3f}  top={tw:.3f}x{th:.3f}  left={lw:.3f}x{lh:.3f}  GAP={GAP:.3f}")
 
-    # 布局（第一角投影，与本项目 FRONT/RIGHT/TOP 约定一致）：
-    #   FRONT（左上）  RIGHT（右上）
+    # 布局（本项目固定布局）：
+    #   FRONT（左上）  LEFT（右上，从左向右看）
     #   TOP  （左下）
     all_ents = (
         shift_ents(front, 0,          th + GAP) +
-        shift_ents(right, fw + GAP,   th + GAP) +
+        shift_ents(left,  fw + GAP,   th + GAP) +
         shift_ents(top,   0,          0)
     )
 

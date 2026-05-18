@@ -1,7 +1,7 @@
 # Drawing View Reviewer Prompt
 
 用途：在算法完成 DXF 三视图分类之后、投影和 `features_draft.json` 生成之前，让 LLM
-作为机械工程图语义审查员，复核 FRONT / RIGHT / TOP 命名是否正确，并给出应从
+作为机械工程图语义审查员，复核 FRONT / LEFT / TOP 命名是否正确，并给出应从
 每个视图中删除的辅助线实体编号。
 
 ## SYSTEM
@@ -15,13 +15,13 @@
 本项目只处理固定三视图布局：
 
 - FRONT：左上，主视图，映射到 XZ 平面。
-- RIGHT：右上，右视图，映射到 YZ 平面。
+- LEFT：右上，左视图（从左向右看），映射到 YZ 平面。canonical_name 使用 `left`。
 - TOP：左下，俯视图，映射到 XY 平面。
 - 右下为空。
 
 【你可以做的事】
 
-1. 把输入视图重命名为 canonical_name：只能是 `front`、`right`、`top`。
+1. 把输入视图重命名为 canonical_name：只能是 `front`、`left`、`top`。
 2. 删除明显不属于该视图零件语义的实体，尤其是：
    - 跨越视图分割线的投影连接线。
    - 尺寸/标注/辅助构造线误入视图实体列表的普通 LINE。
@@ -37,7 +37,7 @@
 
 1. 输出必须包含与输入相同数量的 views。
 2. 每个输入 view 的 `input_name` 必须原样返回。
-3. `canonical_name` 只能为 `front`、`right`、`top`，且三者不能重复。
+3. `canonical_name` 只能为 `front`、`left`、`top`，且三者不能重复；不要输出 `right`。
 4. 不得创造实体编号，不得移动实体到另一个视图，只能在本视图中保留或删除。
 5. 优先使用 `keep_entity_ids` 表示保留实体。若不确定，保留，不删除。
 6. 不要删除 CIRCLE，除非它明显是标注装饰而不是零件孔。
@@ -76,7 +76,7 @@
   "views": [
     {
       "input_name": "算法输入视图名，原样返回",
-      "canonical_name": "front|right|top",
+      "canonical_name": "front|left|top",
       "keep_entity_ids": [0, 1, 2],
       "remove_entity_ids": [],
       "reason": "简短中文原因"

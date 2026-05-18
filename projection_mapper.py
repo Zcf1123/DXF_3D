@@ -3,7 +3,7 @@
 Convention (third-angle projection, Z-up):
     front view -> XZ plane    (drawing x -> world X, drawing y -> world Z)
     top view   -> XY plane    (drawing x -> world X, drawing y -> world Y)
-    right view -> YZ plane    (drawing x -> world Y, drawing y -> world Z)
+    left view  -> YZ plane    (drawing x -> world Y, drawing y -> world Z)
 
 Each view is first translated so that the bottom-left of its bbox sits at
 the origin in its 2D coordinate frame. The mapping then lifts entities
@@ -41,7 +41,8 @@ class ProjectedView:
 PLANE_FOR = {
     "front": "XZ",
     "top":   "XY",
-    "right": "YZ",
+    "left":  "YZ",
+    "right": "YZ",  # backward compatibility for old JSON/prompts
 }
 
 
@@ -92,6 +93,6 @@ def lift_2d_to_3d(plane: str, x: float, y: float,
         return (x, depth, y)
     if plane == "XY":   # top
         return (x, y, depth)
-    if plane == "YZ":   # right
+    if plane == "YZ":   # left view
         return (depth, x, y)
     raise ValueError(f"Unknown plane: {plane}")

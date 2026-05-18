@@ -89,7 +89,7 @@ cd 3D2DXF
 
 ```
 ┌────────────────┬────────────────┐
-│  FRONT（主视） │  RIGHT（右视） │
+│  FRONT（主视） │  LEFT（左视）  │
 ├────────────────┘                │
 │  TOP（俯视）                    │
 └─────────────────────────────────┘
@@ -107,8 +107,8 @@ cd 3D2DXF
 | `FRONT_HID` | 虚线 | 主视图隐藏线（被遮挡轮廓） |
 | `TOP` | 实线 | 俯视图可见轮廓 |
 | `TOP_HID` | 虚线 | 俯视图隐藏线 |
-| `RIGHT` | 实线 | 右视图可见轮廓 |
-| `RIGHT_HID` | 虚线 | 右视图隐藏线 |
+| `LEFT` | 实线 | 左视图可见轮廓（从左向右看） |
+| `LEFT_HID` | 虚线 | 左视图隐藏线 |
 
 DXF 格式为 R12（AC1009），兼容 AutoCAD、FreeCAD、LibreCAD 等主流 CAD 软件。
 
@@ -152,14 +152,14 @@ STL/OBJ 先以 `Mesh` 模块读取网格，再通过 `makeShapeFromMesh` + `remo
 |------|----------|----------|
 | 主视图（front） | +Y 轴 | XZ 平面 |
 | 俯视图（top） | +Z 轴 | XY 平面 |
-| 右视图（right） | +X 轴 | YZ 平面 |
+| 左视图（left） | +X 轴 | YZ 平面 |
 
 `TechDraw.projectEx` 返回 10 个化合物（compound），前 5 个为可见边，后 5 个为隐藏边，分别包含 hard edges、smooth edges、sewn edges、outline edges、iso edges 五类。
 
 投影结果的坐标均落在 Z=0 平面，坐标映射关系：
 - front（+Y 投影）：result.x = worldZ，result.y = worldX
 - top（+Z 投影）：result.x = worldX，result.y = worldY
-- right（+X 投影）：result.x = worldZ，result.y = worldY
+- left（+X 投影，从左向右看）：result.x = worldZ，result.y = worldY
 
 **3. 边转 DXF 实体（`edge_to_ents`）**
 
@@ -179,19 +179,19 @@ STL/OBJ 先以 `Mesh` 模块读取网格，再通过 `makeShapeFromMesh` + `remo
 如需调整三视图的排列方式，修改 `convert.py` 中 `convert()` 函数末尾的布局代码：
 
 ```python
-# 第一角投影（当前默认）：FRONT 左上，RIGHT 右上，TOP 左下
+# 固定布局（当前默认）：FRONT 左上，LEFT 右上，TOP 左下
 all_ents = (
     shift_ents(front, 0,          th + GAP) +
-    shift_ents(right, fw + GAP,   th + GAP) +
+   shift_ents(left,  fw + GAP,   th + GAP) +
     shift_ents(top,   0,          0)
 )
 
-# 第三角投影（美国标准）：TOP 左上，FRONT 左下，RIGHT 右下
+# 第三角投影示例：TOP 左上，FRONT 左下，LEFT 右下
 all_ents = (
     shift_ents(top,   0,          fh + GAP) +
     shift_ents(front, 0,          0) +
-    shift_ents(right, fw + GAP,   0)
+   shift_ents(left,  fw + GAP,   0)
 )
 ```
 
-其中 `fw/fh`、`tw/th`、`rw/rh` 分别是主/俯/右视图的宽度和高度，`GAP` 为视图间距（自动计算为最大视图尺寸的 20%）。
+其中 `fw/fh`、`tw/th`、`lw/lh` 分别是主/俯/左视图的宽度和高度，`GAP` 为视图间距（自动计算为最大视图尺寸的 20%）。

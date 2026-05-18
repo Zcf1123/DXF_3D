@@ -1,9 +1,9 @@
-"""Cluster DXF entities into the three views (front / top / right).
+"""Cluster DXF entities into the three views (front / top / left).
 
 View-layout convention (see ../README.md), FIXED:
 
        +----------------+----------------+
-       |  FRONT (TL)    |  RIGHT (TR)    |
+    |  FRONT (TL)    |  LEFT  (TR)    |
        +----------------+----------------+
        |  TOP   (BL)    |   (empty)      |
        +----------------+----------------+
@@ -31,7 +31,7 @@ ANNOTATION_KINDS = {"TEXT", "MTEXT", "DIMENSION", "HATCH", "SOLID"}
 
 @dataclass
 class ViewBundle:
-    name: str                                # "front" | "top" | "right" | "unknown_<i>"
+    name: str                                # "front" | "top" | "left" | "unknown_<i>"
     bbox: Tuple[float, float, float, float]
     entities: List[DxfEntity] = field(default_factory=list)
     annotations: List[DxfEntity] = field(default_factory=list)
@@ -102,7 +102,7 @@ def classify_views(entities: List[DxfEntity]) -> List[ViewBundle]:
 
     if divider_mx is not None:
         # Groups from _partition_by_dividers are always in tl/tr/bl order.
-        _DIVIDER_NAMES = ["front", "right", "top"]
+        _DIVIDER_NAMES = ["front", "left", "top"]
         for i, b in enumerate(bundles):
             if i < len(_DIVIDER_NAMES):
                 b.name = _DIVIDER_NAMES[i]
@@ -297,7 +297,7 @@ def _partition_by_dividers(
 
     Quadrant mapping (y-up DXF convention):
         top-left  (cx <= x_div, cy >= y_div)  → FRONT
-        top-right (cx >  x_div, cy >= y_div)  → RIGHT
+        top-right (cx >  x_div, cy >= y_div)  → LEFT
         bot-left  (cx <= x_div, cy <  y_div)  → TOP
         bot-right                              → ignored (empty in standard layout)
 
@@ -515,7 +515,7 @@ def _assign_by_layout(
 ) -> None:
     """Assign names by quadrant against the overall drawing bbox.
 
-       FRONT (top-left)     RIGHT (top-right)
+    FRONT (top-left)     LEFT  (top-right)
        TOP   (bottom-left)
 
     *mx* and *my* are the divider coordinates.  When not supplied they are
@@ -534,7 +534,7 @@ def _assign_by_layout(
         if my is None:
             my = (ys0 + ys1) * 0.5
 
-    quad: Dict[str, List[ViewBundle]] = {"front": [], "top": [], "right": []}
+    quad: Dict[str, List[ViewBundle]] = {"front": [], "top": [], "left": []}
     for b in bundles:
         cx, cy = b.center
         if cx <= mx and cy >= my:
@@ -542,7 +542,7 @@ def _assign_by_layout(
         elif cx <= mx and cy < my:
             quad["top"].append(b)
         elif cx > mx and cy >= my:
-            quad["right"].append(b)
+            quad["left"].append(b)
         # bottom-right quadrant is unused per spec; leave such clusters
         # with their default unknown name.
 

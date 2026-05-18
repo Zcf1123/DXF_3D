@@ -2,7 +2,7 @@
 
 Outputs a `.FCStd` file containing:
   - "Result"          : the final 3D solid
-  - "DXF_FRONT/TOP/RIGHT" : the original 2D three-view drawings embedded as
+    - "DXF_FRONT/TOP/LEFT" : the original 2D three-view drawings embedded as
                             edge compounds in their respective 3D planes,
                             so they are visible in the model tree alongside
                             the solid.
@@ -56,19 +56,21 @@ def _direct_build(features: List[Feature], out_dir: str,
 
     for f in features:
         if f.kind == "extrude_profile":
-            solid = _extrude_profile(f.params)
+            solid = _add_base_solid(solid, _extrude_profile(f.params), warnings, f)
         elif f.kind == "base_block":
             p = f.params
             ox, oy, oz = p.get("origin", [0, 0, 0])
-            solid = Part.makeBox(p["width"], p["depth"], p["height"],
-                                 App.Vector(ox, oy, oz))
+            base = Part.makeBox(p["width"], p["depth"], p["height"],
+                                App.Vector(ox, oy, oz))
+            solid = _add_base_solid(solid, base, warnings, f)
         elif f.kind == "sphere":
             p = f.params
             x, y, z = p.get("center", [0, 0, 0])
-            solid = Part.makeSphere(float(p["radius"]),
-                                    App.Vector(float(x), float(y), float(z)))
+            base = Part.makeSphere(float(p["radius"]),
+                                   App.Vector(float(x), float(y), float(z)))
+            solid = _add_base_solid(solid, base, warnings, f)
         elif f.kind == "cylinder_stack":
-            solid = _make_cylinder_stack(f.params)
+            solid = _add_base_solid(solid, _make_cylinder_stack(f.params), warnings, f)
         elif f.kind == "hole" and solid is not None:
             cyl = _make_hole_cylinder(f.params)
             if cyl is not None:
@@ -120,6 +122,23 @@ def _direct_build(features: List[Feature], out_dir: str,
     return {"fcstd": fc_path, "warnings": warnings}
 
 
+def _add_base_solid(current, new_solid, warnings: List[str], feature: Feature):
+    if new_solid is None:
+        warnings.append(f"base solid could not be created: {feature.params}")
+        return current
+    if current is None:
+        return new_solid
+    try:
+        fused = current.fuse(new_solid)
+        try:
+            return fused.removeSplitter()
+        except Exception:
+            return fused
+    except Exception as exc:
+        warnings.append(f"base fuse failed for {feature.params}: {exc}")
+        return current
+
+
 # ---------------------------------------------------------------------------
 # 2-D view embedding
 # ---------------------------------------------------------------------------
@@ -129,7 +148,7 @@ def _direct_build(features: List[Feature], out_dir: str,
 _LIFT_FN = {
     "XZ": lambda App, u, v: App.Vector(float(u), 0.0, float(v)),   # front
     "XY": lambda App, u, v: App.Vector(float(u), float(v), 0.0),   # top
-    "YZ": lambda App, u, v: App.Vector(0.0, float(u), float(v)),   # right
+    "YZ": lambda App, u, v: App.Vector(0.0, float(u), float(v)),   # left view
 }
 
 # Normal axis of each sketch plane (used for circles).
@@ -141,7 +160,7 @@ _PLANE_AXIS = {
 
 
 def _add_2d_views(doc, projected: Dict[str, Any]) -> None:
-    """Add DXF_FRONT / DXF_TOP / DXF_RIGHT as Part::Feature edge compounds.
+    """Add DXF_FRONT / DXF_TOP / DXF_LEFT as Part::Feature edge compounds.
 
     Each object lives in the FreeCAD model tree alongside the solid.  The
     entities are already normalised to origin-relative 2-D coords by
@@ -166,7 +185,8 @@ def _add_2d_views(doc, projected: Dict[str, Any]) -> None:
             continue
 
         compound = Part.Compound(fc_edges)
-        label = f"DXF_{view_name.upper()}"
+        display_name = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}.get(view_name, view_name.upper())
+        label = f"DXF_{display_name}"
         obj = doc.addObject("Part::Feature", label)
         obj.Shape = compound
 
@@ -180,7 +200,7 @@ def _is_single_view_extrude(features: List[Feature]) -> bool:
 
 
 def _add_model_projection_views(doc, solid, existing: set) -> None:
-    """Add generated FRONT/TOP/RIGHT view linework from the final solid.
+    """Add generated FRONT/TOP/LEFT view linework from the final solid.
 
     Single-view inputs only contain TOP linework, but downstream inspection is
     easier when the FCStd also contains generated orthographic projections.
@@ -203,7 +223,7 @@ def _add_model_projection_views(doc, solid, existing: set) -> None:
             return App.Vector(u, v, 0.0)
         return App.Vector(0.0, u, v)
 
-    for view_name in ("front", "top", "right"):
+    for view_name in ("front", "top", "left"):
         if view_name in existing:
             continue
         edges = []
@@ -226,7 +246,8 @@ def _add_model_projection_views(doc, solid, existing: set) -> None:
                 except Exception:
                     pass
         if edges:
-            obj = doc.addObject("Part::Feature", f"DXF_{view_name.upper()}_GENERATED")
+            display_name = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}.get(view_name, view_name.upper())
+            obj = doc.addObject("Part::Feature", f"DXF_{display_name}_GENERATED")
             obj.Shape = Part.Compound(edges)
 
 

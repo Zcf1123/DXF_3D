@@ -256,7 +256,21 @@ class LLMPlanner:
 # ---------------------------------------------------------------------------
 
 _ALLOWED_KINDS = {"extrude_profile", "base_block", "sphere", "cylinder_stack", "hole", "profile_cut", "edge_chamfer"}
-_CANONICAL_VIEWS = {"front", "top", "right"}
+_CANONICAL_VIEWS = {"front", "top", "left"}
+
+
+def _normalize_view_name(name: Any) -> Any:
+    return "left" if name == "right" else name
+
+
+def _normalize_feature_views(feature: Dict[str, Any]) -> None:
+    params = feature.get("params")
+    if not isinstance(params, dict):
+        return
+    if "source_view" in params:
+        params["source_view"] = _normalize_view_name(params.get("source_view"))
+    if isinstance(params.get("source_views"), list):
+        params["source_views"] = [_normalize_view_name(v) for v in params["source_views"]]
 
 
 def _compact_features_for_prompt(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -365,7 +379,8 @@ def _validate_view_review(
         input_name = str(item.get("input_name"))
         if input_name not in by_input:
             return False, f"unknown input_name {input_name!r}"
-        canonical_name = item.get("canonical_name")
+        canonical_name = _normalize_view_name(item.get("canonical_name"))
+        item["canonical_name"] = canonical_name
         if canonical_name not in _CANONICAL_VIEWS:
             return False, f"invalid canonical_name {canonical_name!r}"
         if canonical_name in used_names:
@@ -479,11 +494,12 @@ def _validate_feature_schema(feature: Dict[str, Any]) -> Tuple[bool, str]:
     if not isinstance(params, dict):
         return False, f"{kind} params is not an object"
     if kind == "hole":
+        _normalize_feature_views(feature)
         if params.get("axis") not in {"X", "Y", "Z"}:
             return False, "hole axis invalid"
         if params.get("source_view") not in _CANONICAL_VIEWS:
             return False, "hole source_view invalid"
-        if {"top": "Z", "front": "Y", "right": "X"}.get(params.get("source_view")) != params.get("axis"):
+        if {"top": "Z", "front": "Y", "left": "X"}.get(params.get("source_view")) != params.get("axis"):
             return False, "hole axis/source_view mismatch"
         try:
             radius = float(params.get("radius"))
@@ -495,11 +511,12 @@ def _validate_feature_schema(feature: Dict[str, Any]) -> Tuple[bool, str]:
         except Exception:
             return False, "hole numeric params invalid"
     elif kind == "profile_cut":
+        _normalize_feature_views(feature)
         if params.get("plane") not in {"XY", "XZ", "YZ"}:
             return False, "profile_cut plane invalid"
         if params.get("source_view") not in _CANONICAL_VIEWS:
             return False, "profile_cut source_view invalid"
-        if {"top": "XY", "front": "XZ", "right": "YZ"}.get(params.get("source_view")) != params.get("plane"):
+        if {"top": "XY", "front": "XZ", "left": "YZ"}.get(params.get("source_view")) != params.get("plane"):
             return False, "profile_cut plane/source_view mismatch"
         edges = params.get("edges")
         if not isinstance(edges, list) or len(edges) < 3:
@@ -575,7 +592,7 @@ def _edge_chamfer_has_view_evidence(
         return False
 
     side_entities = []
-    for name in ("front", "right"):
+    for name in ("front", "left"):
         side_entities.extend(by_name.get(name, {}).get("entities", []))
     if not any(e.get("kind") == "ARC" for e in side_entities):
         return False
@@ -609,6 +626,10 @@ def _validate_base_feature(
         for key in ("plane", "source_view", "edges"):
             if bp.get(key) != ap.get(key):
                 return False, f"extrude_profile {key} changed"
+        if bp.get("additive_component"):
+            for key in ("depth", "offset", "additive_component"):
+                if bp.get(key) != ap.get(key):
+                    return False, f"additive extrude_profile {key} changed"
     elif kind == "base_block":
         for key in ("width", "depth", "height", "origin"):
             if key in bp and bp.get(key) != ap.get(key):

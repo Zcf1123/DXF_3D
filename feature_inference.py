@@ -7,15 +7,15 @@ Strategy:
      view by the perpendicular extent of the part.
        - top   outline -> profile in XY, extrude along +Z by H
        - front outline -> profile in XZ, extrude along +Y by D
-       - right outline -> profile in YZ, extrude along +X by W
+    - left outline -> profile in YZ, extrude along +X by W
      Falls back to a bounding-box block if no closed outline is found.
   2. A single same-radius CIRCLE in all three canonical views becomes a sphere
-      when the projected centers agree across TOP/FRONT/RIGHT.
+    when the projected centers agree across TOP/FRONT/LEFT.
   3. CIRCLE entities become through-holes:
        circle in TOP   view -> hole axis = Z
        circle in FRONT view -> hole axis = Y
-       circle in RIGHT view -> hole axis = X
-  4. For prismatic polygon profiles, visible front/right arc offsets become
+    circle in LEFT view -> hole axis = X
+    4. For prismatic polygon profiles, visible front/left arc offsets become
       a top/bottom arc-profile edge treatment.
 """
 from __future__ import annotations
@@ -45,7 +45,8 @@ class Feature:
 _VIEW_PLANE = {
     "top":   "XY",
     "front": "XZ",
-    "right": "YZ",
+    "left":  "YZ",
+    "right": "YZ",  # backward compatibility for old feature JSON
 }
 
 
@@ -126,7 +127,7 @@ def _infer_end_chamfer_distance(
     projected: Dict[str, ProjectedView],
     height: float,
 ) -> Optional[float]:
-    """Infer top/bottom chamfer distance from FRONT/RIGHT side views.
+    """Infer top/bottom chamfer distance from FRONT/LEFT side views.
 
     In this nut drawing, the side views keep short vertical side segments
     inset from z=0 and z=H and connect them to the end faces with arcs. The
@@ -136,7 +137,7 @@ def _infer_end_chamfer_distance(
     if height <= 0:
         return None
     candidates: List[float] = []
-    for view_name in ("front", "right"):
+    for view_name in ("front", "left"):
         pv = projected.get(view_name)
         if pv is None:
             continue
@@ -193,31 +194,31 @@ def _infer_sphere_feature(
     A through-hole usually appears as a circle in one view and hidden/parallel
     evidence in the other views. A sphere projects to a same-radius circle in
     all three canonical views, and the centers must agree under the fixed
-    TOP/FRONT/RIGHT coordinate mapping:
+    TOP/FRONT/LEFT coordinate mapping:
         TOP   circle center -> (X, Y)
         FRONT circle center -> (X, Z)
-        RIGHT circle center -> (Y, Z)
+        LEFT circle center -> (Y, Z)
     """
     required = {name: _visible_circles(projected.get(name))
-                for name in ("top", "front", "right")}
+                for name in ("top", "front", "left")}
     if any(len(circles) != 1 for circles in required.values()):
         return None
     if any(
         any(e.kind != "CIRCLE" for e in projected[name].entities)
-        for name in ("top", "front", "right")
+        for name in ("top", "front", "left")
     ):
         return None
 
     top = required["top"][0]
     front = required["front"][0]
-    right = required["right"][0]
-    assert top.center and front.center and right.center
+    left = required["left"][0]
+    assert top.center and front.center and left.center
     radius = float(top.radius or 0.0)
     if radius <= 0:
         return None
     scale = max(width, depth, height, radius * 2.0, 1.0)
     tol = max(scale * 0.03, 1e-3)
-    for circle in (front, right):
+    for circle in (front, left):
         if abs(float(circle.radius or 0.0) - radius) > tol:
             return None
     if any(abs(dim - 2.0 * radius) > tol for dim in (width, depth, height)):
@@ -225,12 +226,12 @@ def _infer_sphere_feature(
 
     x_from_top, y_from_top = top.center
     x_from_front, z_from_front = front.center
-    y_from_right, z_from_right = right.center
+    y_from_left, z_from_left = left.center
     if abs(float(x_from_top) - float(x_from_front)) > tol:
         return None
-    if abs(float(y_from_top) - float(y_from_right)) > tol:
+    if abs(float(y_from_top) - float(y_from_left)) > tol:
         return None
-    if abs(float(z_from_front) - float(z_from_right)) > tol:
+    if abs(float(z_from_front) - float(z_from_left)) > tol:
         return None
 
     return Feature(
@@ -239,10 +240,10 @@ def _infer_sphere_feature(
             "radius": radius,
             "center": [
                 (float(x_from_top) + float(x_from_front)) * 0.5,
-                (float(y_from_top) + float(y_from_right)) * 0.5,
-                (float(z_from_front) + float(z_from_right)) * 0.5,
+                (float(y_from_top) + float(y_from_left)) * 0.5,
+                (float(z_from_front) + float(z_from_left)) * 0.5,
             ],
-            "source_views": ["top", "front", "right"],
+            "source_views": ["top", "front", "left"],
         },
     )
 
@@ -357,13 +358,13 @@ def _hole_has_hidden_evidence(
 
     axis Z (source=top):
       FRONT checks bbox-x ∈ [hx ± r]   (draw.x → world X)
-      RIGHT checks bbox-x ∈ [hy ± r]   (draw.x → world Y)
+    LEFT checks bbox-x ∈ [hy ± r]   (draw.x → world Y)
 
     axis Y (source=front):
       TOP   checks bbox-x ∈ [hx ± r]   (draw.x → world X)
-      RIGHT checks bbox-y ∈ [hz ± r]   (draw.y → world Z)
+    LEFT checks bbox-y ∈ [hz ± r]   (draw.y → world Z)
 
-    axis X (source=right):
+    axis X (source=left):
       TOP   checks bbox-y ∈ [hy ± r]   (draw.y → world Y)
       FRONT checks bbox-y ∈ [hz ± r]   (draw.y → world Z)
 
@@ -380,9 +381,9 @@ def _hole_has_hidden_evidence(
     tol = max(r * 0.15, 0.5)   # 15 % of radius, min 0.5 mm
 
     if axis == "Z":
-        checks = [("front", "x", hx), ("right", "x", hy)]
+        checks = [("front", "x", hx), ("left", "x", hy)]
     elif axis == "Y":
-        checks = [("top",   "x", hx), ("right", "y", hz)]
+        checks = [("top",   "x", hx), ("left", "y", hz)]
     else:   # X
         checks = [("top",   "y", hy), ("front", "y", hz)]
 
@@ -403,7 +404,8 @@ def _hole_has_hidden_evidence(
 
 def infer_features(projected: Dict[str, ProjectedView],
                    bundles: Optional[List[ViewBundle]] = None,
-                   single_view_extrude_depth: Optional[float] = None) -> List[Feature]:
+                   single_view_extrude_depth: Optional[float] = None,
+                   model_intent: str = "") -> List[Feature]:
     if not projected:
         return []
 
@@ -412,6 +414,10 @@ def infer_features(projected: Dict[str, ProjectedView],
 
     width, depth, height = estimate_part_size(projected, bundles)
     features: List[Feature] = []
+
+    additive = _infer_additive_components(projected, width, depth, height, model_intent)
+    if additive is not None:
+        return additive
 
     sphere = _infer_sphere_feature(projected, width, depth, height)
     if sphere is not None:
@@ -427,7 +433,7 @@ def infer_features(projected: Dict[str, ProjectedView],
 
     # -- 1. Pick the most informative outline as the extrusion profile.
     candidates = []  # list of (score, view_name, outline, holes)
-    for view_name in ("top", "front", "right"):
+    for view_name in ("top", "front", "left"):
         pv = projected.get(view_name)
         if pv is None:
             continue
@@ -443,9 +449,9 @@ def infer_features(projected: Dict[str, ProjectedView],
     chosen = None
     if candidates:
         # Prefer the highest-complexity outline; ties broken by preferred order
-        # of (top, front, right) — top first because end-face profiles are
+        # of (top, front, left) — top first because end-face profiles are
         # the most natural extrusion source for prismatic parts.
-        order = {"top": 0, "front": 1, "right": 2}
+        order = {"top": 0, "front": 1, "left": 2, "right": 2}
         candidates.sort(key=lambda c: (-c[0], order.get(c[1], 99)))
         for sc, vn, ol, hs in candidates:
             if ol is not None and sc > 0:
@@ -463,7 +469,7 @@ def infer_features(projected: Dict[str, ProjectedView],
             extrusion_depth = height
         elif profile_view == "front":
             extrusion_depth = depth
-        else:  # right
+        else:  # left
             extrusion_depth = width
         circular_profile = _outline_as_circle(
             outline,
@@ -544,7 +550,7 @@ def infer_features(projected: Dict[str, ProjectedView],
                     "distance": chamfer_distance,
                     "profile": "arc_revolve" if top_radius else "arc",
                     "scope": "outer_z_edges",
-                    "source_views": ["front", "right"],
+                    "source_views": ["front", "left"],
                     **({"top_radius": top_radius} if top_radius else {}),
                 },
             ))
@@ -559,10 +565,10 @@ def _infer_internal_profile_cuts(
     depth: float,
     height: float,
 ) -> List[Feature]:
-    axis_depth = {"top": height, "front": depth, "right": width}
+    axis_depth = {"top": height, "front": depth, "left": width, "right": width}
     cuts: List[Feature] = []
     seen: set = set()
-    for view_name in ("front", "top", "right"):
+    for view_name in ("front", "top", "left"):
         pv = projected.get(view_name)
         if pv is None:
             continue
@@ -728,7 +734,7 @@ def _infer_side_taper_cuts(
     """
     cuts: List[Feature] = []
     specs = {
-        "right": ("YZ", "X", width),
+        "left": ("YZ", "X", width),
         "front": ("XZ", "Y", depth),
     }
     for view_name, (plane, axis, through_length) in specs.items():
@@ -840,8 +846,8 @@ def _infer_stepped_cylinder_profile(
 ) -> Optional[Feature]:
     top = projected.get("top")
     front = projected.get("front")
-    right = projected.get("right")
-    if top is None or front is None or right is None:
+    left = projected.get("left") or projected.get("right")
+    if top is None or front is None or left is None:
         return None
     top_circles = [
         entity for entity in top.entities
@@ -854,16 +860,16 @@ def _infer_stepped_cylinder_profile(
         return None
 
     front_bands = _stepped_side_bands(front)
-    right_bands = _stepped_side_bands(right)
-    if len(front_bands) < 2 or len(front_bands) != len(right_bands):
+    left_bands = _stepped_side_bands(left)
+    if len(front_bands) < 2 or len(front_bands) != len(left_bands):
         return None
 
     scale = max(width, depth, height, float(outer.radius) * 2.0, 1.0)
     tol = max(scale * 0.03, 1e-3)
     segments: List[Dict] = []
-    for front_band, right_band in zip(front_bands, right_bands):
+    for front_band, left_band in zip(front_bands, left_bands):
         z0, z1, cx, radius_x = front_band
-        rz0, rz1, cy, radius_y = right_band
+        rz0, rz1, cy, radius_y = left_band
         if abs(z0 - rz0) > tol or abs(z1 - rz1) > tol:
             return None
         if abs(radius_x - radius_y) > tol:
@@ -886,7 +892,7 @@ def _infer_stepped_cylinder_profile(
 
     top_cx, top_cy = outer.center
     center_x = sum(band[2] for band in front_bands) / len(front_bands)
-    center_y = sum(band[2] for band in right_bands) / len(right_bands)
+    center_y = sum(band[2] for band in left_bands) / len(left_bands)
     if abs(float(top_cx) - center_x) > tol or abs(float(top_cy) - center_y) > tol:
         return None
 
@@ -896,7 +902,7 @@ def _infer_stepped_cylinder_profile(
             "axis": "Z",
             "center": [float(center_x), float(center_y)],
             "segments": segments,
-            "source_views": ["top", "front", "right"],
+            "source_views": ["top", "front", "left"],
         },
     )
 
@@ -1043,6 +1049,232 @@ def _infer_top_cylindrical_profile(
     return features
 
 
+def _infer_additive_components(
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+    model_intent: str = "",
+) -> Optional[List[Feature]]:
+    """Infer a fused multi-body model from several strong closed outlines.
+
+    This path is intentionally conservative and is mainly enabled by natural
+    language intent such as "组合", "多个物体", "连接", or "相接".  It expresses
+    each detected body as a normal ``extrude_profile`` so the builder can fuse
+    them without introducing a one-off feature type.
+    """
+    if not _intent_requests_additive_components(model_intent):
+        return None
+    front = projected.get("front")
+    top = projected.get("top")
+    left = projected.get("left") or projected.get("right")
+    if front is None or top is None:
+        return None
+
+    front_outlines = _unique_significant_outlines(front)
+    top_outlines = _unique_significant_outlines(top)
+    if not front_outlines or not top_outlines:
+        return None
+
+    scale = max(width, depth, height, 1.0)
+    tol = max(scale * 0.015, 1e-4)
+    features: List[Feature] = []
+    seen: set = set()
+
+    def add_feature(plane: str, source_view: str, outline: Outline,
+                    extrude_depth: float, offset: float = 0.0,
+                    reason: str = "additive_component") -> None:
+        if extrude_depth <= tol:
+            return
+        circular = _outline_as_circle(outline, tol)
+        if circular is not None:
+            cx, cy, radius = circular
+            edges = [{
+                "kind": "CIRCLE",
+                "center": [float(cx), float(cy)],
+                "radius": float(radius),
+            }]
+        else:
+            edges = [_serialize_edge(edge) for edge in outline.edges]
+        key = (
+            plane,
+            source_view,
+            tuple(round(float(v) / tol) for v in outline.bbox),
+            round(float(offset) / tol),
+            round(float(extrude_depth) / tol),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        features.append(Feature(
+            kind="extrude_profile",
+            params={
+                "plane": plane,
+                "depth": float(extrude_depth),
+                "offset": float(offset),
+                "source_view": source_view,
+                "edges": edges,
+                "bbox_2d": list(outline.bbox),
+                "additive_component": True,
+                "reason": reason,
+            },
+        ))
+
+    # Components whose decisive profile is visible in FRONT: e.g. a hexagonal
+    # prism or a horizontal cylinder seen as a circle in FRONT.  TOP supplies
+    # the Y offset/span of that component.
+    for outline in front_outlines:
+        if _outline_area(outline) < max(front.width * front.height * 0.04, tol * tol):
+            continue
+        circular = _outline_as_circle(outline, tol)
+        if circular is not None:
+            span = _best_top_y_span_for_x(top_outlines, outline.bbox, tol, prefer_high=True)
+            if span is None:
+                continue
+            y0, y1 = span
+            add_feature("XZ", "front", outline, y1 - y0, y0, "front_round_component")
+            continue
+        if _is_axis_aligned_rectangle_outline(outline, tol):
+            continue
+        if outline.width < width * 0.35 or outline.height < height * 0.25:
+            continue
+        span = _best_top_y_span_for_x(top_outlines, outline.bbox, tol, prefer_high=False)
+        if span is None:
+            continue
+        y0, y1 = span
+        add_feature("XZ", "front", outline, y1 - y0, y0, "front_polygon_component")
+
+    # Components whose decisive footprint is circular in TOP: e.g. a vertical
+    # small cylinder.  FRONT supplies its Z offset/span when a matching
+    # rectangular side silhouette exists.
+    for outline in top_outlines:
+        circular = _outline_as_circle(outline, tol)
+        if circular is None:
+            continue
+        z_span = _best_front_z_span_for_x(front_outlines, outline.bbox, tol)
+        if z_span is None and left is not None:
+            z_span = _best_front_z_span_for_x(_unique_significant_outlines(left), outline.bbox, tol)
+        if z_span is None:
+            continue
+        z0, z1 = z_span
+        if z1 - z0 >= height * 0.98:
+            continue
+        add_feature("XY", "top", outline, z1 - z0, z0, "top_round_component")
+
+    if len(features) < 2:
+        return None
+    return features
+
+
+def _intent_requests_additive_components(model_intent: str) -> bool:
+    text = (model_intent or "").lower()
+    if not text.strip():
+        return False
+    tokens = (
+        "组合", "多个", "多体", "物体", "部件", "连接", "相接", "拼接",
+        "component", "components", "multi", "assembly", "fuse", "joined",
+    )
+    return any(token in text for token in tokens)
+
+
+def _unique_significant_outlines(pv: ProjectedView) -> List[Outline]:
+    bundle = ViewBundle(
+        name=pv.name,
+        bbox=(0.0, 0.0, pv.width, pv.height),
+        entities=pv.entities,
+    )
+    outlines, _circles = extract_closed_outlines_and_circles(bundle)
+    scale = max(pv.width, pv.height, 1.0)
+    tol = max(scale * 0.01, 1e-4)
+    min_area = max(pv.width * pv.height * 0.015, tol * tol)
+    unique: List[Outline] = []
+    seen = set()
+    for outline in outlines:
+        area = _outline_area(outline)
+        if area < min_area:
+            continue
+        key = tuple(round(float(v) / tol) for v in outline.bbox)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(outline)
+    unique.sort(key=lambda item: _outline_area(item), reverse=True)
+    return unique
+
+
+def _outline_area(outline: Outline) -> float:
+    return max(float(outline.width), 0.0) * max(float(outline.height), 0.0)
+
+
+def _is_axis_aligned_rectangle_outline(outline: Outline, tol: float) -> bool:
+    if len(outline.edges) != 4:
+        return False
+    for edge in outline.edges:
+        if edge.get("kind") != "LINE":
+            return False
+        x0, y0 = edge.get("p0", [0.0, 0.0])
+        x1, y1 = edge.get("p1", [0.0, 0.0])
+        if abs(float(x0) - float(x1)) > tol and abs(float(y0) - float(y1)) > tol:
+            return False
+    return True
+
+
+def _best_top_y_span_for_x(
+    top_outlines: List[Outline],
+    source_bbox: Tuple[float, float, float, float],
+    tol: float,
+    prefer_high: bool,
+) -> Optional[Tuple[float, float]]:
+    sx0, _sy0, sx1, _sy1 = source_bbox
+    source_width = max(sx1 - sx0, tol)
+    candidates: List[Tuple[float, float, float, float]] = []
+    for outline in top_outlines:
+        if _outline_as_circle(outline, tol) is not None:
+            continue
+        tx0, ty0, tx1, ty1 = outline.bbox
+        overlap = max(0.0, min(sx1, tx1) - max(sx0, tx0))
+        if overlap <= source_width * 0.2:
+            continue
+        span = ty1 - ty0
+        if span <= tol:
+            continue
+        width_penalty = abs((tx1 - tx0) - source_width) / max(source_width, tol)
+        overlap_score = overlap / source_width
+        side_bias = ty0 * 100.0 if prefer_high else -ty0 * 100.0
+        score = overlap_score * 10.0 - width_penalty + side_bias
+        candidates.append((score, float(ty0), float(ty1), span))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1], candidates[0][2]
+
+
+def _best_front_z_span_for_x(
+    front_outlines: List[Outline],
+    top_bbox: Tuple[float, float, float, float],
+    tol: float,
+) -> Optional[Tuple[float, float]]:
+    tx0, _ty0, tx1, _ty1 = top_bbox
+    top_width = max(tx1 - tx0, tol)
+    candidates: List[Tuple[float, float, float]] = []
+    for outline in front_outlines:
+        fx0, fz0, fx1, fz1 = outline.bbox
+        z_span = fz1 - fz0
+        if z_span <= tol:
+            continue
+        overlap = max(0.0, min(tx1, fx1) - max(tx0, fx0))
+        if overlap <= top_width * 0.35:
+            continue
+        width_penalty = abs((fx1 - fx0) - top_width) / max(top_width, tol)
+        high_bias = fz0
+        score = (overlap / top_width) * 10.0 - width_penalty + high_bias
+        candidates.append((score, float(fz0), float(fz1)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1], candidates[0][2]
+
+
 def _apply_hidden_hole_extent(
     hole: Feature,
     projected: Dict[str, ProjectedView],
@@ -1082,9 +1314,9 @@ def _hidden_hole_axis_span(
     r = float(p.get("radius", 1.0))
     tol = max(r * 0.15, 0.5)
     if axis == "Z":
-        checks = [("front", "x", hx, "y"), ("right", "x", hy, "y")]
+        checks = [("front", "x", hx, "y"), ("left", "x", hy, "y")]
     elif axis == "Y":
-        checks = [("top", "x", hx, "y"), ("right", "y", hz, "x")]
+        checks = [("top", "x", hx, "y"), ("left", "y", hz, "x")]
     else:
         checks = [("top", "y", hy, "x"), ("front", "y", hz, "x")]
 
@@ -1291,7 +1523,7 @@ def _circle_to_hole(view_name: str, cx: float, cy: float, r: float,
         axis = "Y"
         position = [cx, 0.0, cy]
         through_length = depth
-    elif view_name == "right":
+    elif view_name in {"left", "right"}:
         axis = "X"
         position = [0.0, cx, cy]
         through_length = width
