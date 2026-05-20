@@ -48,16 +48,18 @@ class DXFWriter:
         # TABLES
         rows += ["0", "SECTION", "2", "TABLES"]
 
-        # LTYPE 表
+        # LTYPE 表：使用固定 R12 线型长度。
+        # FreeCAD 的 DXF 导入器对极小的自定义线型 pattern 容错较差，
+        # 因此不要按模型尺寸缩放这里的 40/49 数值。
         rows += ["0", "TABLE", "2", "LTYPE", "70", "3"]
         rows += ["0", "LTYPE", "2", "CONTINUOUS", "70", "0",
                  "3", "Solid line", "72", "65", "73", "0", "40", "0.0"]
         rows += ["0", "LTYPE", "2", "HIDDEN", "70", "0",
-                 "3", "__ __ __ __ __", "72", "65", "73", "2", "40", "9.0",
-                 "49", "6.0", "49", "-3.0"]
+             "3", "__ __ __ __ __", "72", "65", "73", "2", "40", "9.0",
+             "49", "6.0", "49", "-3.0"]
         rows += ["0", "LTYPE", "2", "CENTER", "70", "0",
-                 "3", "___ _ ___ _ ___", "72", "65", "73", "4", "40", "21.0",
-                 "49", "12.0", "49", "-3.0", "49", "3.0", "49", "-3.0"]
+             "3", "___ _ ___ _ ___", "72", "65", "73", "4", "40", "21.0",
+             "49", "12.0", "49", "-3.0", "49", "3.0", "49", "-3.0"]
         rows += ["0", "ENDTAB"]
 
         # LAYER 表
@@ -155,6 +157,15 @@ def edge_to_ents(edge, ax, ay, sx=1.0, sy=1.0, layer="0", lt=""):
     return result
 
 
+def _line_key(ent, tol=1e-6):
+    """生成线段去重 key，忽略端点顺序。"""
+    if ent.get("type") != "LINE":
+        return None
+    p1 = (round(ent["x1"] / tol), round(ent["y1"] / tol))
+    p2 = (round(ent["x2"] / tol), round(ent["y2"] / tol))
+    return tuple(sorted((p1, p2)))
+
+
 def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
                  lvis="0", lhid="HIDDEN"):
     """
@@ -176,21 +187,34 @@ def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
         print(f"  [warn] projectEx({direction}) failed: {e}")
         return []
 
-    ents = []
-    for compound in result[:4]:
+    # TechDraw.projectEx 返回 10 个化合物：
+    #   [0]V_hard  [1]V_smooth  [2]V_sewn  [3]V_outline  [4]V_iso
+    #   [5]H_hard  [6]H_smooth  [7]H_sewn  [8]H_outline  [9]H_iso
+    # 只取有意义的边：排除 sewn（网格伪缝合线）和 iso（参数曲线网格线）
+    VISIBLE_IDX = [0, 1, 3]   # V_hard, V_smooth, V_outline
+    HIDDEN_IDX  = [5, 6, 8]   # H_hard, H_smooth, H_outline
+
+    visible_ents = []
+    for idx in VISIBLE_IDX:
         try:
-            for edge in compound.Edges:
-                ents += edge_to_ents(edge, ax, ay, sx, sy, layer=lvis, lt="")
-        except Exception:
-            pass
-    for compound in result[4:]:
-        try:
-            for edge in compound.Edges:
-                ents += edge_to_ents(edge, ax, ay, sx, sy, layer=lhid, lt="HIDDEN")
+            for edge in result[idx].Edges:
+                visible_ents += edge_to_ents(edge, ax, ay, sx, sy, layer=lvis, lt="")
         except Exception:
             pass
 
-    return ents
+    visible_keys = {key for key in (_line_key(e) for e in visible_ents) if key is not None}
+    hidden_ents = []
+    for idx in HIDDEN_IDX:
+        try:
+            for edge in result[idx].Edges:
+                for ent in edge_to_ents(edge, ax, ay, sx, sy, layer=lhid, lt="HIDDEN"):
+                    key = _line_key(ent)
+                    if key is None or key not in visible_keys:
+                        hidden_ents.append(ent)
+        except Exception:
+            pass
+
+    return visible_ents + hidden_ents
 
 
 def bbox_of_ents(ents):
@@ -276,21 +300,26 @@ def convert(input_path, output_path):
     H = bb.ZMax - bb.ZMin   # Z 方向高度
     print(f"  包围盒  W={W:.2f}  D={D:.2f}  H={H:.2f}")
 
-    # 三视图投影
-    # TechDraw.projectEx 投影结果均在 Z=0 平面：
-    #   沿 +Y（front）: result.x=worldZ, result.y=worldX → ax=1,ay=0
-    #   沿 +Z（top）  : result.x=worldX, result.y=worldY → ax=0,ay=1
-    #   沿 +X（left） : result.x=worldZ, result.y=worldY → ax=1,ay=0
-    print("  投影主视图 (front) ...")
-    front = project_view(shape, (0, 1, 0), ax=1, ay=0,
+    # 三视图投影（第一角投影 / 国标 GB/T 4458.1）
+    #
+    # TechDraw.projectEx 投影结果均在 Z=0 平面，坐标映射：
+    #   正视图 +Y: result.x=worldZ(高), result.y=worldX(宽)
+    #             ax=1→DXF_x=worldX, ay=0→DXF_y=worldZ
+    #   俯视图 +Z: result.x=worldX(宽), result.y=worldY(深)
+    #             ax=0→DXF_x=worldX, ay=1→DXF_y=worldY，保持 FreeCAD 顶视图方向
+    #   左视图 -X: result.x=-worldZ(高), result.y=worldY(深)
+    #             ax=1→DXF_x=worldY, ay=0→DXF_y=worldZ (sy=-1 抵消 result.x 的 Z 翻转)
+
+    print("  投影正视图 (front, 沿 +Y) ...")
+    front = project_view(shape, (0, 1, 0), ax=1, ay=0, sx=1.0, sy=1.0,
                          lvis="FRONT", lhid="FRONT_HID")
 
-    print("  投影俯视图 (top) ...")
-    top = project_view(shape, (0, 0, 1), ax=0, ay=1,
+    print("  投影俯视图 (top, 沿 +Z) ...")
+    top = project_view(shape, (0, 0, 1), ax=0, ay=1, sx=1.0, sy=1.0,
                        lvis="TOP", lhid="TOP_HID")
 
-    print("  投影左视图 (left, 从左向右看) ...")
-    left = project_view(shape, (1, 0, 0), ax=1, ay=0,
+    print("  投影左视图 (left, 沿 -X) ...")
+    left = project_view(shape, (-1, 0, 0), ax=1, ay=0, sx=1.0, sy=-1.0,
                         lvis="LEFT", lhid="LEFT_HID")
 
     # 各视图归零到左下角原点
@@ -303,9 +332,9 @@ def convert(input_path, output_path):
     GAP = max(max_dim * 0.2, 1e-3)
     print(f"  视图尺寸 front={fw:.3f}x{fh:.3f}  top={tw:.3f}x{th:.3f}  left={lw:.3f}x{lh:.3f}  GAP={GAP:.3f}")
 
-    # 布局（本项目固定布局）：
-    #   FRONT（左上）  LEFT（右上，从左向右看）
-    #   TOP  （左下）
+    # 布局（第一角投影）：
+    #   正视图（左上）  左视图（右上）
+    #   俯视图（左下）
     all_ents = (
         shift_ents(front, 0,          th + GAP) +
         shift_ents(left,  fw + GAP,   th + GAP) +

@@ -236,7 +236,8 @@ def validate_projection_against_views(
 
 def export_model_views_png(fcstd_path: str, png_path: str,
                            features: Optional[List[Feature]] = None,
-                           projected: Optional[Dict[str, Any]] = None) -> str:
+                           projected: Optional[Dict[str, Any]] = None,
+                           overlay_input_hidden: bool = False) -> str:
     """Render FRONT / LEFT / TOP orthographic views from the final solid."""
     import matplotlib  # type: ignore
     matplotlib.use("Agg")
@@ -245,14 +246,15 @@ def export_model_views_png(fcstd_path: str, png_path: str,
     import FreeCAD as App  # type: ignore
 
     views = _feature_model_view_segments(features or [], include_cuts=True)
+    feature_based_views = views is not None
     if views is None:
         doc = App.openDocument(fcstd_path)
         try:
             shape = _result_shape(doc)
             views = {
-                "front": _project_shape_edges(shape, "front"),
-                "left": _project_shape_edges(shape, "left"),
-                "top": _project_shape_edges(shape, "top"),
+                "front": _project_shape_edges(shape, "front", classify_hidden=True),
+                "left": _project_shape_edges(shape, "left", classify_hidden=True),
+                "top": _project_shape_edges(shape, "top", classify_hidden=True),
             }
         finally:
             App.closeDocument(doc.Name)
@@ -267,7 +269,9 @@ def export_model_views_png(fcstd_path: str, png_path: str,
     for name in ("front", "left", "top"):
         ax = layout[name]
         raw_segs = list(views[name])
-        if projected is not None and projected.get(name) is not None:
+        if feature_based_views and name == "left":
+            raw_segs = _mirror_left_view_segments(raw_segs)
+        if overlay_input_hidden and projected is not None and projected.get(name) is not None:
             raw_segs.extend(_hidden_segments_from_entities(projected[name].entities, name))
         segs = _normalize_segments(raw_segs)
         if segs:
@@ -311,6 +315,8 @@ def _feature_model_view_segments(features: List[Feature], include_cuts: bool = F
         f for f in features
         if f.kind in {"extrude_profile", "base_block", "sphere", "cylinder_stack"}
     ]
+    if len(base_features) > 1 and all(f.kind == "extrude_profile" for f in base_features):
+        return _combined_extrude_view_segments(base_features, features if include_cuts else [])
     if len(base_features) != 1:
         return None
     if any(f.kind == "profile_cut" for f in features) and not include_cuts:
@@ -379,6 +385,7 @@ def _generic_extrude_view_segments(base: Feature, features: Optional[List[Featur
     params = base.params
     plane = params.get("plane")
     depth = float(params.get("depth", 0.0) or 0.0)
+    offset = float(params.get("offset", 0.0) or 0.0)
     profile = _profile_edge_segments(params.get("edges", []))
     if not profile or depth <= 0:
         return None
@@ -397,26 +404,38 @@ def _generic_extrude_view_segments(base: Feature, features: Optional[List[Featur
 
     if plane == "XY":
         views = {
-            "front": rect(u0, 0.0, u1, depth),
-            "left": rect(v0, 0.0, v1, depth),
+            "front": rect(u0, offset, u1, offset + depth),
+            "left": rect(v0, offset, v1, offset + depth),
             "top": profile,
         }
     elif plane == "XZ":
         views = {
             "front": profile,
-            "left": rect(0.0, v0, depth, v1),
-            "top": rect(u0, 0.0, u1, depth),
+            "left": rect(offset, v0, offset + depth, v1),
+            "top": rect(u0, offset, u1, offset + depth),
         }
     elif plane == "YZ":
         views = {
-            "front": rect(0.0, v0, depth, v1),
+            "front": rect(offset, v0, offset + depth, v1),
             "left": profile,
-            "top": rect(0.0, u0, depth, u1),
+            "top": rect(offset, u0, offset + depth, u1),
         }
     else:
         return None
     _overlay_feature_segments(views, features or [])
     return views
+
+
+def _combined_extrude_view_segments(base_features: List[Feature], features: List[Feature]):
+    combined = {"front": [], "left": [], "top": []}
+    for base in base_features:
+        views = _generic_extrude_view_segments(base, [])
+        if views is None:
+            return None
+        for name in combined:
+            combined[name].extend(views.get(name, []))
+    _overlay_feature_segments(combined, features)
+    return combined
 
 
 def _overlay_feature_segments(views, features: List[Feature]) -> None:
@@ -622,6 +641,18 @@ def _hidden_segments_from_entities(entities: List[DxfEntity], view_name: str):
     return [(a, b, "hidden") for a, b in segments]
 
 
+def _mirror_left_view_segments(segments):
+    mirrored = []
+    for segment in segments:
+        a, b = segment[:2]
+        item = ((-a[0], a[1]), (-b[0], b[1]))
+        if len(segment) >= 3:
+            mirrored.append((item[0], item[1], segment[2]))
+        else:
+            mirrored.append(item)
+    return mirrored
+
+
 def _arc_segments(entity: DxfEntity, steps: int = 48):
     cx, cy = entity.center or (0.0, 0.0)
     radius = float(entity.radius or 0.0)
@@ -742,10 +773,13 @@ def _segments_bbox(segments):
     return [min(xs), min(ys), max(xs), max(ys)]
 
 
-def _project_shape_edges(shape, view_name: str):
+def _project_shape_edges(shape, view_name: str, classify_hidden: bool = False):
     if _is_sphere_shape(shape):
         return _project_sphere_outline(shape, view_name)
     segs = []
+    hidden_classifier = None
+    if classify_hidden:
+        hidden_classifier = _make_projection_hidden_classifier(shape, view_name)
     model_scale = max(
         float(shape.BoundBox.XLength),
         float(shape.BoundBox.YLength),
@@ -769,8 +803,97 @@ def _project_shape_edges(shape, view_name: str):
             b = _project_point(points[i + 1], view_name)
             if abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) < 1e-9:
                 continue
+            if hidden_classifier is not None:
+                mid = points[i].add(points[i + 1]).multiply(0.5)
+                if hidden_classifier(mid):
+                    segs.append((a, b, "hidden"))
+                    continue
             segs.append((a, b))
     return segs
+
+
+def _make_projection_hidden_classifier(shape, view_name: str):
+    bb = shape.BoundBox
+    model_scale = max(
+        float(bb.XLength),
+        float(bb.YLength),
+        float(bb.ZLength),
+        1e-9,
+    )
+    try:
+        vertices, triangles = shape.tessellate(max(model_scale * 0.006, 1e-5))
+    except Exception:
+        return None
+    projected_triangles = []
+    for triangle in triangles:
+        try:
+            pts = [vertices[int(idx)] for idx in triangle[:3]]
+        except Exception:
+            continue
+        screen = [_project_point(point, view_name) for point in pts]
+        depths = [_projection_depth(point, view_name) for point in pts]
+        xmin = min(point[0] for point in screen)
+        xmax = max(point[0] for point in screen)
+        ymin = min(point[1] for point in screen)
+        ymax = max(point[1] for point in screen)
+        area = _triangle_area2(screen[0], screen[1], screen[2])
+        if abs(area) <= 1e-12:
+            continue
+        projected_triangles.append((screen, depths, (xmin, ymin, xmax, ymax), area))
+    if not projected_triangles:
+        return None
+    depth_tol = max(model_scale * 5e-4, 1e-7)
+    screen_tol = max(model_scale * 1e-6, 1e-9)
+
+    def is_hidden(point) -> bool:
+        screen_point = _project_point(point, view_name)
+        point_depth = _projection_depth(point, view_name)
+        nearest_depth = None
+        px, py = screen_point
+        for screen, depths, bbox, area in projected_triangles:
+            xmin, ymin, xmax, ymax = bbox
+            if px < xmin - screen_tol or px > xmax + screen_tol:
+                continue
+            if py < ymin - screen_tol or py > ymax + screen_tol:
+                continue
+            bary = _triangle_barycentric(screen_point, screen[0], screen[1], screen[2], area)
+            if bary is None:
+                continue
+            w0, w1, w2 = bary
+            if w0 < -1e-6 or w1 < -1e-6 or w2 < -1e-6:
+                continue
+            depth = depths[0] * w0 + depths[1] * w1 + depths[2] * w2
+            if nearest_depth is None or depth < nearest_depth:
+                nearest_depth = depth
+        if nearest_depth is None:
+            return False
+        return point_depth > nearest_depth + depth_tol
+
+    return is_hidden
+
+
+def _projection_depth(point, view_name: str) -> float:
+    if view_name == "front":
+        return float(point.y)
+    if view_name == "top":
+        return -float(point.z)
+    if view_name in {"left", "right"}:
+        return float(point.x)
+    raise ValueError(f"unknown view name: {view_name}")
+
+
+def _triangle_area2(a, b, c) -> float:
+    return ((b[0] - a[0]) * (c[1] - a[1]) -
+            (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _triangle_barycentric(p, a, b, c, area):
+    if abs(area) <= 1e-12:
+        return None
+    w0 = _triangle_area2(p, b, c) / area
+    w1 = _triangle_area2(a, p, c) / area
+    w2 = _triangle_area2(a, b, p) / area
+    return w0, w1, w2
 
 
 def _is_line_edge(edge) -> bool:

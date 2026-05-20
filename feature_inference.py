@@ -1071,7 +1071,7 @@ def _infer_additive_components(
     if front is None or top is None:
         return None
 
-    front_outlines = _unique_significant_outlines(front)
+    front_outlines = _component_candidate_outlines(front)
     top_outlines = _unique_significant_outlines(top)
     if not front_outlines or not top_outlines:
         return None
@@ -1123,26 +1123,33 @@ def _infer_additive_components(
     # Components whose decisive profile is visible in FRONT: e.g. a hexagonal
     # prism or a horizontal cylinder seen as a circle in FRONT.  TOP supplies
     # the Y offset/span of that component.
+    accepted_front_bboxes: List[Tuple[float, float, float, float]] = []
     for outline in front_outlines:
         if _outline_area(outline) < max(front.width * front.height * 0.04, tol * tol):
             continue
         circular = _outline_as_circle(outline, tol)
         if circular is not None:
-            span = _best_top_y_span_for_x(top_outlines, outline.bbox, tol, prefer_high=True)
+            span = _best_top_y_span_for_x(top_outlines, outline.bbox, tol,
+                                          prefer_high=True, full_span=top.height)
             if span is None:
                 continue
             y0, y1 = span
             add_feature("XZ", "front", outline, y1 - y0, y0, "front_round_component")
+            accepted_front_bboxes.append(outline.bbox)
             continue
         if _is_axis_aligned_rectangle_outline(outline, tol):
             continue
         if outline.width < width * 0.35 or outline.height < height * 0.25:
             continue
-        span = _best_top_y_span_for_x(top_outlines, outline.bbox, tol, prefer_high=False)
+        if _bbox_is_redundant_component_candidate(outline.bbox, accepted_front_bboxes, tol):
+            continue
+        span = _best_top_y_span_for_x(top_outlines, outline.bbox, tol,
+                          prefer_high=False, full_span=top.height)
         if span is None:
             continue
         y0, y1 = span
         add_feature("XZ", "front", outline, y1 - y0, y0, "front_polygon_component")
+        accepted_front_bboxes.append(outline.bbox)
 
     # Components whose decisive footprint is circular in TOP: e.g. a vertical
     # small cylinder.  FRONT supplies its Z offset/span when a matching
@@ -1177,6 +1184,24 @@ def _intent_requests_additive_components(model_intent: str) -> bool:
     return any(token in text for token in tokens)
 
 
+def _bbox_is_redundant_component_candidate(
+    bbox: Tuple[float, float, float, float],
+    accepted: List[Tuple[float, float, float, float]],
+    tol: float,
+) -> bool:
+    if not accepted:
+        return False
+    bx0, by0, bx1, by1 = bbox
+    area = max((bx1 - bx0) * (by1 - by0), tol * tol)
+    for ax0, ay0, ax1, ay1 in accepted:
+        overlap_x = max(0.0, min(bx1, ax1) - max(bx0, ax0))
+        overlap_y = max(0.0, min(by1, ay1) - max(by0, ay0))
+        overlap = overlap_x * overlap_y
+        if overlap >= area * 0.72:
+            return True
+    return False
+
+
 def _unique_significant_outlines(pv: ProjectedView) -> List[Outline]:
     bundle = ViewBundle(
         name=pv.name,
@@ -1202,6 +1227,78 @@ def _unique_significant_outlines(pv: ProjectedView) -> List[Outline]:
     return unique
 
 
+def _component_candidate_outlines(pv: ProjectedView) -> List[Outline]:
+    candidates = list(_unique_significant_outlines(pv))
+    for pred in (_is_hidden_entity, lambda entity: not _is_hidden_entity(entity)):
+        subset = [entity for entity in pv.entities if pred(entity)]
+        if not subset:
+            continue
+        bundle = ViewBundle(
+            name=pv.name,
+            bbox=(0.0, 0.0, pv.width, pv.height),
+            entities=subset,
+        )
+        outlines, _circles = extract_closed_outlines_and_circles(bundle)
+        candidates.extend(outlines)
+
+    scale = max(pv.width, pv.height, 1.0)
+    tol = max(scale * 0.01, 1e-4)
+    min_area = max(pv.width * pv.height * 0.015, tol * tol)
+    unique: List[Outline] = []
+    for outline in candidates:
+        if _outline_area(outline) < min_area:
+            continue
+        outline_kind = _component_outline_kind(outline, tol)
+        replaced = False
+        for idx, existing in enumerate(unique):
+            if outline_kind != _component_outline_kind(existing, tol):
+                continue
+            if _bbox_overlap_ratio(outline.bbox, existing.bbox) < 0.82:
+                continue
+            if _component_outline_rank(outline, tol) < _component_outline_rank(existing, tol):
+                unique[idx] = outline
+            replaced = True
+            break
+        if not replaced:
+            unique.append(outline)
+    unique.sort(key=lambda item: (_component_outline_rank(item, tol), -_outline_area(item)))
+    return unique
+
+
+def _component_outline_kind(outline: Outline, tol: float) -> str:
+    if _outline_as_circle(outline, tol) is not None:
+        return "circle"
+    if _is_axis_aligned_rectangle_outline(outline, tol):
+        return "rectangle"
+    if len(outline.edges) <= 8:
+        return "simple_polygon"
+    return "complex_polygon"
+
+
+def _component_outline_rank(outline: Outline, tol: float) -> int:
+    if _outline_as_circle(outline, tol) is not None:
+        return 1
+    if _is_axis_aligned_rectangle_outline(outline, tol):
+        return 3
+    if len(outline.edges) <= 8:
+        return 0
+    return 2
+
+
+def _bbox_overlap_ratio(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    overlap_x = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    overlap_y = max(0.0, min(ay1, by1) - max(ay0, by0))
+    overlap = overlap_x * overlap_y
+    area_a = max((ax1 - ax0) * (ay1 - ay0), 1e-12)
+    area_b = max((bx1 - bx0) * (by1 - by0), 1e-12)
+    return overlap / min(area_a, area_b)
+
+
 def _outline_area(outline: Outline) -> float:
     return max(float(outline.width), 0.0) * max(float(outline.height), 0.0)
 
@@ -1224,10 +1321,21 @@ def _best_top_y_span_for_x(
     source_bbox: Tuple[float, float, float, float],
     tol: float,
     prefer_high: bool,
+    full_span: Optional[float] = None,
 ) -> Optional[Tuple[float, float]]:
     sx0, _sy0, sx1, _sy1 = source_bbox
     source_width = max(sx1 - sx0, tol)
     candidates: List[Tuple[float, float, float, float]] = []
+    if full_span is not None and full_span > tol:
+        total_y0 = 0.0
+        total_y1 = float(full_span)
+    elif top_outlines:
+        total_y0 = min(float(outline.bbox[1]) for outline in top_outlines)
+        total_y1 = max(float(outline.bbox[3]) for outline in top_outlines)
+    else:
+        total_y0 = 0.0
+        total_y1 = 0.0
+    total_span = max(total_y1 - total_y0, tol)
     for outline in top_outlines:
         if _outline_as_circle(outline, tol) is not None:
             continue
@@ -1238,6 +1346,8 @@ def _best_top_y_span_for_x(
         span = ty1 - ty0
         if span <= tol:
             continue
+        if span >= total_span * 0.82 and len(top_outlines) > 1:
+            continue
         width_penalty = abs((tx1 - tx0) - source_width) / max(source_width, tol)
         overlap_score = overlap / source_width
         side_bias = ty0 * 100.0 if prefer_high else -ty0 * 100.0
@@ -1246,7 +1356,10 @@ def _best_top_y_span_for_x(
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1], candidates[0][2]
+    y0, y1 = candidates[0][1], candidates[0][2]
+    if prefer_high and y1 < total_y1 - tol:
+        return y1, total_y1
+    return y0, y1
 
 
 def _best_front_z_span_for_x(
