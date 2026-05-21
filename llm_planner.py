@@ -132,6 +132,7 @@ class LLMPlanner:
                         draft_features: List[Dict[str, Any]],
                         view_geometry: Optional[List[Dict[str, Any]]] = None,
                         model_intent: str = "",
+                        allow_rebuild: bool = False,
                         ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
         """Return (refined_features_or_None, log_message)."""
         if _is_deterministic_sphere_draft(draft_features):
@@ -145,6 +146,7 @@ class LLMPlanner:
             prompt = load_prompt("feature_refiner")
         except Exception as exc:
             return None, f"提示词加载失败：{exc}"
+        part_knowledge = _load_part_knowledge_for_refiner()
 
         prompt_draft = (_compact_features_for_prompt(draft_features)
                         if model_intent.strip() else draft_features)
@@ -153,6 +155,8 @@ class LLMPlanner:
             "view_geometry": view_geometry or [],
             "draft_features": prompt_draft,
             "model_intent": model_intent or "（无）",
+            "part_knowledge": part_knowledge,
+            "rebuild_mode": "允许受控重建" if allow_rebuild else "关闭",
         })
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": prompt.system},
@@ -196,7 +200,7 @@ class LLMPlanner:
                 cleaned.append({"kind": f["kind"], "params": f["params"]})
 
         ok, reason = _validate_refined_features(
-            draft_features, cleaned, view_geometry or [], bool(model_intent.strip())
+            draft_features, cleaned, view_geometry or [], bool(model_intent.strip()), allow_rebuild
         )
         if not ok:
             return None, f"LLM 结果未通过程序校验：{reason}；沿用算法草案"
@@ -249,6 +253,14 @@ class LLMPlanner:
         if not ok:
             return None, f"LLM 视图复核未通过程序校验：{reason}"
         return data, f"LLM 视图语义复核完成（{self.model}）"
+
+
+def _load_part_knowledge_for_refiner() -> str:
+    try:
+        prompt = load_prompt("part")
+    except Exception:
+        return "（无）"
+    return prompt.system
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +427,7 @@ def _validate_refined_features(
     refined: List[Dict[str, Any]],
     view_geometry: Optional[List[Dict[str, Any]]] = None,
     allow_feature_edits: bool = False,
+    allow_rebuild: bool = False,
 ) -> Tuple[bool, str]:
     """Validate that the LLM only made safe, minimal edits.
 
@@ -439,34 +452,38 @@ def _validate_refined_features(
         f for f in refined
         if f.get("kind") in {"extrude_profile", "base_block", "sphere", "cylinder_stack"}
     ]
-    if len(draft_base) != len(refined_base):
-        return False, "base/profile feature count changed"
-    for i, (before, after) in enumerate(zip(draft_base, refined_base)):
-        if before.get("kind") != after.get("kind"):
-            return False, f"base/profile kind changed at index {i}"
-        ok, reason = _validate_base_feature(before, after)
-        if not ok:
-            return False, reason
+    if allow_rebuild:
+        if not refined_base:
+            return False, "rebuild produced no base/profile feature"
+    else:
+        if len(draft_base) != len(refined_base):
+            return False, "base/profile feature count changed"
+        for i, (before, after) in enumerate(zip(draft_base, refined_base)):
+            if before.get("kind") != after.get("kind"):
+                return False, f"base/profile kind changed at index {i}"
+            ok, reason = _validate_base_feature(before, after)
+            if not ok:
+                return False, reason
 
     draft_holes = _dedupe_holes([f for f in draft if f.get("kind") == "hole"])
     refined_holes = _dedupe_holes([f for f in refined if f.get("kind") == "hole"])
-    if not allow_feature_edits and len(refined_holes) < len(draft_holes):
+    if not allow_feature_edits and not allow_rebuild and len(refined_holes) < len(draft_holes):
         return False, (
             f"hole count decreased from {len(draft_holes)} "
             f"to {len(refined_holes)}"
         )
-    if not allow_feature_edits:
+    if not allow_feature_edits and not allow_rebuild:
         for hole in draft_holes:
             if not any(_same_hole(hole, candidate) for candidate in refined_holes):
                 return False, "draft hole missing from refined features"
-    if not allow_feature_edits and len(refined_holes) > len(draft_holes):
+    if not allow_feature_edits and not allow_rebuild and len(refined_holes) > len(draft_holes):
         return False, "new hole feature was added"
 
     draft_cuts = [f for f in draft if f.get("kind") == "profile_cut"]
     refined_cuts = [f for f in refined if f.get("kind") == "profile_cut"]
-    if not allow_feature_edits and len(draft_cuts) != len(refined_cuts):
+    if not allow_feature_edits and not allow_rebuild and len(draft_cuts) != len(refined_cuts):
         return False, "profile_cut feature count changed"
-    if not allow_feature_edits:
+    if not allow_feature_edits and not allow_rebuild:
         for before, after in zip(draft_cuts, refined_cuts):
             if before.get("params") != after.get("params"):
                 return False, "profile_cut params changed"
@@ -527,6 +544,22 @@ def _validate_feature_schema(feature: Dict[str, Any]) -> Tuple[bool, str]:
             float(params.get("offset", 0.0) or 0.0)
         except Exception:
             return False, "profile_cut depth invalid"
+    elif kind == "extrude_profile":
+        _normalize_feature_views(feature)
+        if params.get("plane") not in {"XY", "XZ", "YZ"}:
+            return False, "extrude_profile plane invalid"
+        if params.get("source_view") not in _CANONICAL_VIEWS:
+            return False, "extrude_profile source_view invalid"
+        if {"top": "XY", "front": "XZ", "left": "YZ"}.get(params.get("source_view")) != params.get("plane"):
+            return False, "extrude_profile plane/source_view mismatch"
+        edges = params.get("edges")
+        if not isinstance(edges, list) or not edges:
+            return False, "extrude_profile edges invalid"
+        try:
+            if float(params.get("depth")) <= 0:
+                return False, "extrude_profile depth invalid"
+        except Exception:
+            return False, "extrude_profile depth invalid"
     return True, "ok"
 
 

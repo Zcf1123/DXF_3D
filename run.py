@@ -144,6 +144,35 @@ def _apply_view_review(bundles, review: Dict[str, Any]) -> Dict[str, Any]:
     return applied
 
 
+def _intent_allows_rebuild(model_intent: str) -> bool:
+    text = (model_intent or "").lower()
+    if not text.strip():
+        return False
+    tokens = (
+        "重建", "主体", "平面连杆", "连杆板", "摇臂", "摆臂", "曲柄连杆",
+        "多孔连接板", "长圆孔连杆", "整体外轮廓", "主视图整体",
+        "rebuild", "linkage", "rocker", "link plate",
+    )
+    return any(token in text for token in tokens)
+
+
+def _projection_validation_is_poor(validation: Dict) -> bool:
+    views = validation.get("views") or {}
+    if not views:
+        return False
+    poor_views = 0
+    very_poor_views = 0
+    for report in views.values():
+        input_coverage = float(report.get("input_coverage", 0.0) or 0.0)
+        model_match = float(report.get("model_match", 0.0) or 0.0)
+        extra = float(report.get("model_extra_ratio", 0.0) or 0.0)
+        if input_coverage < 0.35 or model_match < 0.35 or extra > 0.65:
+            poor_views += 1
+        if input_coverage < 0.15 or model_match < 0.15 or extra > 0.85:
+            very_poor_views += 1
+    return very_poor_views >= 1 or poor_views >= 2
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -349,10 +378,13 @@ def process_dxf(dxf_path: str, llm,
         # 4. Optional LLM refinement
         banner("阶段 4 ─ LLM 复核与精修特征")
         final_dicts = draft_dicts
+        allow_rebuild = _intent_allows_rebuild(model_intent)
         if llm.enabled:
             log.info("调用模型      : %s", llm.model)
+            if allow_rebuild:
+                log.info("受控重建      : intent 已允许 LLM 重选主体特征")
             refined, msg = llm.refine_features(
-                view_bboxes, draft_dicts, feature_view_summary, model_intent
+                view_bboxes, draft_dicts, feature_view_summary, model_intent, allow_rebuild
             )
             log.info("LLM 返回      : %s", msg)
             if refined is not None:
@@ -437,6 +469,59 @@ def process_dxf(dxf_path: str, llm,
                     )
                 )
             log.info("已写出        : projection_validation.json")
+            if (llm.enabled and not allow_rebuild and
+                    _projection_validation_is_poor(validation)):
+                log.info("反投影较差    : 自动启用受控重建模式并二次精修")
+                retry_intent = (model_intent + "\n" if model_intent else "") + \
+                    "反投影验证很差，允许重选主体外轮廓和基础特征；优先保持真实视图尺寸、厚度、孔位。"
+                rebuilt, retry_msg = llm.refine_features(
+                    view_bboxes, final_dicts, feature_view_summary,
+                    retry_intent, allow_rebuild=True)
+                log.info("二次 LLM 返回  : %s", retry_msg)
+                if rebuilt is not None:
+                    final_dicts = rebuilt
+                    with open(os.path.join(run_dir, "features.json"), "w",
+                              encoding="utf-8") as f:
+                        json.dump(final_dicts, f, indent=2, ensure_ascii=False)
+                    features = [Feature(kind=d["kind"], params=d["params"])
+                                for d in final_dicts]
+                    retry_artifacts = build_model(features, run_dir, base_name=base,
+                                                  projected=projected)
+                    if "error" in retry_artifacts:
+                        log.warning("二次重建失败: %s", retry_artifacts["error"])
+                    else:
+                        for warning in retry_artifacts.get("warnings", []):
+                            log.warning("二次建模警告: %s", warning)
+                        fcstd_path = retry_artifacts["fcstd"]
+                        summary["fcstd"] = fcstd_path
+                        validation = validate_projection_against_views(
+                            fcstd_path, projected, features, validation_path)
+                        log.info("二次反投影验证: %s", validation.get("status"))
+                        _say(f"Projection   : {validation.get('status')} (auto rebuild)")
+                        for view_name in ("front", "left", "top"):
+                            report = validation.get("views", {}).get(view_name)
+                            if not report:
+                                continue
+                            log.info(
+                                "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
+                                view_display.get(view_name, view_name.upper()),
+                                report.get("status"),
+                                float(report.get("input_coverage", 0.0)) * 100.0,
+                                float(report.get("model_match", 0.0)) * 100.0,
+                                float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                                report.get("bbox_error"),
+                            )
+                            _say(
+                                "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
+                                    name=view_display.get(view_name, view_name.upper()),
+                                    status=str(report.get("status", "")),
+                                    input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
+                                    model_match=float(report.get("model_match", 0.0)) * 100.0,
+                                    extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                                )
+                            )
+                else:
+                    log.info("二次重建未生效，保留首次建模结果")
         except Exception as exc:
             log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
             _say(f"Projection   : WARN — validation failed: {exc}")

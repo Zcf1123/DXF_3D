@@ -435,7 +435,77 @@ def _combined_extrude_view_segments(base_features: List[Feature], features: List
         for name in combined:
             combined[name].extend(views.get(name, []))
     _overlay_feature_segments(combined, features)
+    _overlay_cylinder_intersection_segments(combined, base_features)
     return combined
+
+
+def _overlay_cylinder_intersection_segments(views, base_features: List[Feature]) -> None:
+    main = next(
+        (item for item in (_single_circle_extrude(feature, "XZ") for feature in base_features)
+         if item is not None),
+        None,
+    )
+    vertical_rods = [_single_circle_extrude(feature, "XY") for feature in base_features]
+    vertical_rods = [item for item in vertical_rods if item is not None]
+    if main is None or not vertical_rods:
+        return
+    main_cx, main_z, main_radius, _main_offset, _main_depth = main
+    for rod in vertical_rods:
+        rod_x, rod_y, rod_radius, rod_z0, rod_depth = rod
+        if rod_depth <= 0 or rod_z0 > main_z + main_radius + rod_radius:
+            continue
+        segments = _horizontal_vertical_cylinder_intersection_left(
+            main_cx, main_z, main_radius, rod_x, rod_y, rod_radius)
+        if segments:
+            views.setdefault("left", []).extend(segments)
+
+
+def _single_circle_extrude(feature: Feature, plane: str):
+    if feature.kind != "extrude_profile":
+        return None
+    params = feature.params
+    if params.get("plane") != plane:
+        return None
+    edges = params.get("edges", [])
+    if len(edges) != 1 or edges[0].get("kind") != "CIRCLE":
+        return None
+    center = edges[0].get("center")
+    if center is None or len(center) < 2:
+        return None
+    radius = float(edges[0].get("radius", 0.0) or 0.0)
+    depth = float(params.get("depth", 0.0) or 0.0)
+    offset = float(params.get("offset", 0.0) or 0.0)
+    if radius <= 0 or depth <= 0:
+        return None
+    return float(center[0]), float(center[1]), radius, offset, depth
+
+
+def _horizontal_vertical_cylinder_intersection_left(
+    main_cx: float,
+    main_z: float,
+    main_radius: float,
+    rod_x: float,
+    rod_y: float,
+    rod_radius: float,
+    steps: int = 48,
+):
+    x0 = max(main_cx - main_radius, rod_x - rod_radius)
+    x1 = min(main_cx + main_radius, rod_x + rod_radius)
+    if x1 <= x0:
+        return []
+    left_curve = []
+    right_curve = []
+    for idx in range(steps + 1):
+        x = x0 + (x1 - x0) * idx / steps
+        main_term = main_radius * main_radius - (x - main_cx) ** 2
+        rod_term = rod_radius * rod_radius - (x - rod_x) ** 2
+        if main_term < -1e-9 or rod_term < -1e-9:
+            continue
+        z = main_z + math.sqrt(max(0.0, main_term))
+        y_delta = math.sqrt(max(0.0, rod_term))
+        left_curve.append((rod_y - y_delta, z))
+        right_curve.append((rod_y + y_delta, z))
+    return list(zip(left_curve, left_curve[1:])) + list(zip(right_curve, right_curve[1:]))
 
 
 def _overlay_feature_segments(views, features: List[Feature]) -> None:

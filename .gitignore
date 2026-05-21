@@ -1,6 +1,9 @@
 # 运行时输入/输出目录
 dxf_files/
 outputs/
+3D2DXF/3d/
+3D2DXF/3d_stl/
+3D2DXF/output/
 
 # 配置文件
 config.json

@@ -20,6 +20,7 @@ Strategy:
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -415,6 +416,21 @@ def infer_features(projected: Dict[str, ProjectedView],
     width, depth, height = estimate_part_size(projected, bundles)
     features: List[Feature] = []
 
+    radial_rod = _infer_radial_stepped_cylinder_assembly(
+        projected, width, depth, height, model_intent)
+    if radial_rod is not None:
+        return radial_rod
+
+    side_connected_tube = _infer_side_connected_tube_assembly(
+        projected, width, depth, height, model_intent)
+    if side_connected_tube is not None:
+        return side_connected_tube
+
+    linkage_plate = _infer_planar_linkage_plate(
+        projected, width, depth, height, model_intent)
+    if linkage_plate is not None:
+        return linkage_plate
+
     additive = _infer_additive_components(projected, width, depth, height, model_intent)
     if additive is not None:
         return additive
@@ -556,6 +572,335 @@ def infer_features(projected: Dict[str, ProjectedView],
             ))
 
     return features
+
+
+def _infer_side_connected_tube_assembly(
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+    model_intent: str = "",
+) -> Optional[List[Feature]]:
+    front = projected.get("front")
+    if front is None:
+        return None
+    bundle = ViewBundle(
+        name=front.name,
+        bbox=(0.0, 0.0, front.width, front.height),
+        entities=front.entities,
+    )
+    outlines, _circles = extract_closed_outlines_and_circles(
+        bundle, hidden_pred=_is_hidden_entity)
+    if len(outlines) < 5:
+        return None
+    scale = max(width, depth, height, front.width, front.height, 1.0)
+    tol = max(scale * 0.01, 1e-6)
+    significant = [
+        outline for outline in outlines
+        if _outline_area(outline) > max(front.width * front.height * 0.01, tol * tol)
+    ]
+    if len(significant) < 5:
+        return None
+    inners = _nested_inner_outlines(significant, tol)
+    inner_ids = {id(outline) for outline in inners}
+    outer_outlines = [outline for outline in significant if id(outline) not in inner_ids]
+
+    outer_circles: List[Tuple[Tuple[float, float, float], Outline]] = []
+    for outline in outer_outlines:
+        circular = _outline_as_circle(outline, tol)
+        if circular is not None:
+            outer_circles.append((circular, outline))
+    if len(outer_circles) < 2:
+        return None
+    outer_circles.sort(key=lambda item: item[0][2], reverse=True)
+    main_circle, main_outline = outer_circles[0]
+    secondary_circle, secondary_outline = outer_circles[1]
+    main_cx, main_z, main_radius = main_circle
+    side_cx, side_z, side_radius = secondary_circle
+    if main_radius <= tol or side_radius <= tol or side_radius >= main_radius * 0.8:
+        return None
+
+    outer_profiles = [
+        outline for outline in outer_outlines
+        if _outline_as_circle(outline, tol) is None
+        and len(outline.edges) >= 12
+        and _outline_area(outline) > max(_outline_area(secondary_outline) * 0.8, tol * tol)
+    ]
+    if not outer_profiles:
+        return None
+    slot_outline = max(outer_profiles, key=lambda outline: outline.bbox[2])
+    sx0, sz0, sx1, sz1 = slot_outline.bbox
+    if sx1 <= main_cx or sx0 <= main_cx + main_radius * 0.2:
+        return None
+
+    features: List[Feature] = []
+
+    def add_extrude(edges: List[Dict], bbox: Tuple[float, float, float, float], reason: str) -> None:
+        features.append(Feature(kind="extrude_profile", params={
+            "plane": "XZ",
+            "depth": float(depth),
+            "offset": 0.0,
+            "source_view": "front",
+            "edges": edges,
+            "bbox_2d": list(bbox),
+            "additive_component": True,
+            "reason": reason,
+        }))
+
+    add_extrude([{
+        "kind": "CIRCLE",
+        "center": [float(main_cx), float(main_z)],
+        "radius": float(main_radius),
+    }], tuple(main_outline.bbox), "side_connected_main_through_tube")
+    add_extrude([{
+        "kind": "CIRCLE",
+        "center": [float(side_cx), float(side_z)],
+        "radius": float(side_radius),
+    }], tuple(secondary_outline.bbox), "side_connected_round_end")
+    add_extrude([_serialize_edge(edge) for edge in slot_outline.edges],
+                tuple(slot_outline.bbox), "side_connected_slotted_end")
+
+    left_connector = _connector_quad(
+        (float(side_cx), float(side_z)), float(side_radius) * 0.75,
+        (float(main_cx), float(main_z)), float(main_radius) * 0.9,
+        min(float(side_radius), float(main_radius)) * 0.35,
+        tol,
+    )
+    if left_connector is not None:
+        add_extrude(left_connector, _edge_bbox(left_connector),
+                    "side_connected_left_arm")
+    right_connector = _horizontal_connector(
+        float(main_cx + main_radius * 0.35), float(sx0),
+        (float(sz0) + float(sz1)) * 0.5,
+        min(float(main_radius) * 0.55, max(float(sz1 - sz0) * 0.28, tol)),
+        tol,
+    )
+    if right_connector is not None:
+        add_extrude(right_connector, _edge_bbox(right_connector),
+                    "side_connected_right_arm")
+
+    for inner in inners:
+        circular = _outline_as_circle(inner, tol)
+        if circular is not None:
+            cx, z, radius = circular
+            if radius <= tol:
+                continue
+            features.append(Feature(kind="hole", params={
+                "radius": float(radius),
+                "diameter": float(radius) * 2.0,
+                "axis": "Y",
+                "position": [float(cx), 0.0, float(z)],
+                "through_length": float(depth),
+                "source_view": "front",
+                "reason": "side_connected_tube_circular_opening",
+            }))
+        else:
+            if min(inner.width, inner.height) <= tol:
+                continue
+            features.append(Feature(kind="profile_cut", params={
+                "plane": "XZ",
+                "depth": float(depth),
+                "offset": 0.0,
+                "source_view": "front",
+                "edges": [_serialize_edge(edge) for edge in inner.edges],
+                "bbox_2d": list(inner.bbox),
+                "internal_profile_cut": True,
+                "reason": "side_connected_tube_slotted_opening",
+            }))
+
+    if len(features) < 6:
+        return None
+    return features
+
+
+def _connector_quad(
+    start_center: Tuple[float, float],
+    start_offset: float,
+    end_center: Tuple[float, float],
+    end_offset: float,
+    half_width: float,
+    tol: float,
+) -> Optional[List[Dict]]:
+    sx, sz = start_center
+    ex, ez = end_center
+    dx = ex - sx
+    dz = ez - sz
+    length = math.hypot(dx, dz)
+    if length <= tol:
+        return None
+    ux, uz = dx / length, dz / length
+    nx, nz = -uz, ux
+    ax = sx + ux * start_offset
+    az = sz + uz * start_offset
+    bx = ex - ux * end_offset
+    bz = ez - uz * end_offset
+    if math.hypot(bx - ax, bz - az) <= tol:
+        return None
+    pts = [
+        [ax + nx * half_width, az + nz * half_width],
+        [bx + nx * half_width, bz + nz * half_width],
+        [bx - nx * half_width, bz - nz * half_width],
+        [ax - nx * half_width, az - nz * half_width],
+    ]
+    return _polyline_edges(pts)
+
+
+def _horizontal_connector(
+    x0: float,
+    x1: float,
+    z: float,
+    half_height: float,
+    tol: float,
+) -> Optional[List[Dict]]:
+    if x1 - x0 <= tol or half_height <= tol:
+        return None
+    return _polyline_edges([
+        [x0, z - half_height],
+        [x1, z - half_height],
+        [x1, z + half_height],
+        [x0, z + half_height],
+    ])
+
+
+def _polyline_edges(points: List[List[float]]) -> List[Dict]:
+    edges: List[Dict] = []
+    for idx, p0 in enumerate(points):
+        p1 = points[(idx + 1) % len(points)]
+        edges.append({"kind": "LINE", "p0": [float(p0[0]), float(p0[1])],
+                      "p1": [float(p1[0]), float(p1[1])]})
+    return edges
+
+
+def _edge_bbox(edges: List[Dict]) -> Tuple[float, float, float, float]:
+    xs: List[float] = []
+    ys: List[float] = []
+    for edge in edges:
+        for key in ("p0", "p1"):
+            point = edge.get(key)
+            if point is None:
+                continue
+            xs.append(float(point[0]))
+            ys.append(float(point[1]))
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _infer_planar_linkage_plate(
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+    model_intent: str = "",
+) -> Optional[List[Feature]]:
+    text = (model_intent or "").lower()
+    if not any(token in text for token in (
+        "平面连杆", "连杆板", "摇臂", "摆臂", "曲柄连杆",
+        "多孔连接板", "长圆孔连杆", "linkage", "rocker", "link plate",
+    )):
+        return None
+    front = projected.get("front")
+    if front is None:
+        return None
+
+    bundle = ViewBundle(
+        name=front.name,
+        bbox=(0.0, 0.0, front.width, front.height),
+        entities=front.entities,
+    )
+    outlines, _circles = extract_closed_outlines_and_circles(
+        bundle, hidden_pred=_is_hidden_entity)
+    if not outlines:
+        return None
+    scale = max(width, depth, height, front.width, front.height, 1.0)
+    tol = max(scale * 0.01, 1e-6)
+    significant = [
+        outline for outline in outlines
+        if _outline_area(outline) > max(front.width * front.height * 0.001, tol * tol)
+    ]
+    if len(significant) < 3:
+        return None
+
+    bbox = _combined_outline_bbox(significant)
+    features: List[Feature] = [Feature(kind="extrude_profile", params={
+        "plane": "XZ",
+        "depth": float(depth),
+        "source_view": "front",
+        "edges": _rectangle_edges(bbox),
+        "bbox_2d": list(bbox),
+        "reason": "planar_linkage_plate_bbox_rebuild",
+    })]
+
+    for inner in _nested_inner_outlines(significant, tol):
+        circular = _outline_as_circle(inner, tol)
+        if circular is not None:
+            cx, z, radius = circular
+            if radius <= tol:
+                continue
+            features.append(Feature(kind="hole", params={
+                "radius": float(radius),
+                "axis": "Y",
+                "position": [float(cx), 0.0, float(z)],
+                "through_length": float(depth),
+                "source_view": "front",
+                "reason": "planar_linkage_plate_internal_circle",
+            }))
+        else:
+            if min(inner.width, inner.height) <= tol:
+                continue
+            features.append(Feature(kind="profile_cut", params={
+                "plane": "XZ",
+                "depth": float(depth),
+                "offset": 0.0,
+                "source_view": "front",
+                "edges": [_serialize_edge(edge) for edge in inner.edges],
+                "bbox_2d": list(inner.bbox),
+                "internal_profile_cut": True,
+                "reason": "planar_linkage_plate_internal_profile",
+            }))
+
+    return features
+
+
+def _combined_outline_bbox(outlines: List[Outline]) -> Tuple[float, float, float, float]:
+    return (
+        min(float(outline.bbox[0]) for outline in outlines),
+        min(float(outline.bbox[1]) for outline in outlines),
+        max(float(outline.bbox[2]) for outline in outlines),
+        max(float(outline.bbox[3]) for outline in outlines),
+    )
+
+
+def _rectangle_edges(bbox: Tuple[float, float, float, float]) -> List[Dict]:
+    x0, y0, x1, y1 = [float(value) for value in bbox]
+    return [
+        {"kind": "LINE", "p0": [x0, y0], "p1": [x1, y0]},
+        {"kind": "LINE", "p0": [x1, y0], "p1": [x1, y1]},
+        {"kind": "LINE", "p0": [x1, y1], "p1": [x0, y1]},
+        {"kind": "LINE", "p0": [x0, y1], "p1": [x0, y0]},
+    ]
+
+
+def _nested_inner_outlines(outlines: List[Outline], tol: float) -> List[Outline]:
+    inners: List[Outline] = []
+    for candidate in outlines:
+        containers = [
+            outline for outline in outlines
+            if outline is not candidate and _outline_inside_outline(candidate, outline, tol)
+        ]
+        if not containers:
+            continue
+        container = min(containers, key=_outline_area)
+        if _outline_area(candidate) >= _outline_area(container) * 0.9:
+            continue
+        inners.append(candidate)
+    deduped: List[Outline] = []
+    seen = set()
+    for outline in sorted(inners, key=_outline_area, reverse=True):
+        key = tuple(round(float(v) / tol) for v in outline.bbox) + (len(outline.edges),)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(outline)
+    return deduped
 
 
 def _infer_internal_profile_cuts(
@@ -1182,6 +1527,355 @@ def _intent_requests_additive_components(model_intent: str) -> bool:
         "component", "components", "multi", "assembly", "fuse", "joined",
     )
     return any(token in text for token in tokens)
+
+
+def _infer_radial_stepped_cylinder_assembly(
+    projected: Dict[str, ProjectedView],
+    width: float,
+    depth: float,
+    height: float,
+    model_intent: str = "",
+) -> Optional[List[Feature]]:
+    text = (model_intent or "").lower()
+    if not any(token in text for token in (
+        "圆柱杆", "较粗", "较细", "粗", "细", "垂直于轴线",
+        "阶梯圆柱杆", "偏心侧向", "偏心径向", "径向", "竖直", "立式",
+        "侧向杆", "支管", "凸台",
+        "radial", "stepped", "rod", "branch", "boss", "vertical",
+    )):
+        return None
+    front = projected.get("front")
+    top = projected.get("top")
+    left = projected.get("left") or projected.get("right")
+    if front is None or top is None or left is None:
+        return None
+
+    scale = max(width, depth, height, 1.0)
+    tol = max(scale * 0.015, 1e-4)
+    front_circles = [
+        (_outline_as_circle(outline, tol), outline)
+        for outline in _component_candidate_outlines(front)
+    ]
+    front_circles = [(circle, outline) for circle, outline in front_circles if circle is not None]
+    if not front_circles:
+        return None
+    main_circle, _main_outline = max(front_circles, key=lambda item: item[0][2])
+    main_cx, main_z, main_radius = main_circle
+    if main_radius < max(width, height) * 0.18:
+        return None
+
+    top_circles = [
+        (_outline_as_circle(outline, tol), outline)
+        for outline in _unique_significant_outlines(top)
+    ]
+    top_circles = [(circle, outline) for circle, outline in top_circles if circle is not None]
+    if not top_circles:
+        return None
+    rod_circle, _rod_outline = max(top_circles, key=lambda item: item[0][2])
+    rod_x, rod_y, coarse_radius = rod_circle
+    if coarse_radius <= tol or coarse_radius >= main_radius * 0.65:
+        return None
+
+    side_branch_tokens = (
+        "沿x", "x向", "x 方向", "x方向", "侧向接管", "支管", "横向伸出",
+        "side branch", "branch pipe", "x-axis", "x axis",
+    )
+    vertical_rod_tokens = (
+        "径向", "竖直", "立式", "向上", "偏心径向", "vertical",
+    )
+    if (any(token in text for token in side_branch_tokens)
+            and not any(token in text for token in vertical_rod_tokens)):
+        side_features = _infer_left_side_stepped_rod_features(
+            projected, main_cx, main_z, main_radius, depth,
+            rod_x, rod_y, coarse_radius, tol)
+        if side_features is not None:
+            return side_features
+
+    main_top = main_z + main_radius
+    fine_span_front = _fine_rod_span_from_view(front, rod_x, coarse_radius, main_top, tol)
+    fine_span_left = _fine_rod_span_from_view(left, rod_y, coarse_radius, main_top, tol)
+    if fine_span_front is None and fine_span_left is None:
+        return None
+    spans = [span for span in (fine_span_front, fine_span_left) if span is not None]
+    fine_z0 = min(span[1] for span in spans)
+    fine_z1 = max(span[2] for span in spans)
+    fine_radius_values = [span[0] for span in spans if span[0] > tol]
+    if not fine_radius_values or fine_z1 - fine_z0 <= tol:
+        return None
+    fine_radius = min(fine_radius_values)
+    if fine_radius >= coarse_radius * 0.95:
+        return None
+
+    coarse_z0 = _coarse_rod_start_from_views(
+        ((front, rod_x), (left, rod_y)), coarse_radius, fine_z0, main_top, tol)
+    if coarse_z0 is None:
+        coarse_z0 = max(0.0, main_top - coarse_radius * 1.25)
+    coarse_z1 = fine_z0
+    if coarse_z1 - coarse_z0 <= tol:
+        return None
+
+    return [
+        Feature(kind="extrude_profile", params={
+            "plane": "XZ",
+            "depth": float(depth),
+            "offset": 0.0,
+            "source_view": "front",
+            "edges": [{
+                "kind": "CIRCLE",
+                "center": [float(main_cx), float(main_z)],
+                "radius": float(main_radius),
+            }],
+            "bbox_2d": [
+                float(main_cx - main_radius), float(main_z - main_radius),
+                float(main_cx + main_radius), float(main_z + main_radius),
+            ],
+            "additive_component": True,
+            "reason": "main_horizontal_cylinder",
+        }),
+        Feature(kind="extrude_profile", params={
+            "plane": "XY",
+            "depth": float(coarse_z1 - coarse_z0),
+            "offset": float(coarse_z0),
+            "source_view": "top",
+            "edges": [{
+                "kind": "CIRCLE",
+                "center": [float(rod_x), float(rod_y)],
+                "radius": float(coarse_radius),
+            }],
+            "bbox_2d": [
+                float(rod_x - coarse_radius), float(rod_y - coarse_radius),
+                float(rod_x + coarse_radius), float(rod_y + coarse_radius),
+            ],
+            "additive_component": True,
+            "reason": "radial_rod_large_segment",
+        }),
+        Feature(kind="extrude_profile", params={
+            "plane": "XY",
+            "depth": float(fine_z1 - fine_z0),
+            "offset": float(fine_z0),
+            "source_view": "top",
+            "edges": [{
+                "kind": "CIRCLE",
+                "center": [float(rod_x), float(rod_y)],
+                "radius": float(fine_radius),
+            }],
+            "bbox_2d": [
+                float(rod_x - fine_radius), float(rod_y - fine_radius),
+                float(rod_x + fine_radius), float(rod_y + fine_radius),
+            ],
+            "additive_component": True,
+            "reason": "radial_rod_small_segment",
+        }),
+    ]
+
+
+def _infer_left_side_stepped_rod_features(
+    projected: Dict[str, ProjectedView],
+    main_cx: float,
+    main_z: float,
+    main_radius: float,
+    main_depth: float,
+    rod_x: float,
+    rod_y: float,
+    coarse_radius_hint: float,
+    tol: float,
+) -> Optional[List[Feature]]:
+    front = projected.get("front")
+    left = projected.get("left") or projected.get("right")
+    if front is None or left is None:
+        return None
+
+    left_circles = [
+        (_outline_as_circle(outline, tol), outline)
+        for outline in _unique_significant_outlines(left)
+    ]
+    left_circles = [(circle, outline) for circle, outline in left_circles if circle is not None]
+    if not left_circles:
+        return None
+    side_circle, _side_outline = max(left_circles, key=lambda item: item[0][2])
+    rod_y_from_left, side_z, side_radius = side_circle
+    rod_z = float(side_z)
+    coarse_radius = max(float(coarse_radius_hint), float(side_radius))
+
+    fine = _fine_rod_span_from_view(front, rod_x, coarse_radius, main_z + main_radius, tol)
+    fine_radius = fine[0] if fine is not None else None
+    fine_length = fine[2] - fine[1] if fine is not None else None
+    if fine_radius is None or fine_radius <= tol:
+        fine_radius = _fine_radius_from_rectangles(left, rod_y_from_left, rod_z, coarse_radius, tol)
+    if fine_length is None or fine_length <= tol:
+        fine_length = main_radius
+    if fine_radius is None or fine_radius <= tol or fine_radius >= coarse_radius * 0.95:
+        return None
+
+    dz = float(rod_z - main_z)
+    surface_span_sq = float(main_radius * main_radius - dz * dz)
+    if surface_span_sq > 0.0:
+        main_left_surface_x = float(main_cx - math.sqrt(surface_span_sq))
+    else:
+        main_left_surface_x = float(main_cx - main_radius)
+    # For a side branch fused into a round body, the coarse root is mostly
+    # embedded in the host cylinder in the front projection. Keep only the
+    # outer tangent at the cylinder surface instead of forcing visible overhang.
+    coarse_x1 = float(main_left_surface_x)
+    coarse_depth = float(coarse_radius * 2.0)
+    coarse_x0 = coarse_x1 - coarse_depth
+    fine_depth = float(fine_length)
+    fine_x0 = float(coarse_x0 - fine_depth)
+
+    return [
+        Feature(kind="extrude_profile", params={
+            "plane": "XZ",
+            "depth": float(main_depth),
+            "offset": 0.0,
+            "source_view": "front",
+            "edges": [{
+                "kind": "CIRCLE",
+                "center": [float(main_cx), float(main_z)],
+                "radius": float(main_radius),
+            }],
+            "bbox_2d": [
+                float(main_cx - main_radius), float(main_z - main_radius),
+                float(main_cx + main_radius), float(main_z + main_radius),
+            ],
+            "additive_component": True,
+            "reason": "main_horizontal_cylinder",
+        }),
+        Feature(kind="extrude_profile", params={
+            "plane": "YZ",
+            "depth": coarse_depth,
+            "offset": coarse_x0,
+            "source_view": "left",
+            "edges": [{
+                "kind": "CIRCLE",
+                "center": [float(rod_y_from_left), float(rod_z)],
+                "radius": float(coarse_radius),
+            }],
+            "bbox_2d": [
+                float(rod_y_from_left - coarse_radius), float(rod_z - coarse_radius),
+                float(rod_y_from_left + coarse_radius), float(rod_z + coarse_radius),
+            ],
+            "additive_component": True,
+            "reason": "left_side_rod_large_segment",
+        }),
+        Feature(kind="extrude_profile", params={
+            "plane": "YZ",
+            "depth": fine_depth,
+            "offset": fine_x0,
+            "source_view": "left",
+            "edges": [{
+                "kind": "CIRCLE",
+                "center": [float(rod_y_from_left), float(rod_z)],
+                "radius": float(fine_radius),
+            }],
+            "bbox_2d": [
+                float(rod_y_from_left - fine_radius), float(rod_z - fine_radius),
+                float(rod_y_from_left + fine_radius), float(rod_z + fine_radius),
+            ],
+            "additive_component": True,
+            "reason": "left_side_rod_small_segment",
+        }),
+    ]
+
+
+def _fine_radius_from_rectangles(
+    pv: ProjectedView,
+    center: float,
+    z_center: float,
+    coarse_radius: float,
+    tol: float,
+) -> Optional[float]:
+    candidates = []
+    for outline in _unique_significant_outlines(pv):
+        if not _is_axis_aligned_rectangle_outline(outline, tol):
+            continue
+        x0, z0, x1, z1 = outline.bbox
+        rect_center = (float(x0) + float(x1)) * 0.5
+        if abs(rect_center - center) > coarse_radius * 0.35:
+            continue
+        if float(z0) < z_center:
+            continue
+        radius = (float(x1) - float(x0)) * 0.5
+        if tol < radius < coarse_radius:
+            candidates.append(radius)
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+def _fine_rod_span_from_view(
+    pv: ProjectedView,
+    center: float,
+    coarse_radius: float,
+    main_top: float,
+    tol: float,
+) -> Optional[Tuple[float, float, float]]:
+    verticals = []
+    for entity in pv.entities:
+        if entity.kind != "LINE" or len(entity.points) < 2:
+            continue
+        (x0, z0), (x1, z1) = entity.points[:2]
+        if abs(float(x0) - float(x1)) > tol * 0.25:
+            continue
+        lo, hi = sorted((float(z0), float(z1)))
+        if hi - lo <= coarse_radius:
+            continue
+        if lo < main_top - coarse_radius * 0.25:
+            continue
+        x = float(x0)
+        if abs(x - center) > coarse_radius * 1.2:
+            continue
+        verticals.append((x, lo, hi))
+    if len(verticals) < 2:
+        return None
+    best = None
+    for i, left_seg in enumerate(verticals):
+        for right_seg in verticals[i + 1:]:
+            x0, z00, z01 = left_seg
+            x1, z10, z11 = right_seg
+            width = abs(x1 - x0)
+            if width <= tol or width >= coarse_radius * 1.9:
+                continue
+            lo = max(z00, z10)
+            hi = min(z01, z11)
+            if hi - lo <= coarse_radius:
+                continue
+            center_error = abs(((x0 + x1) * 0.5) - center)
+            score = (hi - lo) - center_error * 5.0 - width
+            if best is None or score > best[0]:
+                best = (score, width * 0.5, lo, hi)
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
+def _coarse_rod_start_from_views(
+    views: Tuple[Tuple[ProjectedView, float], ...],
+    coarse_radius: float,
+    coarse_z1: float,
+    main_top: float,
+    tol: float,
+) -> Optional[float]:
+    starts: List[float] = []
+    for pv, center in views:
+        edge_positions = (center - coarse_radius, center + coarse_radius)
+        for entity in pv.entities:
+            if entity.kind != "LINE" or len(entity.points) < 2:
+                continue
+            (x0, z0), (x1, z1) = entity.points[:2]
+            if abs(float(x0) - float(x1)) > tol * 0.25:
+                continue
+            x = float(x0)
+            if min(abs(x - edge) for edge in edge_positions) > max(coarse_radius * 0.18, tol):
+                continue
+            lo, hi = sorted((float(z0), float(z1)))
+            if hi < main_top - coarse_radius * 2.0 or lo > coarse_z1 + tol:
+                continue
+            if hi < coarse_z1 - coarse_radius * 0.6:
+                continue
+            starts.append(lo)
+    if not starts:
+        return None
+    return max(0.0, min(starts))
 
 
 def _bbox_is_redundant_component_candidate(
