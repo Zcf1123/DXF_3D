@@ -39,7 +39,7 @@
 镜像名可用环境变量 `DXF_3D_IMAGE` 覆盖（默认 `dxf-3d`）。本文所有示例默认使用
 `-d` 开发挂载模式，让容器挂载当前源码目录，避免每次改代码后重建镜像。
 
-### Auto 路线为什么会参考 direct
+### Auto 路线参考 direct
 
 `--auto` 会让 LLM 直接编写 FreeCAD Python。LLM 容易写出两类错误：一类是
 FreeCAD API 细节错误，例如把 `Part.makeCircle` 返回的边直接传给 `Part.Face`；另一类是
