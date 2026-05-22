@@ -207,18 +207,16 @@ def validate_projection_against_views(
     """
     import FreeCAD as App  # type: ignore
 
-    model_views = _feature_model_view_segments(features or [], include_cuts=False)
-    if model_views is None:
-        doc = App.openDocument(fcstd_path)
-        try:
-            shape = _result_shape(doc)
-            model_views = {
-                "front": _project_shape_edges(shape, "front"),
-                "left": _project_shape_edges(shape, "left"),
-                "top": _project_shape_edges(shape, "top"),
-            }
-        finally:
-            App.closeDocument(doc.Name)
+    doc = App.openDocument(fcstd_path)
+    try:
+        shape = _result_shape(doc)
+        model_views = {
+            "front": _project_shape_edges(shape, "front"),
+            "left": _project_shape_edges(shape, "left"),
+            "top": _project_shape_edges(shape, "top"),
+        }
+    finally:
+        App.closeDocument(doc.Name)
 
     view_reports: Dict[str, Any] = {}
     for view_name in ("front", "left", "top"):
@@ -252,19 +250,16 @@ def export_model_views_png(fcstd_path: str, png_path: str,
     from matplotlib.collections import LineCollection  # type: ignore
     import FreeCAD as App  # type: ignore
 
-    views = _feature_model_view_segments(features or [], include_cuts=True)
-    feature_based_views = views is not None
-    if views is None:
-        doc = App.openDocument(fcstd_path)
-        try:
-            shape = _result_shape(doc)
-            views = {
-                "front": _project_shape_edges(shape, "front", classify_hidden=True),
-                "left": _project_shape_edges(shape, "left", classify_hidden=True),
-                "top": _project_shape_edges(shape, "top", classify_hidden=True),
-            }
-        finally:
-            App.closeDocument(doc.Name)
+    doc = App.openDocument(fcstd_path)
+    try:
+        shape = _result_shape(doc)
+        views = {
+            "front": _project_shape_edges(shape, "front", classify_hidden=True),
+            "left": _project_shape_edges(shape, "left", classify_hidden=True),
+            "top": _project_shape_edges(shape, "top", classify_hidden=True),
+        }
+    finally:
+        App.closeDocument(doc.Name)
 
     fig, axes = plt.subplots(2, 2, figsize=(8, 8))
     layout = {"front": axes[0][0], "left": axes[0][1],
@@ -276,8 +271,6 @@ def export_model_views_png(fcstd_path: str, png_path: str,
     for name in ("front", "left", "top"):
         ax = layout[name]
         raw_segs = list(views[name])
-        if feature_based_views and name == "left":
-            raw_segs = _mirror_left_view_segments(raw_segs)
         if overlay_input_hidden and projected is not None and projected.get(name) is not None:
             raw_segs.extend(_hidden_segments_from_entities(projected[name].entities, name))
         segs = _normalize_segments(raw_segs)
@@ -1355,7 +1348,7 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
     finally:
         App.closeDocument(doc.Name)
 
-    if face_verts:
+    if False and face_verts:
         xmin3, xmax3, ymin3, ymax3, zmin3, zmax3 = bbox_vals
         sx = max(xmax3 - xmin3, 1e-3)
         sy = max(ymax3 - ymin3, 1e-3)
@@ -1421,17 +1414,9 @@ def export_iso_overview_png(fcstd_path: str, png_path: str) -> str:
     fig, ax = plt.subplots(figsize=(9, 9 * H / W))
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
-    if face_polys:
-        ordered = sorted(face_polys, key=lambda item: item[0])
-        pc = PolyCollection([poly for _, poly, _ in ordered],
-                            facecolors=[color for _, _, color in ordered],
-                            edgecolors="none", linewidths=0.0,
-                            antialiaseds=True)
-        ax.add_collection(pc)
-    else:
-        lc = LineCollection(segs, colors="black", linewidths=0.8,
-                            capstyle="round", joinstyle="round")
-        ax.add_collection(lc)
+    lc = LineCollection(segs, colors="black", linewidths=0.8,
+                        capstyle="round", joinstyle="round")
+    ax.add_collection(lc)
     ax.set_xlim(xmin - margin, xmax + margin)
     ax.set_ylim(ymin - margin, ymax + margin)
     ax.set_aspect("equal")
