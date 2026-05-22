@@ -64,6 +64,7 @@ _INVALID_FREECAD_CALLS = {
     "Part.setMeasurePrecision": "FreeCAD Part has no Part.setMeasurePrecision; remove this no-op line",
     "Part.cut": "FreeCAD Part has no Part.cut module function; call shape.cut(other_shape) instead",
     "Part.common": "FreeCAD Part has no Part.common module function; call shape.common(other_shape) instead",
+    "App.setActiveDocument": "Do not call App.setActiveDocument; keep and use the document returned by App.newDocument(...) instead",
     "doc.close": "FreeCAD document objects have no close() method; remove doc.close() after saveAs",
     "doc.Name": "FreeCAD document Name is read-only; pass the name to App.newDocument(...) instead",
 }
@@ -239,6 +240,7 @@ def strip_code_fence(text: str) -> str:
 
 def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
+    script = re.sub(r"(?m)^\s*App\.setActiveDocument\([^\n]*\)\s*\n?", "", script)
     script = re.sub(r"(?m)^\s*doc\.close\(\)\s*\n?", "", script)
     script = re.sub(r"(?m)^\s*doc\.Name\s*=\s*[^\n]*\n?", "", script)
     shape_vars = re.findall(
@@ -270,7 +272,25 @@ def _sanitize_generated_script(script: str) -> str:
     if "Part.fuse(" in script:
         script = script.replace("Part.fuse(", "_fuse_all(")
         script = _ensure_fuse_helper(script)
+    script = _strip_full_line_comments(script)
     return script.strip() + "\n"
+
+
+def _strip_full_line_comments(script: str) -> str:
+    lines = []
+    blank_count = 0
+    for line in script.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if not stripped:
+            blank_count += 1
+            if blank_count > 1:
+                continue
+        else:
+            blank_count = 0
+        lines.append(line.rstrip())
+    return "\n".join(lines)
 
 
 def _ensure_geometry_helper(script: str) -> str:

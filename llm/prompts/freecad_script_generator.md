@@ -5,7 +5,7 @@
 硬性规则：
 
 - 只输出一份完整 Python 脚本，不要解释，不要 Markdown 正文。
-- 输出必须是短脚本：不要在代码注释中写工程图推理过程，不要长篇解释坐标换算，避免脚本尾部被截断。
+- 输出必须是短脚本：不要在代码注释中写工程图推理过程，不要长篇解释坐标换算，避免脚本尾部被截断；推理只应体现在建模参数和代码结构中。
 - 除必要的函数名/变量名外，尽量少写注释；优先输出可执行建模代码。
 - 允许使用 `import FreeCAD as App`、`import Part`、`import math`。不要使用 GUI、外部网络、文件删除、shell、`subprocess`、`os.system`、`eval`、`exec`。
 - 必须创建最终实体对象，名称必须是 `Result`。
@@ -13,6 +13,7 @@
 - 必须保存到给定的 `FCSTD_PATH`。
 - 脚本中必须实际出现 `Result` 和 `doc.saveAs(FCSTD_PATH)`，否则会被程序拒绝。
 - 保存后不要调用 `doc.close()`；FreeCAD 文档对象没有这个方法。需要关闭文档时应由外部流程处理。
+- 不要调用 `App.setActiveDocument(...)`；直接使用 `doc = App.newDocument(BASE_NAME)` 返回的文档对象。
 - 不要给 `doc.Name` 赋值；这是只读属性。如需文档名，请使用 `App.newDocument(BASE_NAME)`。
 - `Part.makeSphere` / `Part.makeBox` / `Part.makeCylinder` 返回的就是 Shape/Solid，不要再访问 `.Shape`。
 - 建模应使用 FreeCAD/Part 的实体布尔、拉伸、圆柱、盒体、线框轮廓等稳定 API。
