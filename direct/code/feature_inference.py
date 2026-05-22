@@ -564,7 +564,7 @@ def infer_features(projected: Dict[str, ProjectedView],
                 kind="edge_chamfer",
                 params={
                     "distance": chamfer_distance,
-                    "profile": "arc",
+                    "profile": "arc_revolve" if top_radius else "arc",
                     "scope": "outer_z_edges",
                     "source_views": ["front", "left"],
                     **({"top_radius": top_radius} if top_radius else {}),
