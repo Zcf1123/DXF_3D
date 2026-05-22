@@ -28,7 +28,12 @@ _BANNED_TEXT = (
 )
 
 _ALLOWED_IMPORT_ROOTS = {"FreeCAD", "Part", "math"}
+_INVALID_FREECAD_CALLS = {
+    "Part.Extrude": "FreeCAD Part has no Part.Extrude; create a Part.Face and call face.extrude(App.Vector(...)) instead",
+    "Part.setMeasurePrecision": "FreeCAD Part has no Part.setMeasurePrecision; remove this no-op line",
+}
 _REQUEST_TIMEOUT_SECONDS = 180
+_MAX_SCRIPT_TOKENS = 9000
 
 
 def build_auto_context(
@@ -88,7 +93,7 @@ def generate_freecad_script(
                 model=llm.model,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=5000,
+                max_tokens=_MAX_SCRIPT_TOKENS,
                 timeout=_REQUEST_TIMEOUT_SECONDS,
             )
         content = (resp.choices[0].message.content or "").strip()
@@ -96,14 +101,16 @@ def generate_freecad_script(
         return None, f"LLM 请求失败：{exc}"
 
     _write_debug_text(debug_dir, "llm_raw_response.txt", content)
-    script = strip_code_fence(content)
+    script = _sanitize_generated_script(strip_code_fence(content))
     _write_debug_text(debug_dir, "generated_model_candidate.py", script)
     ok, reason = validate_generated_script(script)
     if not ok:
         repaired, repair_msg = _repair_generated_script(
             llm, messages, content, reason, debug_dir)
         if repaired is None:
-            return None, f"LLM 脚本未通过安全/结构校验：{reason}；{repair_msg}"
+            fallback = _fallback_freecad_script(context, base_name, fcstd_path)
+            _write_debug_text(debug_dir, "generated_model_fallback.py", fallback)
+            return fallback, f"LLM 脚本未通过安全/结构校验：{reason}；{repair_msg}；已使用 auto_context 兜底脚本"
         return repaired, repair_msg
     return script, f"LLM 直接建模脚本生成完成（{llm.model}）"
 
@@ -126,7 +133,10 @@ def _repair_generated_script(
             "2. 必须创建对象 `result = doc.addObject('Part::Feature', 'Result')`。\n"
             "3. 必须给 `result.Shape` 赋最终 solid。\n"
             "4. 脚本末尾必须包含 `doc.recompute()` 和 `doc.saveAs(FCSTD_PATH)`。\n"
-            "5. 不要输出 Markdown 解释文字。"
+            "5. 不要使用不存在的 `Part.Extrude`；拉伸必须使用 `Part.Face(...).extrude(App.Vector(...))`。\n"
+            "6. `Part.makeCylinder` 正确签名是 `Part.makeCylinder(radius, height, base, direction)` 或带第 5 个 angle；第 4 个参数必须是方向向量，不是数字。\n"
+            "7. 直接给短脚本，不要写工程图推理过程，不要写长段注释，避免输出被截断。\n"
+            "8. 不要输出 Markdown 解释文字。"
         ),
     })
     try:
@@ -135,7 +145,7 @@ def _repair_generated_script(
                 model=llm.model,
                 messages=repair_messages,
                 temperature=0.0,
-                max_tokens=5000,
+                max_tokens=_MAX_SCRIPT_TOKENS,
                 timeout=_REQUEST_TIMEOUT_SECONDS,
             )
         content = (resp.choices[0].message.content or "").strip()
@@ -143,7 +153,7 @@ def _repair_generated_script(
         return None, f"自动重试失败：{exc}"
 
     _write_debug_text(debug_dir, "llm_raw_response_retry.txt", content)
-    script = strip_code_fence(content)
+    script = _sanitize_generated_script(strip_code_fence(content))
     _write_debug_text(debug_dir, "generated_model_candidate_retry.py", script)
     ok, repair_reason = validate_generated_script(script)
     if not ok:
@@ -165,10 +175,185 @@ def _write_debug_text(debug_dir: Optional[str], filename: str, text: str) -> Non
 
 def strip_code_fence(text: str) -> str:
     text = text.strip()
-    if text.startswith("```"):
+    fenced = re.search(r"```(?:python)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    else:
         text = re.sub(r"^```(?:python)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     return text.strip() + "\n"
+
+
+def _sanitize_generated_script(script: str) -> str:
+    script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
+    return script.strip() + "\n"
+
+
+def _fallback_freecad_script(context: Dict[str, Any], base_name: str, fcstd_path: str) -> str:
+    front = _context_view(context, "projected_views", "front") or _context_view(context, "views", "front")
+    top = _context_view(context, "projected_views", "top") or _context_view(context, "views", "top")
+    curves = list(front.get("approximated_curves") or [])
+    outer_ids = _outer_curve_ids(curves)
+    depth = _view_extent(top, "height", 1.0) or 1.0
+    thin_depth = max(depth / 3.0, depth * 0.25)
+    thin_y = max((depth - thin_depth) / 2.0, 0.0)
+    lines = [
+        "import FreeCAD as App",
+        "import Part",
+        "",
+        f"BASE_NAME = {base_name!r}",
+        f"FCSTD_PATH = {fcstd_path!r}",
+        "",
+        "doc = App.newDocument(BASE_NAME)",
+        "Y_AXIS = App.Vector(0, 1, 0)",
+        "shapes = []",
+        "cuts = []",
+        "",
+    ]
+    for curve in curves:
+        curve_id = curve.get("id")
+        is_outer = curve_id in outer_ids
+        y0 = 0.0 if _is_center_curve(curve, front) else thin_y
+        local_depth = depth if _is_center_curve(curve, front) else thin_depth
+        target = "shapes" if is_outer else "cuts"
+        expr = _curve_shape_expr(curve, y0, local_depth)
+        if expr:
+            lines.append(f"{target}.append({expr})")
+    lines.extend(_fallback_connector_lines(curves, outer_ids, thin_y, thin_depth))
+    lines.extend([
+        "",
+        "if shapes:",
+        "    final_shape = shapes[0]",
+        "    for shape in shapes[1:]:",
+        "        final_shape = final_shape.fuse(shape)",
+        "else:",
+        f"    final_shape = Part.makeBox({_view_extent(front, 'width', 1.0):.6f}, {depth:.6f}, {_view_extent(front, 'height', 1.0):.6f}, App.Vector(0, 0, 0))",
+        "for cut_shape in cuts:",
+        "    final_shape = final_shape.cut(cut_shape)",
+        "result = doc.addObject('Part::Feature', 'Result')",
+        "result.Shape = final_shape",
+        "doc.recompute()",
+        "doc.saveAs(FCSTD_PATH)",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _context_view(context: Dict[str, Any], section: str, name: str) -> Dict[str, Any]:
+    views = context.get(section)
+    if isinstance(views, dict):
+        item = views.get(name)
+        return item if isinstance(item, dict) else {}
+    if isinstance(views, list):
+        for item in views:
+            if isinstance(item, dict) and item.get("name") == name:
+                return item
+    return {}
+
+
+def _outer_curve_ids(curves: List[Dict[str, Any]]) -> set:
+    outer = set()
+    for curve in curves:
+        curve_id = curve.get("id")
+        bbox = curve.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        contained = False
+        for other in curves:
+            if other is curve:
+                continue
+            obox = other.get("bbox") or []
+            if len(obox) == 4 and _bbox_contains(obox, bbox) and _bbox_area(obox) > _bbox_area(bbox):
+                contained = True
+                break
+        if not contained:
+            outer.add(curve_id)
+    return outer
+
+
+def _bbox_contains(outer: List[float], inner: List[float], tol: float = 1e-5) -> bool:
+    return (outer[0] <= inner[0] + tol and outer[1] <= inner[1] + tol and
+            outer[2] >= inner[2] - tol and outer[3] >= inner[3] - tol)
+
+
+def _bbox_area(bbox: List[float]) -> float:
+    return max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+
+
+def _view_extent(view: Dict[str, Any], key: str, default: float) -> float:
+    try:
+        value = float(view.get(key, default))
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+def _is_center_curve(curve: Dict[str, Any], front: Dict[str, Any]) -> bool:
+    center = curve.get("center") or None
+    if not center:
+        line = curve.get("centerline") or []
+        if line:
+            center = line[0]
+    width = _view_extent(front, "width", 1.0)
+    try:
+        x = float(center[0])
+        return 0.35 * width <= x <= 0.75 * width
+    except Exception:
+        return False
+
+
+def _curve_shape_expr(curve: Dict[str, Any], y0: float, depth: float) -> str:
+    kind = curve.get("kind")
+    if kind == "approximated_circle":
+        center = curve.get("center") or [0.0, 0.0]
+        radius = float(curve.get("radius") or 0.0)
+        if radius <= 0:
+            return ""
+        return (f"Part.makeCylinder({radius:.6f}, {depth:.6f}, "
+                f"App.Vector({float(center[0]):.6f}, {y0:.6f}, {float(center[1]):.6f}), Y_AXIS)")
+    if kind == "approximated_rounded_slot":
+        return _slot_shape_expr(curve, y0, depth)
+    return ""
+
+
+def _slot_shape_expr(curve: Dict[str, Any], y0: float, depth: float) -> str:
+    line = curve.get("centerline") or []
+    radius = float(curve.get("radius") or 0.0)
+    if len(line) != 2 or radius <= 0:
+        return ""
+    x1, z1 = float(line[0][0]), float(line[0][1])
+    x2, z2 = float(line[1][0]), float(line[1][1])
+    xmin, xmax = min(x1, x2), max(x1, x2)
+    zmin, zmax = min(z1, z2), max(z1, z2)
+    if abs(x1 - x2) <= abs(z1 - z2):
+        straight = max(0.0, zmax - zmin)
+        box = (f"Part.makeBox({2 * radius:.6f}, {depth:.6f}, {straight:.6f}, "
+               f"App.Vector({x1 - radius:.6f}, {y0:.6f}, {zmin:.6f}))")
+    else:
+        straight = max(0.0, xmax - xmin)
+        box = (f"Part.makeBox({straight:.6f}, {depth:.6f}, {2 * radius:.6f}, "
+               f"App.Vector({xmin:.6f}, {y0:.6f}, {z1 - radius:.6f}))")
+    cyl1 = f"Part.makeCylinder({radius:.6f}, {depth:.6f}, App.Vector({x1:.6f}, {y0:.6f}, {z1:.6f}), Y_AXIS)"
+    cyl2 = f"Part.makeCylinder({radius:.6f}, {depth:.6f}, App.Vector({x2:.6f}, {y0:.6f}, {z2:.6f}), Y_AXIS)"
+    return f"({box}).fuse({cyl1}).fuse({cyl2})"
+
+
+def _fallback_connector_lines(curves: List[Dict[str, Any]], outer_ids: set, y0: float, depth: float) -> List[str]:
+    bboxes = [curve.get("bbox") for curve in curves if curve.get("id") in outer_ids and len(curve.get("bbox") or []) == 4]
+    if len(bboxes) < 2:
+        return []
+    bboxes = sorted(bboxes, key=lambda b: (float(b[0]) + float(b[2])) / 2.0)
+    lines = ["# conservative connector blocks between neighboring outer profiles"]
+    for left, right in zip(bboxes, bboxes[1:]):
+        gap = float(right[0]) - float(left[2])
+        if gap <= 0:
+            continue
+        zmin = min(float(left[1]), float(right[1]))
+        zmax = max(float(left[3]), float(right[3]))
+        lines.append(
+            f"shapes.append(Part.makeBox({gap:.6f}, {depth:.6f}, {zmax - zmin:.6f}, "
+            f"App.Vector({float(left[2]):.6f}, {y0:.6f}, {zmin:.6f})))")
+    return lines
 
 
 class _alarm_timeout:
@@ -222,7 +407,15 @@ def validate_generated_script(script: str) -> Tuple[bool, str]:
             func_name = _call_name(node.func)
             if func_name in {"eval", "exec", "compile", "open", "__import__"}:
                 return False, f"call {func_name!r} is not allowed"
+            if func_name in _INVALID_FREECAD_CALLS:
+                return False, _INVALID_FREECAD_CALLS[func_name]
+            if func_name == "Part.makeCylinder" and len(node.args) >= 4 and _is_number_literal(node.args[3]):
+                return False, "Part.makeCylinder fourth argument must be a direction App.Vector, not a number; use Part.makeCylinder(radius, height, base, App.Vector(...))"
     return True, "ok"
+
+
+def _is_number_literal(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
 
 
 def _bundle_summary(bundle: ViewBundle) -> Dict[str, Any]:

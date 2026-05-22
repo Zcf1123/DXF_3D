@@ -5,12 +5,18 @@
 硬性规则：
 
 - 只输出一份完整 Python 脚本，不要解释，不要 Markdown 正文。
+- 输出必须是短脚本：不要在代码注释中写工程图推理过程，不要长篇解释坐标换算，避免脚本尾部被截断。
+- 除必要的函数名/变量名外，尽量少写注释；优先输出可执行建模代码。
 - 允许使用 `import FreeCAD as App`、`import Part`、`import math`。不要使用 GUI、外部网络、文件删除、shell、`subprocess`、`os.system`、`eval`、`exec`。
 - 必须创建最终实体对象，名称必须是 `Result`。
 - `Result.Shape` 必须是一个非空 solid 或多个 solid fuse 后的 solid。
 - 必须保存到给定的 `FCSTD_PATH`。
 - 脚本中必须实际出现 `Result` 和 `doc.saveAs(FCSTD_PATH)`，否则会被程序拒绝。
 - 建模应使用 FreeCAD/Part 的实体布尔、拉伸、圆柱、盒体、线框轮廓等稳定 API。
+- 不存在 `Part.Extrude` 这个 API；拉伸轮廓必须先构造 `Part.Face(...)`，再调用 `face.extrude(App.Vector(dx, dy, dz))`。
+- `Part.makeCylinder(radius, height, base, direction)` 的方向参数必须显式传入；沿 Y 方向拉伸圆筒/孔时使用 `App.Vector(0, 1, 0)`。
+- 不要写 `Part.makeCylinder(radius, height, App.Vector(0, 1, 0), 360)`；这是错误签名。正确写法是 `Part.makeCylinder(radius, height, base_point, App.Vector(0, 1, 0))`。
+- 不要调用 `Part.setMeasurePrecision`；FreeCAD 的 `Part` 模块没有这个 API。
 - 坐标系固定：FRONT 为 XZ，TOP 为 XY，LEFT 为 YZ。Z 是高度方向。
 - 虚线、HID、HIDDEN 图元不是外轮廓，只能作为孔、盲孔、贯穿关系、被遮挡边界的证据。
 - 优先让模型的 FRONT/TOP/LEFT 正投影贴合输入视图；不要为了代码简单把不同厚度的构件做成同一厚度。
@@ -42,9 +48,11 @@ FCSTD_PATH = "{{ fcstd_path }}"
 输出要求：
 
 - 只输出 Python 脚本。
+- 不要输出推理过程或长注释，脚本应尽量控制在 250 行以内。
 - 最终必须有名为 `Result` 的对象。
 - 末尾必须 `doc.recompute()` 并 `doc.saveAs(FCSTD_PATH)`。
 - 推荐使用 `result = doc.addObject("Part::Feature", "Result")`，然后 `result.Shape = final_shape`。
+- 拉伸闭合轮廓时使用 `face.extrude(App.Vector(...))`，禁止使用 `Part.Extrude(...)`。
 - 如果需要构造曲线轮廓，优先使用上下文中的 `projected_views[*].approximated_curves`，再参考 `visible_closed_outlines` 的 bbox。
 - 如果需要开孔，使用 cut，并保证孔方向、半径、槽长和位置与三视图一致。
 
