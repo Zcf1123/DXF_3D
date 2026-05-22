@@ -564,7 +564,7 @@ def infer_features(projected: Dict[str, ProjectedView],
                 kind="edge_chamfer",
                 params={
                     "distance": chamfer_distance,
-                    "profile": "arc_revolve" if top_radius else "arc",
+                    "profile": "arc",
                     "scope": "outer_z_edges",
                     "source_views": ["front", "left"],
                     **({"top_radius": top_radius} if top_radius else {}),
@@ -1109,6 +1109,8 @@ def _infer_internal_profile_cuts(
             if not _is_visible_internal_top_rectangle(view_name, outline):
                 span = _internal_cut_span_from_cross_view(
                     view_name, outline, projected, width, depth, height, tol)
+                if span is None:
+                    continue
             if span is not None:
                 offset, end = span
                 depth_value = max(0.0, end - offset)

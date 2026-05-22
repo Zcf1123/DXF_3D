@@ -156,14 +156,12 @@ def generate_freecad_script(
 
     _write_debug_text(debug_dir, "llm_raw_response.txt", content)
     script = _sanitize_generated_script(strip_code_fence(content))
-    _write_debug_text(debug_dir, "generated_model_candidate.py", script)
     ok, reason = validate_generated_script(script)
     if not ok:
         repaired, repair_msg = _repair_generated_script(
             llm, messages, content, reason, debug_dir)
         if repaired is None:
             fallback = _fallback_freecad_script(context, base_name, fcstd_path)
-            _write_debug_text(debug_dir, "generated_model_fallback.py", fallback)
             return fallback, f"LLM 脚本未通过安全/结构校验：{reason}；{repair_msg}；已使用 auto_context 兜底脚本"
         return repaired, repair_msg
     return script, f"LLM 直接建模脚本生成完成（{llm.model}）"
@@ -208,7 +206,6 @@ def _repair_generated_script(
 
     _write_debug_text(debug_dir, "llm_raw_response_retry.txt", content)
     script = _sanitize_generated_script(strip_code_fence(content))
-    _write_debug_text(debug_dir, "generated_model_candidate_retry.py", script)
     ok, repair_reason = validate_generated_script(script)
     if not ok:
         return None, f"自动重试仍未通过：{repair_reason}"
