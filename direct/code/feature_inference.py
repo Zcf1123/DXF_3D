@@ -535,6 +535,21 @@ def infer_features(projected: Dict[str, ProjectedView],
                 _apply_hidden_hole_extent(hole, projected, width, depth, height)
                 hole_candidates.append(hole)
 
+        if view_name in {"front", "left", "right"}:
+            side_hole_tol = max(max(width, depth, height) * 0.01, 1e-6)
+            for approx_cx, approx_cy, approx_radius in _dedupe_circle_triplets(
+                _approximated_visible_line_circles(pv), side_hole_tol
+            ):
+                if approx_radius <= side_hole_tol:
+                    continue
+                hole = _circle_to_hole(
+                    view_name, approx_cx, approx_cy, approx_radius,
+                    width, depth, height,
+                )
+                if hole is not None:
+                    _apply_hidden_hole_extent(hole, projected, width, depth, height)
+                    hole_candidates.append(hole)
+
     for hole in hole_candidates:
         if _hole_has_hidden_evidence(hole, projected):
             features.append(hole)
@@ -1640,7 +1655,98 @@ def _infer_top_cylindrical_profile(
         if _hole_has_hidden_evidence(hole, projected):
             features.append(hole)
 
+    front = projected.get("front")
+    if front is not None:
+        side_hole_tol = max(max(width, depth, height, outer_radius * 2.0) * 0.01, 1e-6)
+        for hole_cx, hole_z, radius in _dedupe_circle_triplets(
+            _approximated_visible_line_circles(front), side_hole_tol
+        ):
+            if radius <= side_hole_tol or radius >= outer_radius * 0.8:
+                continue
+            hole = _circle_to_hole("front", hole_cx, hole_z, radius, width, depth, height)
+            if hole is None:
+                continue
+            _apply_hidden_hole_extent(hole, projected, width, depth, height)
+            if _hole_has_hidden_evidence(hole, projected):
+                features.append(hole)
+
     return features
+
+
+def _approximated_visible_line_circles(pv: ProjectedView) -> List[Tuple[float, float, float]]:
+    line_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    for entity in pv.entities:
+        if _is_hidden_entity(entity) or entity.kind != "LINE" or len(entity.points) < 2:
+            continue
+        p0 = (float(entity.points[0][0]), float(entity.points[0][1]))
+        p1 = (float(entity.points[1][0]), float(entity.points[1][1]))
+        if math.hypot(p1[0] - p0[0], p1[1] - p0[1]) <= 1e-9:
+            continue
+        line_segments.append((p0, p1))
+    if not line_segments:
+        return []
+    scale = max(pv.width, pv.height, 1.0)
+    tol = max(scale * 1e-5, 1e-6)
+    point_to_segments: Dict[Tuple[int, int], List[int]] = {}
+    for idx, segment in enumerate(line_segments):
+        point_to_segments.setdefault(_point_key_2d(segment[0], tol), []).append(idx)
+        point_to_segments.setdefault(_point_key_2d(segment[1], tol), []).append(idx)
+
+    seen = set()
+    circles: List[Tuple[float, float, float]] = []
+    for start in range(len(line_segments)):
+        if start in seen:
+            continue
+        stack = [start]
+        component: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        seen.add(start)
+        while stack:
+            idx = stack.pop()
+            component.append(line_segments[idx])
+            for point in line_segments[idx]:
+                for neighbor in point_to_segments.get(_point_key_2d(point, tol), []):
+                    if neighbor in seen:
+                        continue
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        if len(component) < 8:
+            continue
+        points = [point for segment in component for point in segment]
+        x0 = min(point[0] for point in points)
+        y0 = min(point[1] for point in points)
+        x1 = max(point[0] for point in points)
+        y1 = max(point[1] for point in points)
+        box_width = x1 - x0
+        box_height = y1 - y0
+        radius = (box_width + box_height) * 0.25
+        if radius <= tol or abs(box_width - box_height) > max(radius * 0.12, tol * 4.0):
+            continue
+        cx = (x0 + x1) * 0.5
+        cy = (y0 + y1) * 0.5
+        errors = [abs(math.hypot(point[0] - cx, point[1] - cy) - radius) for point in points]
+        if max(errors) > max(radius * 0.08, tol * 5.0):
+            continue
+        circles.append((float(cx), float(cy), float(radius)))
+    return circles
+
+
+def _point_key_2d(point: Tuple[float, float], tol: float) -> Tuple[int, int]:
+    return (round(float(point[0]) / tol), round(float(point[1]) / tol))
+
+
+def _dedupe_circle_triplets(
+    circles: List[Tuple[float, float, float]],
+    tol: float,
+) -> List[Tuple[float, float, float]]:
+    out: List[Tuple[float, float, float]] = []
+    for circle in sorted(circles, key=lambda item: item[2]):
+        cx, cy, radius = circle
+        if any(abs(cx - ox) <= max(radius, oradius, tol) * 0.2 and
+               abs(cy - oy) <= max(radius, oradius, tol) * 0.2
+               for ox, oy, oradius in out):
+            continue
+        out.append(circle)
+    return out
 
 
 def _infer_additive_components(

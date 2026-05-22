@@ -148,7 +148,7 @@ def export_preview_png(bundles: List[ViewBundle], png_path: str) -> str:
         ax.set_title(_view_display_name(b.name), fontsize=11)
         ax.grid(True, linestyle=":", alpha=0.4)
 
-    fig.suptitle("DXF three views", fontsize=13)
+    fig.suptitle("Three views", fontsize=13)
     fig.tight_layout()
     fig.savefig(png_path, dpi=120)
     plt.close(fig)
@@ -177,15 +177,11 @@ def export_normalized_views_png(projected: Dict[str, Any], png_path: str) -> str
         for e in pv.entities:
             _draw_entity(ax, e)
         ax.set_aspect("equal")
-        ax.set_title(f"{_view_display_name(name)} (0-origin)", fontsize=11)
-        x_max = max(float(pv.width), 1e-6)
-        y_max = max(float(pv.height), 1e-6)
-        pad = max(x_max, y_max, 1.0) * 0.04
-        ax.set_xlim(-pad, x_max + pad)
-        ax.set_ylim(-pad, y_max + pad)
+        ax.set_title(_view_display_name(name), fontsize=11)
+        _apply_view_limits(ax, projected, name)
         ax.grid(True, linestyle=":", alpha=0.4)
 
-    fig.suptitle("DXF normalized three views", fontsize=13)
+    fig.suptitle("Three views", fontsize=13)
     fig.tight_layout()
     fig.savefig(png_path, dpi=120)
     plt.close(fig)
@@ -297,15 +293,42 @@ def export_model_views_png(fcstd_path: str, png_path: str,
         else:
             ax.set_xlim(0.0, 1.0)
             ax.set_ylim(0.0, 1.0)
+        if projected is not None:
+            _apply_view_limits(ax, projected, name)
         ax.set_aspect("equal")
-        ax.set_title(f"{_view_display_name(name)} model (0-origin)", fontsize=11)
+        ax.set_title(name, fontsize=11)
         ax.grid(True, linestyle=":", alpha=0.4)
 
-    fig.suptitle("Model orthographic three views", fontsize=13)
     fig.tight_layout()
     fig.savefig(png_path, dpi=120)
     plt.close(fig)
     return png_path
+
+
+def _apply_view_limits(ax, projected: Dict[str, Any], name: str) -> None:
+    limits = _view_limits_from_projected(projected, name)
+    if limits is None:
+        return
+    x_max, y_max = limits
+    pad = max(x_max, y_max, 1.0) * 0.04
+    ax.set_xlim(-pad, x_max + pad)
+    ax.set_ylim(-pad, y_max + pad)
+
+
+def _view_limits_from_projected(projected: Dict[str, Any], name: str) -> Optional[Tuple[float, float]]:
+    front = projected.get("front")
+    left = projected.get("left") or projected.get("right")
+    top = projected.get("top")
+    width_x = float(getattr(front, "width", 0.0) or getattr(top, "width", 0.0) or 0.0)
+    depth_y = float(getattr(left, "width", 0.0) or getattr(top, "height", 0.0) or 0.0)
+    height_z = float(getattr(front, "height", 0.0) or getattr(left, "height", 0.0) or 0.0)
+    if name == "front" and width_x > 0 and height_z > 0:
+        return width_x, height_z
+    if name in {"left", "right"} and depth_y > 0 and height_z > 0:
+        return depth_y, height_z
+    if name == "top" and width_x > 0 and depth_y > 0:
+        return width_x, depth_y
+    return None
 
 
 def _feature_model_view_segments(features: List[Feature], include_cuts: bool = False):

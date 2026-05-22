@@ -31,14 +31,17 @@ Stdout is intentionally minimal:
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as _dt
 import glob
 import json
 import logging
 import os
+import re
 import runpy
 import sys
 import traceback
+import time
 from typing import Any, Dict, List, Optional
 
 
@@ -219,6 +222,14 @@ def _make_run_dir(base: str, prefix: str = "") -> str:
     return out_dir
 
 
+def _auto_output_prefix(llm) -> str:
+    label = str(getattr(llm, "model", "") or "auto").strip().lower()
+    match = re.match(r"[a-z]+", label)
+    if match:
+        return match.group(0)
+    return "auto"
+
+
 def _make_logger(run_dir: str) -> logging.Logger:
     logger = logging.getLogger(f"dxf3d.{os.path.basename(run_dir)}")
     logger.setLevel(logging.DEBUG)
@@ -242,6 +253,7 @@ def _make_logger(run_dir: str) -> logging.Logger:
 def process_dxf(dxf_path: str, llm,
                 single_view_extrude_depth: Optional[float] = None,
                 model_intent: str = "") -> Dict[str, Any]:
+    started_at = time.perf_counter()
     base = os.path.splitext(os.path.basename(dxf_path))[0]
     run_dir = _make_run_dir(base)
     log = _make_logger(run_dir)
@@ -607,6 +619,8 @@ def process_dxf(dxf_path: str, llm,
         log.error("流水线失败: %s\n%s", exc, traceback.format_exc())
         summary["error"] = f"{type(exc).__name__}: {exc}"
 
+    summary["elapsed_s"] = round(time.perf_counter() - started_at, 3)
+    log.info("总耗时        : %.3fs", summary["elapsed_s"])
     return summary
 
 
@@ -617,9 +631,10 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
     validation identical to the controlled pipeline, but lets the LLM write
     the FreeCAD modeling script directly instead of emitting Feature objects.
     """
+    started_at = time.perf_counter()
     source_base = os.path.splitext(os.path.basename(dxf_path))[0]
     base = source_base
-    run_dir = _make_run_dir(source_base, prefix="A")
+    run_dir = _make_run_dir(source_base, prefix=_auto_output_prefix(llm))
     log = _make_logger(run_dir)
     summary: Dict[str, Any] = {
         "input": dxf_path,
@@ -702,6 +717,16 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         log.info("LLM 返回      : %s", script_msg)
         if script is None:
             raise RuntimeError(script_msg)
+        model_understanding = _extract_model_understanding(script)
+        if model_understanding:
+            log.info("LLM 模型理解  : %s", model_understanding)
+        else:
+            log.info("LLM 模型理解  : （生成脚本未提供）")
+        dimensions_used = _extract_dimensions_used(script)
+        if dimensions_used:
+            log.info("LLM 使用尺寸  : %s", json.dumps(dimensions_used, ensure_ascii=False, sort_keys=True))
+        else:
+            log.info("LLM 使用尺寸  : （生成脚本未提供）")
         with open(py_path, "w", encoding="utf-8") as f:
             f.write(script)
         log.info("已写出        : generated_model.py")
@@ -719,10 +744,10 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         from .exporters import (
             export_step, export_obj, export_preview_png,
             export_normalized_views_png,
-            export_model_views_png,
             export_iso_overview_png, export_model_json,
             validate_projection_against_views,
         )
+        from ...llm.code.hlr_exporters import export_hlr_model_views_png
         step_path = os.path.join(run_dir, f"{base}.step")
         obj_path = os.path.join(run_dir, f"{base}.obj")
         png_path = os.path.join(run_dir, f"{base}.png")
@@ -770,7 +795,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
             ("OBJ",             lambda: export_obj(fcstd_path, obj_path)),
             ("三视图预览 PNG",  lambda: export_preview_png(bundles, png_path)),
             ("归一化三视图 PNG", lambda: export_normalized_views_png(projected, normalized_png)),
-            ("模型三视图 PNG",  lambda: export_model_views_png(fcstd_path, model_views_png, None, projected)),
+            ("模型三视图 PNG",  lambda: export_hlr_model_views_png(fcstd_path, model_views_png)),
             ("3D 总览 PNG",      lambda: export_iso_overview_png(fcstd_path, overview_png)),
             ("model.json",      lambda: export_model_json(
                 fcstd_path, json_path,
@@ -801,6 +826,8 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         log.error("Auto 流水线失败: %s\n%s", exc, traceback.format_exc())
         summary["error"] = f"{type(exc).__name__}: {exc}"
 
+    summary["elapsed_s"] = round(time.perf_counter() - started_at, 3)
+    log.info("总耗时        : %.3fs", summary["elapsed_s"])
     return summary
 
 
@@ -836,8 +863,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"No DXF files found in {DXF_FILES_DIR}/")
         return 1
 
-    from .llm_planner import LLMPlanner
-    llm = LLMPlanner(config_path=args.config, disabled=args.no_llm)
+    if args.auto:
+        from ...llm_client import LLMClient
+        llm = LLMClient(config_path=args.config, disabled=args.no_llm)
+    else:
+        from .llm_planner import LLMPlanner
+        llm = LLMPlanner(config_path=args.config, disabled=args.no_llm)
     llm_label = llm.model if llm.enabled else f"disabled ({llm.disabled_reason})"
     _say(f"LLM         : {llm_label}")
 
@@ -849,6 +880,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             s = process_dxf(t, llm, single_view_extrude_depth=args.extrude_depth,
                             model_intent=args.model_intent)
         _say(f"Output dir  : {s['output_dir']}")
+        _say(f"Elapsed     : {float(s.get('elapsed_s', 0.0)):.3f}s")
         _say(f"Status      : {s['status']}"
               + (f" — {s.get('error')}" if s["status"] != "OK" else ""))
         _say("")
@@ -862,6 +894,32 @@ def _say(msg: str) -> None:
     progress chatter on stdout cannot clobber it."""
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
+
+
+def _extract_model_understanding(script: str) -> str:
+    match = re.search(r'(?m)^\s*MODEL_UNDERSTANDING\s*=\s*(["\'])(.*?)\1', script)
+    if not match:
+        return ""
+    return match.group(2).strip()
+
+
+def _extract_dimensions_used(script: str) -> Dict[str, Any]:
+    try:
+        tree = ast.parse(script)
+    except SyntaxError:
+        return {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "DIMENSIONS_USED"
+                   for target in node.targets):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ...dxf_loader import DxfEntity
 from ...geometry_estimator import extract_closed_outlines_and_circles
-from ...direct.code.llm_planner import Prompt, _SECTION_RE, _load_part_knowledge_for_refiner, _render
+from ...llm_client import Prompt, load_prompt_from_dir, render_template
 from ...view_classifier import ViewBundle
 
 
@@ -20,30 +20,7 @@ PROMPTS_DIR = os.path.join(os.path.dirname(HERE), "prompts")
 
 
 def load_prompt(name: str) -> Prompt:
-    path = os.path.join(PROMPTS_DIR, f"{name}.md")
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
-
-    sections: Dict[str, str] = {}
-    matches = list(_SECTION_RE.finditer(text))
-    for i, m in enumerate(matches):
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        sections[m.group(1).strip()] = text[m.end():end].strip()
-
-    if "SYSTEM" not in sections or "USER" not in sections:
-        raise ValueError(f"Prompt {name}.md missing SYSTEM or USER section")
-
-    examples: List[Tuple[str, str]] = []
-    if "EXAMPLES" in sections:
-        for block in re.split(r"\n---\s*\n", sections["EXAMPLES"]):
-            if "--- output ---" in block:
-                inp, out = block.split("--- output ---", 1)
-                examples.append((inp.replace("--- input ---", "").strip(),
-                                 out.strip()))
-
-    return Prompt(system=sections["SYSTEM"],
-                  user_template=sections["USER"],
-                  examples=examples)
+    return load_prompt_from_dir(PROMPTS_DIR, name)
 
 
 _MAX_VISIBLE_ENTITIES_PER_VIEW = 0
@@ -64,6 +41,8 @@ _INVALID_FREECAD_CALLS = {
     "Part.setMeasurePrecision": "FreeCAD Part has no Part.setMeasurePrecision; remove this no-op line",
     "Part.cut": "FreeCAD Part has no Part.cut module function; call shape.cut(other_shape) instead",
     "Part.common": "FreeCAD Part has no Part.common module function; call shape.common(other_shape) instead",
+    "Part.makeRevolution": "Do not use Part.makeRevolution; create a closed Part.Face and call face.revolve(axis_point, axis_dir, 360) instead",
+    "Part.makePrism": "FreeCAD Part has no stable Part.makePrism helper here; create Part.Face(wire).extrude(vector) instead",
     "App.setActiveDocument": "Do not call App.setActiveDocument; keep and use the document returned by App.newDocument(...) instead",
     "doc.close": "FreeCAD document objects have no close() method; remove doc.close() after saveAs",
     "doc.Name": "FreeCAD document Name is read-only; pass the name to App.newDocument(...) instead",
@@ -87,7 +66,7 @@ def build_auto_context(
 ) -> Dict[str, Any]:
     """Build a compact, geometry-first context for direct script generation."""
     intent = (model_intent or "").strip()
-    part_knowledge = _load_part_knowledge_for_refiner()
+    part_knowledge = _load_part_knowledge()
     context = {
         "input_file": os.path.basename(dxf_path),
         "model_intent": intent or "（无）",
@@ -113,7 +92,146 @@ def build_auto_context(
         },
     }
     context["hole_hints"] = _through_hole_hints(context["projected_views"])
+    context["model_understanding_hints"] = _model_understanding_hints(context["projected_views"])
+    context["dimension_constraints"] = _dimension_constraints(context["projected_views"])
     return context
+
+
+def _dimension_constraints(projected_views: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    front = projected_views.get("front") or {}
+    top = projected_views.get("top") or {}
+    left = projected_views.get("left") or {}
+    width_x = _view_extent(front, "width", _view_extent(top, "width", 0.0))
+    depth_y = _view_extent(left, "width", _view_extent(top, "height", 0.0))
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    tolerance = max(width_x, depth_y, height_z, 1.0) * 0.02
+    return {
+        "overall_size": {
+            "width_x": _round_num(width_x),
+            "depth_y": _round_num(depth_y),
+            "height_z": _round_num(height_z),
+            "tolerance": _round_num(tolerance),
+        },
+        "sources": {
+            "width_x": "front.width, cross-check top.width",
+            "depth_y": "left.width, cross-check top.height",
+            "height_z": "front.height, cross-check left.height",
+        },
+        "required_rules": [
+            "All main lengths, radii, offsets, hole positions and extrusion depths must come from projected_views, hole_hints, model_understanding_hints, or this dimension_constraints object.",
+            "Do not invent round numbers or rescale the part unless a provided hint explicitly says so.",
+            "Final model bbox XLength must match width_x within tolerance when the view evidence defines the full X extent.",
+            "Final model bbox YLength must match depth_y within tolerance when the view evidence defines the full Y extent.",
+            "Final model bbox ZLength must match height_z within tolerance when the view evidence defines the full Z extent.",
+            "The script must define DIMENSIONS_USED as a Python dict recording the JSON-derived values used for key dimensions.",
+        ],
+    }
+
+
+def _model_understanding_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    hints: List[Dict[str, Any]] = []
+    nut_hint = _hex_nut_arc_revolve_hint(projected_views)
+    if nut_hint is not None:
+        hints.append(nut_hint)
+    return hints
+
+
+def _hex_nut_arc_revolve_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    polygons = [hint for hint in top.get("regular_polygon_hints") or []
+                if hint.get("kind") == "regular_hexagon_bbox"]
+    if not polygons:
+        return None
+    hex_hint = polygons[0]
+    circles = top.get("visible_circles") or []
+    boundary_circles = [circle for circle in circles if _circle_touches_view_boundary(circle, top)]
+    hole_circles = [circle for circle in circles if not _circle_touches_view_boundary(circle, top)]
+    if not boundary_circles or not hole_circles:
+        return None
+    chamfer_distance = _side_arc_chamfer_distance(front, left)
+    if chamfer_distance is None:
+        return None
+    boundary_circle = max(boundary_circles, key=lambda item: float(item.get("radius") or 0.0))
+    hole_circle = min(hole_circles, key=lambda item: float(item.get("radius") or 0.0))
+    top_radius = float(boundary_circle.get("radius") or 0.0)
+    outer_radius = float(hex_hint.get("circumradius") or 0.0)
+    if top_radius <= 0.0 or outer_radius <= 0.0 or top_radius >= outer_radius:
+        return None
+    center = hex_hint.get("center") or hole_circle.get("center") or [0.0, 0.0]
+    height = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    return {
+        "kind": "hex_nut_arc_revolve_chamfer",
+        "confidence": "high",
+        "understanding": "六角螺母：TOP 为六边形主体和中心通孔，大同心圆是端面圆弧倒角参考；FRONT/LEFT 给出上下圆弧包络。",
+        "evidence": [
+            "top.regular_polygon_hints contains regular_hexagon_bbox",
+            "top.visible_circles contains one inner hole circle and one boundary/reference circle",
+            "front/left visible outlines contain end arcs and inset side lines",
+        ],
+        "base_profile": {
+            "source_view": "top",
+            "plane": "XY",
+            "vertices_2d": hex_hint.get("recommended_vertices_2d"),
+            "center": center,
+            "height_z": _round_num(height),
+            "outer_radius": _round_num(outer_radius),
+        },
+        "through_hole": {
+            "axis": "Z",
+            "center": hole_circle.get("center"),
+            "radius": _round_num(float(hole_circle.get("radius") or 0.0)),
+        },
+        "arc_revolve_chamfer": {
+            "distance": _round_num(chamfer_distance),
+            "top_radius": _round_num(top_radius),
+            "outer_radius": _round_num(outer_radius),
+            "operation": "Build an R-Z arc envelope, revolve it 360 degrees around Z through the hex center, then use final_shape = prism_with_hole.common(envelope).",
+            "avoid": "Do not use shape.makeChamfer or shape.makeFillet for this feature; those create straight/edge fillets and do not match the FRONT/LEFT circular arc envelope.",
+            "rz_profile_template": [
+                {"kind": "line", "from": [0.0, 0.0], "to": [_round_num(top_radius), 0.0]},
+                {"kind": "arc", "from": [_round_num(top_radius), 0.0], "mid": [_round_num((top_radius + outer_radius) * 0.5), _round_num(chamfer_distance * 0.35)], "to": [_round_num(outer_radius), _round_num(chamfer_distance)]},
+                {"kind": "line", "from": [_round_num(outer_radius), _round_num(chamfer_distance)], "to": [_round_num(outer_radius), _round_num(height - chamfer_distance)]},
+                {"kind": "arc", "from": [_round_num(outer_radius), _round_num(height - chamfer_distance)], "mid": [_round_num((top_radius + outer_radius) * 0.5), _round_num(height - chamfer_distance * 0.35)], "to": [_round_num(top_radius), _round_num(height)]},
+                {"kind": "line", "from": [_round_num(top_radius), _round_num(height)], "to": [0.0, _round_num(height)]},
+                {"kind": "line", "from": [0.0, _round_num(height)], "to": [0.0, 0.0]},
+            ],
+            "implementation_note": "R-Z points are radial distance from the hex center and Z height. Convert each [r,z] to App.Vector(center_x + r, center_y, z), make a closed Wire/Face, then call env_face.revolve(App.Vector(center_x, center_y, 0), App.Vector(0,0,1), 360).",
+        },
+    }
+
+
+def _side_arc_chamfer_distance(*views: Dict[str, Any]) -> Optional[float]:
+    candidates: List[float] = []
+    for view in views:
+        height = float(view.get("height") or 0.0)
+        if height <= 0.0:
+            continue
+        has_arc = any(
+            edge.get("kind") == "ARC"
+            for outline in view.get("visible_closed_outlines") or []
+            for edge in outline.get("edges") or []
+        )
+        if not has_arc:
+            continue
+        for outline in view.get("visible_closed_outlines") or []:
+            for edge in outline.get("edges") or []:
+                if edge.get("kind") != "LINE":
+                    continue
+                for point in (edge.get("p0"), edge.get("p1")):
+                    if not point or len(point) != 2:
+                        continue
+                    z = float(point[1])
+                    if 1e-6 < z < height * 0.45:
+                        candidates.append(z)
+                    upper = height - z
+                    if 1e-6 < upper < height * 0.45:
+                        candidates.append(upper)
+    if not candidates:
+        return None
+    candidates.sort()
+    return float(candidates[len(candidates) // 2])
 
 
 def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -125,7 +243,7 @@ def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict
     height_z = _view_extent(front, "height", _view_extent(left, "height", 1.0))
     margin = max(width_x, depth_y, height_z, 1.0) * 0.05
     hints: List[Dict[str, Any]] = []
-    for circle in top.get("visible_circles") or []:
+    for circle in _deduped_circle_sources(top):
         center = circle.get("center") or []
         radius = float(circle.get("radius") or 0.0)
         if len(center) == 2 and radius > 0.0:
@@ -139,7 +257,7 @@ def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict
                 "height": _round_num(height_z + 2.0 * margin),
                 "rule": "base.z < solid_z_min and base.z + height > solid_z_max",
             })
-    for circle in front.get("visible_circles") or []:
+    for circle in _deduped_circle_sources(front):
         center = circle.get("center") or []
         radius = float(circle.get("radius") or 0.0)
         if len(center) == 2 and radius > 0.0:
@@ -153,7 +271,7 @@ def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict
                 "height": _round_num(depth_y + 2.0 * margin),
                 "rule": "base.y < solid_y_min and base.y + height > solid_y_max",
             })
-    for circle in left.get("visible_circles") or []:
+    for circle in _deduped_circle_sources(left):
         center = circle.get("center") or []
         radius = float(circle.get("radius") or 0.0)
         if len(center) == 2 and radius > 0.0:
@@ -169,6 +287,63 @@ def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict
                 "rule": "base.x < solid_x_min and base.x + height > solid_x_max",
             })
     return hints
+
+
+def _deduped_circle_sources(view: Dict[str, Any]) -> List[Dict[str, Any]]:
+    circles: List[Dict[str, Any]] = []
+    for circle in view.get("visible_circles") or []:
+        if not _circle_touches_view_boundary(circle, view):
+            circles.append(circle)
+    for curve in view.get("approximated_curves") or []:
+        if curve.get("kind") != "approximated_circle":
+            continue
+        if not _circle_touches_view_boundary(curve, view):
+            circles.append(curve)
+
+    grouped: List[Dict[str, Any]] = []
+    for circle in sorted(circles, key=lambda item: float(item.get("radius") or 0.0)):
+        center = circle.get("center") or []
+        radius = float(circle.get("radius") or 0.0)
+        if len(center) != 2 or radius <= 0.0:
+            continue
+        if any(_same_circle_center(circle, existing) for existing in grouped):
+            continue
+        grouped.append(circle)
+    return grouped
+
+
+def _same_circle_center(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    ac = a.get("center") or []
+    bc = b.get("center") or []
+    if len(ac) != 2 or len(bc) != 2:
+        return False
+    ar = float(a.get("radius") or 0.0)
+    br = float(b.get("radius") or 0.0)
+    tol = max(ar, br, 1e-6) * 0.2
+    return abs(float(ac[0]) - float(bc[0])) <= tol and abs(float(ac[1]) - float(bc[1])) <= tol
+
+
+def _circle_touches_view_boundary(circle: Dict[str, Any], view: Dict[str, Any]) -> bool:
+    bbox = circle.get("bbox") or []
+    if len(bbox) != 4:
+        return False
+    width = float(view.get("width") or 0.0)
+    height = float(view.get("height") or 0.0)
+    if width <= 0.0 or height <= 0.0:
+        return False
+    tol = max(width, height, 1.0) * 0.01
+    touches_x = abs(float(bbox[0])) <= tol and abs(float(bbox[2]) - width) <= tol
+    touches_y = abs(float(bbox[1])) <= tol and abs(float(bbox[3]) - height) <= tol
+    return touches_x or touches_y
+
+
+def _load_part_knowledge() -> str:
+    path = os.path.join(os.path.dirname(os.path.dirname(HERE)), "prompts", "part_knowledge.md")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return "（无）"
 
 
 def generate_freecad_script(
@@ -187,7 +362,7 @@ def generate_freecad_script(
     except Exception as exc:
         return None, f"提示词加载失败：{exc}"
 
-    user_msg = _render(prompt.user_template, {
+    user_msg = render_template(prompt.user_template, {
         "base_name": base_name,
         "fcstd_path": fcstd_path,
         "auto_context": context,
@@ -215,8 +390,7 @@ def generate_freecad_script(
         repaired, repair_msg = _repair_generated_script(
             llm, messages, content, reason, debug_dir)
         if repaired is None:
-            fallback = _fallback_freecad_script(context, base_name, fcstd_path)
-            return fallback, f"LLM 脚本未通过安全/结构校验：{reason}；{repair_msg}；已使用 auto_context 兜底脚本"
+            return None, f"LLM 脚本未通过安全/结构校验：{reason}；{repair_msg}"
         return repaired, repair_msg
     return script, f"LLM 直接建模脚本生成完成（{llm.model}）"
 
@@ -239,12 +413,15 @@ def _repair_generated_script(
             "2. 必须创建对象 `result = doc.addObject('Part::Feature', 'Result')`。\n"
             "3. 必须给 `result.Shape` 赋最终 solid。\n"
             "4. 脚本末尾必须包含 `doc.recompute()` 和 `doc.saveAs(FCSTD_PATH)`。\n"
+            "4a. 必须定义 `DIMENSIONS_USED = {...}`，记录关键尺寸来自上下文 JSON 的数值。\n"
             "5. 不要使用不存在的 `Part.Extrude`；拉伸必须使用 `Part.Face(...).extrude(App.Vector(...))`。\n"
             "6. `Part.makeCylinder` 正确签名是 `Part.makeCylinder(radius, height, base, direction)` 或带第 5 个 angle；第 4 个参数必须是方向向量，不是数字。\n"
             "7. 直接给短脚本，不要写工程图推理过程，不要写长段注释，避免输出被截断。\n"
             "8. 不要输出 Markdown 解释文字。\n"
             "9. 不要保留错误代码和修正代码的两个版本；只输出最终正确版本。\n"
-            "10. 如需保留少量注释，注释必须使用中文。"
+            "10. 如需保留少量注释，注释必须使用中文。\n"
+            "11. 构造 R-Z 圆弧包络时，每个 template 条目只生成一条边；不要把 arc 的 mid 点同时作为折线点，否则 Wire 会自交。\n"
+            "12. R-Z 点必须映射为 App.Vector(center_x + r, center_y, z)，包络必须用 common 裁剪主体，禁止 fuse 倒角包络。"
         ),
     })
     try:
@@ -323,10 +500,28 @@ def _sanitize_generated_script(script: str) -> str:
         )
         script = re.sub(rf"\b{re.escape(var_name)}\.Shape\b", var_name, script)
     script = re.sub(r"\.(X|Y|Z)\b", lambda m: "." + m.group(1).lower(), script)
-    if "Part.Arc(" in script or "Part.Line(" in script or ".Edge" in script:
+    script = re.sub(
+        r"Part\.makePrism\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^\n]+?)\)",
+        r"Part.Face(\1).extrude(\2)",
+        script,
+    )
+    if "Part.Arc(" in script or "Part.makeArc(" in script or "Part.Line(" in script or ".Edge" in script:
         script = script.replace("Part.Arc(", "_safe_arc(")
+        script = script.replace("Part.makeArc(", "_safe_arc(")
         script = script.replace("Part.Line(", "_safe_line(")
         script = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\.Edge\b", r"_edge(\1)", script)
+        script = _ensure_geometry_helper(script)
+    script = re.sub(r"(_safe_arc\([^\n]*?\))\.toShape\(\)", r"\1", script)
+    script = re.sub(r"(_safe_line\([^\n]*?\))\.toShape\(\)", r"\1", script)
+    safe_edge_vars = re.findall(
+        r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*_safe_(?:arc|line)\(",
+        script,
+    )
+    for var_name in safe_edge_vars:
+        script = re.sub(rf"\b{re.escape(var_name)}\.toShape\(\)", var_name, script)
+    script = re.sub(r"Part\.Wire\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", r"Part.Wire(_valid_edges(\1))", script)
+    script = re.sub(r"Part\.Wire\(\s*\[([^\]\n]+)\]\s*\)", r"Part.Wire(_valid_edges([\1]))", script)
+    if "_valid_edges(" in script and "def _valid_edges(" not in script:
         script = _ensure_geometry_helper(script)
     circle_vars = re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Part\.makeCircle\(", script)
     for var_name in circle_vars:
@@ -360,7 +555,8 @@ def _strip_full_line_comments(script: str) -> str:
 
 
 def _ensure_geometry_helper(script: str) -> str:
-    if "def _safe_arc(" in script and "def _safe_line(" in script and "def _edge(" in script:
+    if ("def _safe_arc(" in script and "def _safe_line(" in script and
+            "def _edge(" in script and "def _valid_edges(" in script):
         return script
     helper = (
         "\n\ndef _edge(curve):\n"
@@ -369,13 +565,22 @@ def _ensure_geometry_helper(script: str) -> str:
         "    return curve\n"
         "\n"
         "def _safe_arc(p1, p2, p3):\n"
+        "    if p1.distanceToPoint(p3) < 1e-9:\n"
+        "        return None\n"
         "    try:\n"
         "        return Part.Arc(p1, p2, p3).toShape()\n"
         "    except Exception:\n"
+        "        if p1.distanceToPoint(p3) < 1e-9:\n"
+        "            return None\n"
         "        return Part.LineSegment(p1, p3).toShape()\n"
         "\n"
         "def _safe_line(p1, p2):\n"
+        "    if p1.distanceToPoint(p2) < 1e-9:\n"
+        "        return None\n"
         "    return Part.LineSegment(p1, p2).toShape()\n"
+        "\n"
+        "def _valid_edges(edges):\n"
+        "    return [edge for edge in edges if edge is not None]\n"
     )
     insert_after = re.search(r"(?m)^(?:import .+\n)+", script)
     if insert_after:
@@ -402,171 +607,12 @@ def _ensure_fuse_helper(script: str) -> str:
     return helper.lstrip() + "\n" + script
 
 
-def _fallback_freecad_script(context: Dict[str, Any], base_name: str, fcstd_path: str) -> str:
-    front = _context_view(context, "projected_views", "front") or _context_view(context, "views", "front")
-    top = _context_view(context, "projected_views", "top") or _context_view(context, "views", "top")
-    curves = list(front.get("approximated_curves") or [])
-    outer_ids = _outer_curve_ids(curves)
-    depth = _view_extent(top, "height", 1.0) or 1.0
-    thin_depth = max(depth / 3.0, depth * 0.25)
-    thin_y = max((depth - thin_depth) / 2.0, 0.0)
-    lines = [
-        "import FreeCAD as App",
-        "import Part",
-        "",
-        f"BASE_NAME = {base_name!r}",
-        f"FCSTD_PATH = {fcstd_path!r}",
-        "",
-        "doc = App.newDocument(BASE_NAME)",
-        "Y_AXIS = App.Vector(0, 1, 0)",
-        "shapes = []",
-        "cuts = []",
-        "",
-    ]
-    for curve in curves:
-        curve_id = curve.get("id")
-        is_outer = curve_id in outer_ids
-        y0 = 0.0 if _is_center_curve(curve, front) else thin_y
-        local_depth = depth if _is_center_curve(curve, front) else thin_depth
-        target = "shapes" if is_outer else "cuts"
-        expr = _curve_shape_expr(curve, y0, local_depth)
-        if expr:
-            lines.append(f"{target}.append({expr})")
-    lines.extend(_fallback_connector_lines(curves, outer_ids, thin_y, thin_depth))
-    lines.extend([
-        "",
-        "if shapes:",
-        "    final_shape = shapes[0]",
-        "    for shape in shapes[1:]:",
-        "        final_shape = final_shape.fuse(shape)",
-        "else:",
-        f"    final_shape = Part.makeBox({_view_extent(front, 'width', 1.0):.6f}, {depth:.6f}, {_view_extent(front, 'height', 1.0):.6f}, App.Vector(0, 0, 0))",
-        "for cut_shape in cuts:",
-        "    final_shape = final_shape.cut(cut_shape)",
-        "result = doc.addObject('Part::Feature', 'Result')",
-        "result.Shape = final_shape",
-        "doc.recompute()",
-        "doc.saveAs(FCSTD_PATH)",
-        "",
-    ])
-    return "\n".join(lines)
-
-
-def _context_view(context: Dict[str, Any], section: str, name: str) -> Dict[str, Any]:
-    views = context.get(section)
-    if isinstance(views, dict):
-        item = views.get(name)
-        return item if isinstance(item, dict) else {}
-    if isinstance(views, list):
-        for item in views:
-            if isinstance(item, dict) and item.get("name") == name:
-                return item
-    return {}
-
-
-def _outer_curve_ids(curves: List[Dict[str, Any]]) -> set:
-    outer = set()
-    for curve in curves:
-        curve_id = curve.get("id")
-        bbox = curve.get("bbox") or []
-        if len(bbox) != 4:
-            continue
-        contained = False
-        for other in curves:
-            if other is curve:
-                continue
-            obox = other.get("bbox") or []
-            if len(obox) == 4 and _bbox_contains(obox, bbox) and _bbox_area(obox) > _bbox_area(bbox):
-                contained = True
-                break
-        if not contained:
-            outer.add(curve_id)
-    return outer
-
-
-def _bbox_contains(outer: List[float], inner: List[float], tol: float = 1e-5) -> bool:
-    return (outer[0] <= inner[0] + tol and outer[1] <= inner[1] + tol and
-            outer[2] >= inner[2] - tol and outer[3] >= inner[3] - tol)
-
-
-def _bbox_area(bbox: List[float]) -> float:
-    return max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
-
-
 def _view_extent(view: Dict[str, Any], key: str, default: float) -> float:
     try:
         value = float(view.get(key, default))
         return value if value > 0 else default
     except Exception:
         return default
-
-
-def _is_center_curve(curve: Dict[str, Any], front: Dict[str, Any]) -> bool:
-    center = curve.get("center") or None
-    if not center:
-        line = curve.get("centerline") or []
-        if line:
-            center = line[0]
-    width = _view_extent(front, "width", 1.0)
-    try:
-        x = float(center[0])
-        return 0.35 * width <= x <= 0.75 * width
-    except Exception:
-        return False
-
-
-def _curve_shape_expr(curve: Dict[str, Any], y0: float, depth: float) -> str:
-    kind = curve.get("kind")
-    if kind == "approximated_circle":
-        center = curve.get("center") or [0.0, 0.0]
-        radius = float(curve.get("radius") or 0.0)
-        if radius <= 0:
-            return ""
-        return (f"Part.makeCylinder({radius:.6f}, {depth:.6f}, "
-                f"App.Vector({float(center[0]):.6f}, {y0:.6f}, {float(center[1]):.6f}), Y_AXIS)")
-    if kind == "approximated_rounded_slot":
-        return _slot_shape_expr(curve, y0, depth)
-    return ""
-
-
-def _slot_shape_expr(curve: Dict[str, Any], y0: float, depth: float) -> str:
-    line = curve.get("centerline") or []
-    radius = float(curve.get("radius") or 0.0)
-    if len(line) != 2 or radius <= 0:
-        return ""
-    x1, z1 = float(line[0][0]), float(line[0][1])
-    x2, z2 = float(line[1][0]), float(line[1][1])
-    xmin, xmax = min(x1, x2), max(x1, x2)
-    zmin, zmax = min(z1, z2), max(z1, z2)
-    if abs(x1 - x2) <= abs(z1 - z2):
-        straight = max(0.0, zmax - zmin)
-        box = (f"Part.makeBox({2 * radius:.6f}, {depth:.6f}, {straight:.6f}, "
-               f"App.Vector({x1 - radius:.6f}, {y0:.6f}, {zmin:.6f}))")
-    else:
-        straight = max(0.0, xmax - xmin)
-        box = (f"Part.makeBox({straight:.6f}, {depth:.6f}, {2 * radius:.6f}, "
-               f"App.Vector({xmin:.6f}, {y0:.6f}, {z1 - radius:.6f}))")
-    cyl1 = f"Part.makeCylinder({radius:.6f}, {depth:.6f}, App.Vector({x1:.6f}, {y0:.6f}, {z1:.6f}), Y_AXIS)"
-    cyl2 = f"Part.makeCylinder({radius:.6f}, {depth:.6f}, App.Vector({x2:.6f}, {y0:.6f}, {z2:.6f}), Y_AXIS)"
-    return f"({box}).fuse({cyl1}).fuse({cyl2})"
-
-
-def _fallback_connector_lines(curves: List[Dict[str, Any]], outer_ids: set, y0: float, depth: float) -> List[str]:
-    bboxes = [curve.get("bbox") for curve in curves if curve.get("id") in outer_ids and len(curve.get("bbox") or []) == 4]
-    if len(bboxes) < 2:
-        return []
-    bboxes = sorted(bboxes, key=lambda b: (float(b[0]) + float(b[2])) / 2.0)
-    lines = ["# conservative connector blocks between neighboring outer profiles"]
-    for left, right in zip(bboxes, bboxes[1:]):
-        gap = float(right[0]) - float(left[2])
-        if gap <= 0:
-            continue
-        zmin = min(float(left[1]), float(right[1]))
-        zmax = max(float(left[3]), float(right[3]))
-        lines.append(
-            f"shapes.append(Part.makeBox({gap:.6f}, {depth:.6f}, {zmax - zmin:.6f}, "
-            f"App.Vector({float(left[2]):.6f}, {y0:.6f}, {zmin:.6f})))")
-    return lines
 
 
 class _alarm_timeout:
@@ -598,10 +644,16 @@ def validate_generated_script(script: str) -> Tuple[bool, str]:
     for token in _BANNED_TEXT:
         if token in script:
             return False, f"contains banned token {token!r}"
-    required = ("FreeCAD", "Part", "Result", "saveAs")
+    required = ("FreeCAD", "Part", "Result", "saveAs", "DIMENSIONS_USED")
     missing = [token for token in required if token not in script]
     if missing:
         return False, f"missing required tokens: {missing}"
+    if _has_flattened_arc_profile(script):
+        return False, "R-Z arc profile mixes arc edges with polyline segments through arc midpoints; build one edge per rz_profile_template segment"
+    if _has_chamfer_envelope_union(script):
+        return False, "arc-revolve chamfer envelope must clip the hex body with common(), not fuse() with the body"
+    if _has_untranslated_rz_profile(script):
+        return False, "R-Z profile points must be translated to App.Vector(center_x + r, center_y, z) before revolve"
     try:
         tree = ast.parse(script)
     except SyntaxError as exc:
@@ -631,6 +683,28 @@ def validate_generated_script(script: str) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _has_flattened_arc_profile(script: str) -> bool:
+    return (
+        "rz_points" in script and
+        "revolve_points" in script and
+        "_safe_arc(" in script and
+        "range(len(revolve_points) - 1)" in script
+    )
+
+
+def _has_chamfer_envelope_union(script: str) -> bool:
+    envelope_names = ("chamfer_solid", "solid_env", "envelope")
+    return any(f".fuse({name}" in script for name in envelope_names)
+
+
+def _has_untranslated_rz_profile(script: str) -> bool:
+    if "revolve(App.Vector(" not in script or "_safe_arc(App.Vector(" not in script:
+        return False
+    if any(token in script for token in ("center_x +", "center[0] +", "+ r,")):
+        return False
+    return bool(re.search(r"_safe_arc\(\s*App\.Vector\(\s*(?:8\.66|9\.33|10\.0)\s*,\s*0\.0", script))
+
+
 def _is_number_literal(node: ast.AST) -> bool:
     return isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
 
@@ -655,7 +729,9 @@ def _bundle_summary(bundle: ViewBundle) -> Dict[str, Any]:
         "excluded_auxiliary_entity_count": len(bundle.entities) - len(modeling_entities),
         "annotations": [_annotation_summary(ann) for ann in bundle.annotations],
         "visible_closed_outline_bboxes": [_outline_bbox_summary(o) for o in outlines[:_MAX_OUTLINES_PER_VIEW]],
-        "approximated_curves": _approximated_curve_summaries(outlines),
+        "approximated_curves": _dedupe_curve_summaries(
+            _approximated_curve_summaries(outlines) + _approximated_line_circle_summaries(modeling_entities)
+        ),
         "visible_circles": [_circle_summary(c) for c in circles],
     }
 
@@ -683,7 +759,9 @@ def _projected_view_summary(name: str, pv: Any) -> Dict[str, Any]:
         "visible_closed_outlines": [_outline_summary(o) for o in outlines[:_MAX_OUTLINES_PER_VIEW]],
         "regular_polygon_hints": _regular_polygon_hints(outlines),
         "extrusion_profile_hints": _extrusion_profile_hints(outlines, pv.plane, float(pv.width)),
-        "approximated_curves": _approximated_curve_summaries(outlines),
+        "approximated_curves": _dedupe_curve_summaries(
+            _approximated_curve_summaries(outlines) + _approximated_line_circle_summaries(modeling_entities)
+        ),
         "visible_circles": [_circle_summary(c) for c in circles],
         "key_visible_entities": _key_entity_summaries(visible, _MAX_VISIBLE_ENTITIES_PER_VIEW),
         "key_hidden_entities": _key_entity_summaries(hidden, _MAX_HIDDEN_ENTITIES_PER_VIEW),
@@ -891,6 +969,98 @@ def _approximated_curve_summaries(outlines: List[Any]) -> List[Dict[str, Any]]:
         if slot is not None:
             curves.append({"id": idx, **slot})
     return curves
+
+
+def _approximated_line_circle_summaries(entities: List[DxfEntity]) -> List[Dict[str, Any]]:
+    line_segments = []
+    for entity in entities:
+        if _is_hidden_entity(entity) or entity.kind != "LINE" or len(entity.points) < 2:
+            continue
+        p0 = (float(entity.points[0][0]), float(entity.points[0][1]))
+        p1 = (float(entity.points[1][0]), float(entity.points[1][1]))
+        if math.hypot(p1[0] - p0[0], p1[1] - p0[1]) <= 1e-9:
+            continue
+        line_segments.append((p0, p1))
+    if not line_segments:
+        return []
+    scale = max(
+        max(max(abs(v) for v in (*p0, *p1)) for p0, p1 in line_segments),
+        1.0,
+    )
+    tol = max(scale * 1e-5, 1e-6)
+    point_to_segments: Dict[Tuple[int, int], List[int]] = {}
+    for idx, (p0, p1) in enumerate(line_segments):
+        point_to_segments.setdefault(_point_key(p0, tol), []).append(idx)
+        point_to_segments.setdefault(_point_key(p1, tol), []).append(idx)
+
+    seen = set()
+    curves: List[Dict[str, Any]] = []
+    for start in range(len(line_segments)):
+        if start in seen:
+            continue
+        stack = [start]
+        component = []
+        seen.add(start)
+        while stack:
+            idx = stack.pop()
+            component.append(line_segments[idx])
+            for point in line_segments[idx]:
+                for neighbor in point_to_segments.get(_point_key(point, tol), []):
+                    if neighbor in seen:
+                        continue
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        if len(component) < 8:
+            continue
+        points = [point for segment in component for point in segment]
+        bbox = (
+            min(point[0] for point in points),
+            min(point[1] for point in points),
+            max(point[0] for point in points),
+            max(point[1] for point in points),
+        )
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        radius = (width + height) * 0.25
+        if radius <= tol or abs(width - height) > max(radius * 0.12, tol * 4.0):
+            continue
+        cx = (bbox[0] + bbox[2]) * 0.5
+        cy = (bbox[1] + bbox[3]) * 0.5
+        errors = [abs(math.hypot(point[0] - cx, point[1] - cy) - radius) for point in points]
+        max_error = max(errors)
+        rms_error = math.sqrt(sum(error * error for error in errors) / len(errors))
+        if max_error > max(radius * 0.08, tol * 5.0):
+            continue
+        curves.append({
+            "id": len(curves),
+            "kind": "approximated_circle",
+            "center": [_round_num(cx), _round_num(cy)],
+            "radius": _round_num(radius),
+            "bbox": _round_list(bbox),
+            "edge_count": len(component),
+            "max_error": _round_num(max_error),
+            "rms_error": _round_num(rms_error),
+        })
+    return curves
+
+
+def _point_key(point: Tuple[float, float], tol: float) -> Tuple[int, int]:
+    return (round(float(point[0]) / tol), round(float(point[1]) / tol))
+
+
+def _dedupe_curve_summaries(curves: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for curve in curves:
+        if curve.get("kind") != "approximated_circle":
+            out.append(curve)
+            continue
+        if any(existing.get("kind") == "approximated_circle" and _same_circle_center(curve, existing)
+               for existing in out):
+            continue
+        out.append(curve)
+    for idx, curve in enumerate(out):
+        curve["id"] = idx
+    return out
 
 
 def _fit_outline_circle(outline: Any) -> Optional[Tuple[float, float, float, float, float]]:
