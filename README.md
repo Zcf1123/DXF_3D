@@ -223,7 +223,11 @@ DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
 
 ---
 
-## 五、产物（每次运行一个 `outputs/<YYYYMMDD>_<HHMMSS>_<base>/` 目录）
+## 五、产物（每次运行一个独立输出目录）
+
+普通 direct 路线输出到 `outputs/<YYYYMMDD>_<HHMMSS>_<base>/`。
+`--auto` 路线输出到 `outputs/A_<YYYYMMDD>_<HHMMSS>_<source_base>/`，目录名前缀
+`A_` 用于和 direct 结果区分；目录内文件基名仍为 `A<source_base>`。
 
 | 文件                       | 说明 |
 | -------------------------- | ---- |
@@ -247,8 +251,9 @@ DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
 | `run.log`                  | 详细中文日志（每一阶段、警告、栈追踪） |
 
 测试或调试时可设置 `DXF_3D_OUTPUT_SUBDIR=test`，输出会进入
-`outputs/test/<YYYYMMDD>_<HHMMSS>_<base>/`。未设置时保持默认行为，仍输出到
-`outputs/<YYYYMMDD>_<HHMMSS>_<base>/`。
+`outputs/test/<YYYYMMDD>_<HHMMSS>_<base>/` 或
+`outputs/test/A_<YYYYMMDD>_<HHMMSS>_<source_base>/`。未设置时保持默认行为，仍输出到
+`outputs/` 下对应目录。
 
 ---
 

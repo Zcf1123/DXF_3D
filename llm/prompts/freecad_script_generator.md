@@ -12,6 +12,7 @@
 - `Result.Shape` 必须是一个非空 solid 或多个 solid fuse 后的 solid。
 - 必须保存到给定的 `FCSTD_PATH`。
 - 脚本中必须实际出现 `Result` 和 `doc.saveAs(FCSTD_PATH)`，否则会被程序拒绝。
+- 保存后不要调用 `doc.close()`；FreeCAD 文档对象没有这个方法。需要关闭文档时应由外部流程处理。
 - 建模应使用 FreeCAD/Part 的实体布尔、拉伸、圆柱、盒体、线框轮廓等稳定 API。
 - 不存在 `Part.Extrude` 这个 API；拉伸轮廓必须先构造 `Part.Face(...)`，再调用 `face.extrude(App.Vector(dx, dy, dz))`。
 - `Part.makeCylinder(radius, height, base, direction)` 的方向参数必须显式传入；沿 Y 方向拉伸圆筒/孔时使用 `App.Vector(0, 1, 0)`。

@@ -205,13 +205,16 @@ def _intent_understanding_description(model_intent: str) -> str:
 # Logging
 # ---------------------------------------------------------------------------
 
-def _make_run_dir(base: str) -> str:
+def _make_run_dir(base: str, prefix: str = "") -> str:
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = OUTPUTS_DIR
     output_subdir = os.environ.get("DXF_3D_OUTPUT_SUBDIR", "").strip().strip("/")
     if output_subdir:
         output_root = os.path.join(output_root, output_subdir)
-    out_dir = os.path.join(output_root, f"{ts}_{base}")
+    dirname = f"{ts}_{base}"
+    if prefix:
+        dirname = f"{prefix}_{dirname}"
+    out_dir = os.path.join(output_root, dirname)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
@@ -616,7 +619,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
     """
     source_base = os.path.splitext(os.path.basename(dxf_path))[0]
     base = f"A{source_base}"
-    run_dir = _make_run_dir(base)
+    run_dir = _make_run_dir(source_base, prefix="A")
     log = _make_logger(run_dir)
     summary: Dict[str, Any] = {
         "input": dxf_path,

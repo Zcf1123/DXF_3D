@@ -64,6 +64,7 @@ _INVALID_FREECAD_CALLS = {
     "Part.setMeasurePrecision": "FreeCAD Part has no Part.setMeasurePrecision; remove this no-op line",
     "Part.cut": "FreeCAD Part has no Part.cut module function; call shape.cut(other_shape) instead",
     "Part.common": "FreeCAD Part has no Part.common module function; call shape.common(other_shape) instead",
+    "doc.close": "FreeCAD document objects have no close() method; remove doc.close() after saveAs",
 }
 _REQUEST_TIMEOUT_SECONDS = 180
 _MAX_SCRIPT_TOKENS = 9000
@@ -237,6 +238,7 @@ def strip_code_fence(text: str) -> str:
 
 def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
+    script = re.sub(r"(?m)^\s*doc\.close\(\)\s*\n?", "", script)
     script = re.sub(r"\.(X|Y|Z)\b", lambda m: "." + m.group(1).lower(), script)
     if "Part.Arc(" in script or "Part.Line(" in script or ".Edge" in script:
         script = script.replace("Part.Arc(", "_safe_arc(")
