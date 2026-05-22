@@ -232,21 +232,6 @@ def _make_logger(run_dir: str) -> logging.Logger:
     return logger
 
 
-def _fcstd_has_result_solid(fcstd_path: str) -> bool:
-    try:
-        import FreeCAD as App  # type: ignore
-    except Exception:
-        return False
-
-    doc = App.openDocument(fcstd_path)
-    try:
-        result = doc.getObject("Result")
-        shape = getattr(result, "Shape", None)
-        return bool(shape is not None and not shape.isNull() and shape.Solids)
-    finally:
-        App.closeDocument(doc.Name)
-
-
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -707,30 +692,21 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
 
         banner("阶段 3 ─ 投影并生成 Auto 上下文")
         from .projection_mapper import map_views_to_3d
-        from .feature_inference import infer_features
-        from .exporters import export_generated_python, validate_projection_against_views
         from ...llm.code.llm_code_planner import build_auto_context, generate_freecad_script
         projected = map_views_to_3d(bundles)
         for name, pv in projected.items():
             log.info("投影 %-6s -> 平面 %s, 尺寸 %.3f × %.3f, 实体数=%d",
                      name, pv.plane, pv.width, pv.height, len(pv.entities))
-        direct_features = infer_features(projected, bundles, model_intent=model_intent)
         auto_context = build_auto_context(dxf_path, bundles, projected, model_intent)
-        auto_context["direct_reference"] = {
-            "说明": "由 direct 模式确定性推断得到。LLM 应优先按这些特征生成 FreeCAD 代码，不要脱离这些实体、孔、拉伸方向和尺寸自由发挥。",
-            "features": [feature.to_dict() for feature in direct_features],
-        }
         with open(os.path.join(run_dir, "auto_context.json"), "w",
                   encoding="utf-8") as f:
             json.dump(auto_context, f, indent=2, ensure_ascii=False)
         with open(os.path.join(run_dir, "features_draft.json"), "w",
                   encoding="utf-8") as f:
-            json.dump([feature.to_dict() for feature in direct_features], f, indent=2, ensure_ascii=False)
+            json.dump([], f, indent=2, ensure_ascii=False)
         with open(os.path.join(run_dir, "features.json"), "w",
                   encoding="utf-8") as f:
-            json.dump([feature.to_dict() for feature in direct_features], f, indent=2, ensure_ascii=False)
-        direct_reference_py = os.path.join(run_dir, "generated_model_direct_reference.py")
-        export_generated_python(direct_features, direct_reference_py, base, fcstd_path=os.path.join(run_dir, f"{base}.FCStd"))
+            json.dump([], f, indent=2, ensure_ascii=False)
         log.info("已写出        : auto_context.json / features*.json")
 
         banner("阶段 4 ─ LLM 直接生成 FreeCAD 脚本")
@@ -745,40 +721,9 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         log.info("已写出        : generated_model.py")
 
         banner("阶段 5 ─ 执行 LLM 生成脚本")
-        used_direct_fallback = False
-
-        def run_direct_reference(reason: str) -> None:
-            log.warning("%s，切换到 direct 参考脚本兜底", reason)
-            with open(direct_reference_py, "r", encoding="utf-8") as f:
-                fallback_script = f.read()
-            with open(py_path, "w", encoding="utf-8") as f:
-                f.write(fallback_script)
-            runpy.run_path(py_path, run_name="__main__")
-            if not os.path.exists(fcstd_path) or not _fcstd_has_result_solid(fcstd_path):
-                raise RuntimeError("LLM 脚本和 direct 参考脚本都未生成有效 solid")
-
-        try:
-            runpy.run_path(py_path, run_name="__main__")
-        except Exception as exc:
-            run_direct_reference(f"LLM 脚本执行失败: {exc}")
-            used_direct_fallback = True
-
-        if (used_direct_fallback or not os.path.exists(fcstd_path)
-                or not _fcstd_has_result_solid(fcstd_path)):
-            if not used_direct_fallback:
-                run_direct_reference("LLM 脚本未生成有效 Result solid")
-                used_direct_fallback = True
-        if not used_direct_fallback:
-            try:
-                precheck_path = os.path.join(run_dir, "projection_validation_precheck.json")
-                precheck = validate_projection_against_views(
-                    fcstd_path, projected, None, precheck_path)
-                if precheck.get("status") != "OK":
-                    run_direct_reference("LLM 脚本反投影验证未通过")
-                    used_direct_fallback = True
-            except Exception as exc:
-                run_direct_reference(f"LLM 脚本反投影验证失败: {exc}")
-                used_direct_fallback = True
+        runpy.run_path(py_path, run_name="__main__")
+        if not os.path.exists(fcstd_path):
+            raise RuntimeError(f"LLM 脚本未生成 FCStd: {fcstd_path}")
         summary["fcstd"] = fcstd_path
         log.info("FCStd 文件    : %s", fcstd_path)
 

@@ -19,8 +19,11 @@
 - 不要调用 `Part.setMeasurePrecision`；FreeCAD 的 `Part` 模块没有这个 API。
 - 访问 `App.Vector` 分量时使用小写 `.x/.y/.z`，不要使用 `.X/.Y/.Z`。
 - 不要调用 `Part.fuse([...])`；应使用 `shape1.fuse(shape2)` 逐个融合。
+- 构造 `Part.Arc(p1, p2, p3)` 前必须确认三点不共线；如果无法确认，使用直线段或圆柱/盒体组合近似，避免 `Three points are collinear`。
 - 坐标系固定：FRONT 为 XZ，TOP 为 XY，LEFT 为 YZ。Z 是高度方向。
 - 虚线、HID、HIDDEN 图元不是外轮廓，只能作为孔、盲孔、贯穿关系、被遮挡边界的证据。
+- 坐标轴、中心线、轴线、辅助线、投影线、参考线、标注线不是模型几何，绝不能拉伸成实体，也不能作为圆柱、板、孔或槽的边界。
+- 上下文中的 `excluded_auxiliary_entity_count` 表示已经被过滤掉的辅助实体数量；这些实体只用于说明图纸清理情况，不参与建模。
 - 优先让模型的 FRONT/TOP/LEFT 正投影贴合输入视图；不要为了代码简单把不同厚度的构件做成同一厚度。
 
 工程图理解规则：
@@ -31,7 +34,6 @@
 - 圆筒、圆耳、长圆孔端耳、连杆、板臂等零件应按工程语义拆成合理实体再 fuse/cut。
 - 当图纸显示多个局部厚度时，应分别建模局部实体，再融合成整体。
 - 若上下文中出现 `approximated_curves`，说明 DXF 原始圆/圆弧已被很多短 LINE 打散；建模时应优先使用这些拟合后的圆、圆筒、圆孔或长圆孔摘要，而不是逐条短线段重建。
-- 若上下文中出现 `direct_reference.features`，这是 direct 模式已经确定性推断出的实体、孔、切除、拉伸方向和尺寸。必须优先按这些特征生成 FreeCAD 代码；不要脱离这些特征自由猜测几何。
 - `Part.makeCircle(...)` 返回的是边，不是线框；如果要生成面，必须写 `Part.Face(Part.Wire([circle_edge]))`，不要写 `Part.Face(circle_edge)`。
 
 ## USER
@@ -58,7 +60,6 @@ FCSTD_PATH = "{{ fcstd_path }}"
 - 推荐使用 `result = doc.addObject("Part::Feature", "Result")`，然后 `result.Shape = final_shape`。
 - 拉伸闭合轮廓时使用 `face.extrude(App.Vector(...))`，禁止使用 `Part.Extrude(...)`。
 - 如果需要构造曲线轮廓，优先使用上下文中的 `projected_views[*].approximated_curves`，再参考 `visible_closed_outlines` 的 bbox。
-- 如果上下文包含 `direct_reference.features`，优先使用该特征列表作为建模蓝图；三视图摘要只用于校验局部尺寸和孔槽位置。
 - 如果需要开孔，使用 cut，并保证孔方向、半径、槽长和位置与三视图一致。
 
 ## OUTPUT

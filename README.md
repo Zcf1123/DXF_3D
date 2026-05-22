@@ -39,17 +39,6 @@
 镜像名可用环境变量 `DXF_3D_IMAGE` 覆盖（默认 `dxf-3d`）。本文所有示例默认使用
 `-d` 开发挂载模式，让容器挂载当前源码目录，避免每次改代码后重建镜像。
 
-### Auto 路线参考 direct
-
-`--auto` 会让 LLM 直接编写 FreeCAD Python。LLM 容易写出两类错误：一类是
-FreeCAD API 细节错误，例如把 `Part.makeCircle` 返回的边直接传给 `Part.Face`；另一类是
-工程语义错误，例如生成了 solid，但 FRONT/TOP/LEFT 反投影和原图不匹配。
-
-为减少这类错误，Auto 路线现在会先运行 direct 模式的确定性特征推断，把得到的
-`direct_reference.features` 写入 `auto_context.json`，要求 LLM 优先按这些实体、孔、切除、
-拉伸方向和尺寸生成脚本。如果 LLM 脚本执行失败、没有生成有效 `Result` solid，或反投影
-验证不是 `OK`，流水线会自动切换到 direct 参考脚本兜底，避免把错误模型当作成功结果。
-
 ### 单一俯视图拉伸
 
 如果 DXF 中只包含一个俯视图轮廓，可以在命令行提供拉伸长度：

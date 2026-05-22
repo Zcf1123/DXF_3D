@@ -68,6 +68,13 @@ _INVALID_FREECAD_CALLS = {
 _REQUEST_TIMEOUT_SECONDS = 180
 _MAX_SCRIPT_TOKENS = 9000
 
+_AUXILIARY_TOKENS = frozenset({
+    "CENTER", "CENTRE", "CENTRO", "AXIS", "AXES", "CONSTRUCTION",
+    "PROJECTION", "AUX", "GUIDE", "REF", "REFERENCE", "DIM", "ANNO",
+    "TEXT", "NOTE", "DEFPOINTS", "坐标", "轴线", "中心", "辅助",
+    "投影", "参考", "标注", "尺寸",
+})
+
 
 def build_auto_context(
     dxf_path: str,
@@ -220,6 +227,10 @@ def strip_code_fence(text: str) -> str:
 def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
     script = re.sub(r"\.(X|Y|Z)\b", lambda m: "." + m.group(1).lower(), script)
+    if "Part.Arc(" in script or ".Edge" in script:
+        script = script.replace("Part.Arc(", "_safe_arc(")
+        script = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\.Edge\b", r"_edge(\1)", script)
+        script = _ensure_geometry_helper(script)
     circle_vars = re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Part\.makeCircle\(", script)
     for var_name in circle_vars:
         script = re.sub(
@@ -231,6 +242,27 @@ def _sanitize_generated_script(script: str) -> str:
         script = script.replace("Part.fuse(", "_fuse_all(")
         script = _ensure_fuse_helper(script)
     return script.strip() + "\n"
+
+
+def _ensure_geometry_helper(script: str) -> str:
+    if "def _safe_arc(" in script and "def _edge(" in script:
+        return script
+    helper = (
+        "\n\ndef _edge(curve):\n"
+        "    if hasattr(curve, 'toShape'):\n"
+        "        return curve.toShape()\n"
+        "    return curve\n"
+        "\n"
+        "def _safe_arc(p1, p2, p3):\n"
+        "    try:\n"
+        "        return Part.Arc(p1, p2, p3)\n"
+        "    except Exception:\n"
+        "        return Part.LineSegment(p1, p3)\n"
+    )
+    insert_after = re.search(r"(?m)^(?:import .+\n)+", script)
+    if insert_after:
+        return script[:insert_after.end()] + helper + script[insert_after.end():]
+    return helper.lstrip() + "\n" + script
 
 
 def _ensure_fuse_helper(script: str) -> str:
@@ -482,13 +514,23 @@ def _is_number_literal(node: ast.AST) -> bool:
 
 
 def _bundle_summary(bundle: ViewBundle) -> Dict[str, Any]:
-    outlines, circles = extract_closed_outlines_and_circles(bundle, hidden_pred=_is_hidden_entity)
+    modeling_entities = _modeling_entities(bundle.entities)
+    modeling_bundle = ViewBundle(
+        name=bundle.name,
+        bbox=bundle.bbox,
+        entities=modeling_entities,
+        annotations=bundle.annotations,
+    )
+    outlines, circles = extract_closed_outlines_and_circles(
+        modeling_bundle, hidden_pred=_is_hidden_entity)
     return {
         "name": bundle.name,
         "bbox": _round_list(bundle.bbox),
         "width": _round_num(bundle.width),
         "height": _round_num(bundle.height),
         "entity_count": len(bundle.entities),
+        "modeling_entity_count": len(modeling_entities),
+        "excluded_auxiliary_entity_count": len(bundle.entities) - len(modeling_entities),
         "annotations": [_annotation_summary(ann) for ann in bundle.annotations],
         "visible_closed_outline_bboxes": [_outline_bbox_summary(o) for o in outlines[:_MAX_OUTLINES_PER_VIEW]],
         "approximated_curves": _approximated_curve_summaries(outlines),
@@ -497,10 +539,15 @@ def _bundle_summary(bundle: ViewBundle) -> Dict[str, Any]:
 
 
 def _projected_view_summary(name: str, pv: Any) -> Dict[str, Any]:
-    temp_bundle = ViewBundle(name=name, bbox=(0.0, 0.0, float(pv.width), float(pv.height)), entities=pv.entities)
+    modeling_entities = _modeling_entities(pv.entities)
+    temp_bundle = ViewBundle(
+        name=name,
+        bbox=(0.0, 0.0, float(pv.width), float(pv.height)),
+        entities=modeling_entities,
+    )
     outlines, circles = extract_closed_outlines_and_circles(temp_bundle, hidden_pred=_is_hidden_entity)
-    visible = [e for e in pv.entities if not _is_hidden_entity(e)]
-    hidden = [e for e in pv.entities if _is_hidden_entity(e)]
+    visible = [e for e in modeling_entities if not _is_hidden_entity(e)]
+    hidden = [e for e in modeling_entities if _is_hidden_entity(e)]
     return {
         "name": name,
         "plane": pv.plane,
@@ -508,6 +555,8 @@ def _projected_view_summary(name: str, pv: Any) -> Dict[str, Any]:
         "width": _round_num(pv.width),
         "height": _round_num(pv.height),
         "entity_count": len(pv.entities),
+        "modeling_entity_count": len(modeling_entities),
+        "excluded_auxiliary_entity_count": len(pv.entities) - len(modeling_entities),
         "visible_closed_outlines": [_outline_bbox_summary(o) for o in outlines[:_MAX_OUTLINES_PER_VIEW]],
         "approximated_curves": _approximated_curve_summaries(outlines),
         "visible_circles": [_circle_summary(c) for c in circles],
@@ -693,6 +742,19 @@ def _is_hidden_entity(entity: DxfEntity) -> bool:
     linetype = (entity.linetype or "").upper()
     desc = str(entity.extra.get("linetype_desc") or "").upper()
     return "HID" in layer or "HIDDEN" in linetype or "HIDDEN" in desc
+
+
+def _modeling_entities(entities: List[DxfEntity]) -> List[DxfEntity]:
+    return [entity for entity in entities if not _is_auxiliary_entity(entity)]
+
+
+def _is_auxiliary_entity(entity: DxfEntity) -> bool:
+    text = " ".join([
+        str(entity.layer or ""),
+        str(entity.linetype or ""),
+        str(entity.extra.get("linetype_desc") or ""),
+    ]).upper()
+    return any(token in text for token in _AUXILIARY_TOKENS)
 
 
 def _call_name(node: ast.AST) -> str:
