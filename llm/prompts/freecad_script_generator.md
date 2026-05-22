@@ -33,6 +33,8 @@
 - LEFT 决定 YZ 尺寸和高度关系，并校验 TOP/FRONT 推断。
 - 圆筒、圆耳、长圆孔端耳、连杆、板臂等零件应按工程语义拆成合理实体再 fuse/cut。
 - 当图纸显示多个局部厚度时，应分别建模局部实体，再融合成整体。
+- 当上下文 `intent_mode.enabled=true` 时，必须结合 `model_intent` 和 `part_knowledge` 判断零件族、组件关系、孔槽贯穿方向和可容忍的视图漏画；不要忽略用户意图。
+- `part_knowledge` 只用于辅助理解，不是几何本身；所有尺寸、位置、半径、深度仍必须来自三视图摘要。
 - 若上下文中出现 `approximated_curves`，说明 DXF 原始圆/圆弧已被很多短 LINE 打散；建模时应优先使用这些拟合后的圆、圆筒、圆孔或长圆孔摘要，而不是逐条短线段重建。
 - `Part.makeCircle(...)` 返回的是边，不是线框；如果要生成面，必须写 `Part.Face(Part.Wire([circle_edge]))`，不要写 `Part.Face(circle_edge)`。
 
@@ -60,6 +62,7 @@ FCSTD_PATH = "{{ fcstd_path }}"
 - 推荐使用 `result = doc.addObject("Part::Feature", "Result")`，然后 `result.Shape = final_shape`。
 - 拉伸闭合轮廓时使用 `face.extrude(App.Vector(...))`，禁止使用 `Part.Extrude(...)`。
 - 如果需要构造曲线轮廓，优先使用上下文中的 `projected_views[*].approximated_curves`，再参考 `visible_closed_outlines` 的 bbox。
+- 如果 `intent_mode.enabled=true`，先根据 `model_intent` 和 `part_knowledge` 选择合理的零件建模策略，再用三视图摘要确定具体几何。
 - 如果需要开孔，使用 cut，并保证孔方向、半径、槽长和位置与三视图一致。
 
 ## OUTPUT

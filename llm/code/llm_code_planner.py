@@ -83,15 +83,26 @@ def build_auto_context(
     model_intent: str = "",
 ) -> Dict[str, Any]:
     """Build a compact, geometry-first context for direct script generation."""
+    intent = (model_intent or "").strip()
+    part_knowledge = _load_part_knowledge_for_refiner()
     return {
         "input_file": os.path.basename(dxf_path),
-        "model_intent": model_intent or "（无）",
+        "model_intent": intent or "（无）",
+        "intent_mode": {
+            "enabled": bool(intent),
+            "instruction": (
+                "用户提供了建模意图。请结合 part_knowledge 解释零件类型、组件关系、孔槽贯穿方向和允许容忍的视图简化；"
+                "但最终几何仍必须由三视图证据支撑。"
+                if intent else
+                "未提供建模意图。请只根据三视图几何摘要保守建模。"
+            ),
+        },
         "coordinate_convention": {
             "front": "XZ plane: drawing x -> world X, drawing y -> world Z",
             "top": "XY plane: drawing x -> world X, drawing y -> world Y",
             "left": "YZ plane: drawing x -> world Y, drawing y -> world Z",
         },
-        "part_knowledge": _load_part_knowledge_for_refiner(),
+        "part_knowledge": part_knowledge,
         "views": [_bundle_summary(bundle) for bundle in bundles],
         "projected_views": {
             name: _projected_view_summary(name, pv)
@@ -227,8 +238,9 @@ def strip_code_fence(text: str) -> str:
 def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
     script = re.sub(r"\.(X|Y|Z)\b", lambda m: "." + m.group(1).lower(), script)
-    if "Part.Arc(" in script or ".Edge" in script:
+    if "Part.Arc(" in script or "Part.Line(" in script or ".Edge" in script:
         script = script.replace("Part.Arc(", "_safe_arc(")
+        script = script.replace("Part.Line(", "_safe_line(")
         script = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\.Edge\b", r"_edge(\1)", script)
         script = _ensure_geometry_helper(script)
     circle_vars = re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Part\.makeCircle\(", script)
@@ -245,7 +257,7 @@ def _sanitize_generated_script(script: str) -> str:
 
 
 def _ensure_geometry_helper(script: str) -> str:
-    if "def _safe_arc(" in script and "def _edge(" in script:
+    if "def _safe_arc(" in script and "def _safe_line(" in script and "def _edge(" in script:
         return script
     helper = (
         "\n\ndef _edge(curve):\n"
@@ -255,9 +267,12 @@ def _ensure_geometry_helper(script: str) -> str:
         "\n"
         "def _safe_arc(p1, p2, p3):\n"
         "    try:\n"
-        "        return Part.Arc(p1, p2, p3)\n"
+        "        return Part.Arc(p1, p2, p3).toShape()\n"
         "    except Exception:\n"
-        "        return Part.LineSegment(p1, p3)\n"
+        "        return Part.LineSegment(p1, p3).toShape()\n"
+        "\n"
+        "def _safe_line(p1, p2):\n"
+        "    return Part.LineSegment(p1, p2).toShape()\n"
     )
     insert_after = re.search(r"(?m)^(?:import .+\n)+", script)
     if insert_after:

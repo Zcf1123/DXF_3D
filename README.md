@@ -5,8 +5,8 @@
 可以**整个目录拷贝到任意主机独立部署**，不依赖仓库其它任何文件。
 
 代码按建模路线分区：`direct/` 是当前稳定的确定性特征路线，`llm/` 是原始目标的
-“三视图 JSON/图片摘要 -> LLM 写 FreeCAD 脚本”路线，`prompts/common/` 存放两条路线
-共用的工程图约定和零件语义。根目录只保留启动入口、部署文件、输入输出目录和文档。
+“三视图 JSON/图片摘要 -> LLM 写 FreeCAD 脚本”路线，`prompts/` 存放两条路线共用的
+工程图约定和零件语义。根目录只保留启动入口、部署文件、输入输出目录和文档。
 
 ---
 
@@ -306,7 +306,7 @@ LLM 当前分两步介入：
 3. `llm/prompts/freecad_script_generator.md`：`--auto` 路线专用，要求 LLM 直接输出
    可运行的 FreeCAD Python；程序会拒绝危险调用和常见 FreeCAD API 幻觉。
 
-route-specific prompt 放在各自目录；公共知识放在 [prompts/common/](prompts/common/)。
+route-specific prompt 放在各自目录；公共知识放在 [prompts/](prompts/)。
 direct prompt 文件遵循 [direct/prompts/PROMPT_SPEC.md](direct/prompts/PROMPT_SPEC.md)
 的二级标题分块约定。
 

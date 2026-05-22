@@ -19,9 +19,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(HERE))
 PROMPTS_DIR = os.path.join(PROJECT_ROOT, "direct", "prompts")
-COMMON_PROMPTS_DIR = os.path.join(PROJECT_ROOT, "prompts", "common")
+COMMON_PROMPTS_DIR = os.path.join(PROJECT_ROOT, "prompts")
 
 
 # ---------------------------------------------------------------------------
