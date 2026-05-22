@@ -88,7 +88,7 @@ def build_auto_context(
     """Build a compact, geometry-first context for direct script generation."""
     intent = (model_intent or "").strip()
     part_knowledge = _load_part_knowledge_for_refiner()
-    return {
+    context = {
         "input_file": os.path.basename(dxf_path),
         "model_intent": intent or "（无）",
         "intent_mode": {
@@ -112,6 +112,63 @@ def build_auto_context(
             for name, pv in projected.items()
         },
     }
+    context["hole_hints"] = _through_hole_hints(context["projected_views"])
+    return context
+
+
+def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    width_x = _view_extent(front, "width", _view_extent(top, "width", 1.0))
+    depth_y = _view_extent(left, "width", _view_extent(top, "height", 1.0))
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 1.0))
+    margin = max(width_x, depth_y, height_z, 1.0) * 0.05
+    hints: List[Dict[str, Any]] = []
+    for circle in top.get("visible_circles") or []:
+        center = circle.get("center") or []
+        radius = float(circle.get("radius") or 0.0)
+        if len(center) == 2 and radius > 0.0:
+            cx, cy = float(center[0]), float(center[1])
+            hints.append({
+                "source_view": "top",
+                "axis": "Z",
+                "radius": _round_num(radius),
+                "center_world": [_round_num(cx), _round_num(cy), 0.0],
+                "base_world": [_round_num(cx), _round_num(cy), _round_num(-margin)],
+                "height": _round_num(height_z + 2.0 * margin),
+                "rule": "base.z < solid_z_min and base.z + height > solid_z_max",
+            })
+    for circle in front.get("visible_circles") or []:
+        center = circle.get("center") or []
+        radius = float(circle.get("radius") or 0.0)
+        if len(center) == 2 and radius > 0.0:
+            cx, cz = float(center[0]), float(center[1])
+            hints.append({
+                "source_view": "front",
+                "axis": "Y",
+                "radius": _round_num(radius),
+                "center_world": [_round_num(cx), 0.0, _round_num(cz)],
+                "base_world": [_round_num(cx), _round_num(-margin), _round_num(cz)],
+                "height": _round_num(depth_y + 2.0 * margin),
+                "rule": "base.y < solid_y_min and base.y + height > solid_y_max",
+            })
+    for circle in left.get("visible_circles") or []:
+        center = circle.get("center") or []
+        radius = float(circle.get("radius") or 0.0)
+        if len(center) == 2 and radius > 0.0:
+            uy, cz = float(center[0]), float(center[1])
+            cy = depth_y - uy
+            hints.append({
+                "source_view": "left",
+                "axis": "X",
+                "radius": _round_num(radius),
+                "center_world": [0.0, _round_num(cy), _round_num(cz)],
+                "base_world": [_round_num(-margin), _round_num(cy), _round_num(cz)],
+                "height": _round_num(width_x + 2.0 * margin),
+                "rule": "base.x < solid_x_min and base.x + height > solid_x_max",
+            })
+    return hints
 
 
 def generate_freecad_script(
@@ -143,14 +200,11 @@ def generate_freecad_script(
 
     try:
         with _alarm_timeout(_REQUEST_TIMEOUT_SECONDS):
-            resp = llm.client.chat.completions.create(
-                model=llm.model,
-                messages=messages,
-                temperature=0.0,
+            content = llm.complete_text(
+                messages,
                 max_tokens=_MAX_SCRIPT_TOKENS,
                 timeout=_REQUEST_TIMEOUT_SECONDS,
             )
-        content = (resp.choices[0].message.content or "").strip()
     except Exception as exc:
         return None, f"LLM 请求失败：{exc}"
 
@@ -188,19 +242,18 @@ def _repair_generated_script(
             "5. 不要使用不存在的 `Part.Extrude`；拉伸必须使用 `Part.Face(...).extrude(App.Vector(...))`。\n"
             "6. `Part.makeCylinder` 正确签名是 `Part.makeCylinder(radius, height, base, direction)` 或带第 5 个 angle；第 4 个参数必须是方向向量，不是数字。\n"
             "7. 直接给短脚本，不要写工程图推理过程，不要写长段注释，避免输出被截断。\n"
-            "8. 不要输出 Markdown 解释文字。"
+            "8. 不要输出 Markdown 解释文字。\n"
+            "9. 不要保留错误代码和修正代码的两个版本；只输出最终正确版本。\n"
+            "10. 如需保留少量注释，注释必须使用中文。"
         ),
     })
     try:
         with _alarm_timeout(_REQUEST_TIMEOUT_SECONDS):
-            resp = llm.client.chat.completions.create(
-                model=llm.model,
-                messages=repair_messages,
-                temperature=0.0,
+            content = llm.complete_text(
+                repair_messages,
                 max_tokens=_MAX_SCRIPT_TOKENS,
                 timeout=_REQUEST_TIMEOUT_SECONDS,
             )
-        content = (resp.choices[0].message.content or "").strip()
     except Exception as exc:
         return None, f"自动重试失败：{exc}"
 
@@ -240,6 +293,22 @@ def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*App\.setActiveDocument\([^\n]*\)\s*\n?", "", script)
     script = re.sub(r"(?m)^\s*doc\.close\(\)\s*\n?", "", script)
     script = re.sub(r"(?m)^\s*doc\.Name\s*=\s*[^\n]*\n?", "", script)
+    script = re.sub(r"(?m)^\s*[A-Za-z_][A-Za-z0-9_]*\.Label\s*=\s*[^\n]*\n?", "", script)
+    script = re.sub(
+        r"Part\.makePolygon\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        r"Part.makePolygon(\1 + [\1[0]])",
+        script,
+    )
+    wire_vars = re.findall(
+        r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Part\.makePolygon\(",
+        script,
+    )
+    for var_name in wire_vars:
+        script = re.sub(
+            rf"\b{re.escape(var_name)}\.extrude\(",
+            f"Part.Face({var_name}).extrude(",
+            script,
+        )
     shape_vars = re.findall(
         r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Part\.make(?:Sphere|Box|Cylinder|Cone|Torus)\(",
         script,
@@ -553,6 +622,10 @@ def validate_generated_script(script: str) -> Tuple[bool, str]:
                 return False, f"call {func_name!r} is not allowed"
             if func_name in _INVALID_FREECAD_CALLS:
                 return False, _INVALID_FREECAD_CALLS[func_name]
+            if _call_name(node.func).endswith(".extrude"):
+                owner = node.func.value if isinstance(node.func, ast.Attribute) else None
+                if isinstance(owner, ast.Name) and owner.id.lower().endswith(("wire", "polyline", "polygon")):
+                    return False, "wire extrusion creates a shell; create Part.Face(wire).extrude(...) to produce a solid"
             if func_name == "Part.makeCylinder" and len(node.args) >= 4 and _is_number_literal(node.args[3]):
                 return False, "Part.makeCylinder fourth argument must be a direction App.Vector, not a number; use Part.makeCylinder(radius, height, base, App.Vector(...))"
     return True, "ok"
@@ -600,18 +673,31 @@ def _projected_view_summary(name: str, pv: Any) -> Dict[str, Any]:
     return {
         "name": name,
         "plane": pv.plane,
+        "point_to_world": _point_to_world_hint(pv.plane, float(pv.width)),
         "origin_2d": _round_list(pv.origin_2d),
         "width": _round_num(pv.width),
         "height": _round_num(pv.height),
         "entity_count": len(pv.entities),
         "modeling_entity_count": len(modeling_entities),
         "excluded_auxiliary_entity_count": len(pv.entities) - len(modeling_entities),
-        "visible_closed_outlines": [_outline_bbox_summary(o) for o in outlines[:_MAX_OUTLINES_PER_VIEW]],
+        "visible_closed_outlines": [_outline_summary(o) for o in outlines[:_MAX_OUTLINES_PER_VIEW]],
+        "regular_polygon_hints": _regular_polygon_hints(outlines),
+        "extrusion_profile_hints": _extrusion_profile_hints(outlines, pv.plane, float(pv.width)),
         "approximated_curves": _approximated_curve_summaries(outlines),
         "visible_circles": [_circle_summary(c) for c in circles],
         "key_visible_entities": _key_entity_summaries(visible, _MAX_VISIBLE_ENTITIES_PER_VIEW),
         "key_hidden_entities": _key_entity_summaries(hidden, _MAX_HIDDEN_ENTITIES_PER_VIEW),
     }
+
+
+def _point_to_world_hint(plane: str, width: float) -> str:
+    if plane == "XY":
+        return "2D point [u,v] maps to App.Vector(u, v, z); extrude along Z for thickness/height"
+    if plane == "XZ":
+        return "2D point [u,v] maps to App.Vector(u, y, v); extrude along Y for depth"
+    if plane == "YZ":
+        return f"2D point [u,v] maps to App.Vector(x, {width:.6f} - u, v); extrude along X for width"
+    return "2D point [u,v] must be mapped according to the view plane before extrusion"
 
 
 def _key_entity_summaries(entities: List[DxfEntity], limit: int) -> List[Dict[str, Any]]:
@@ -683,6 +769,103 @@ def _outline_bbox_summary(outline: Any) -> Dict[str, Any]:
         "height": _round_num(outline.height),
         "edge_count": len(outline.edges),
     }
+
+
+def _regular_polygon_hints(outlines: List[Any]) -> List[Dict[str, Any]]:
+    hints: List[Dict[str, Any]] = []
+    for outline in outlines[:_MAX_OUTLINES_PER_VIEW]:
+        if len(outline.edges) != 6:
+            continue
+        min_x, min_y, max_x, max_y = [float(value) for value in outline.bbox]
+        width = max_x - min_x
+        height = max_y - min_y
+        if width <= 0.0 or height <= 0.0:
+            continue
+        hints.append({
+            "kind": "regular_hexagon_bbox",
+            "bbox": _round_list(outline.bbox),
+            "center": [_round_num((min_x + max_x) * 0.5), _round_num((min_y + max_y) * 0.5)],
+            "flat_to_flat": _round_num(height),
+            "vertex_to_vertex": _round_num(width),
+            "circumradius": _round_num(width * 0.5),
+            "inradius": _round_num(height * 0.5),
+            "recommended_vertices_2d": _round_json([
+                [max_x, (min_y + max_y) * 0.5],
+                [max_x - width * 0.25, max_y],
+                [min_x + width * 0.25, max_y],
+                [min_x, (min_y + max_y) * 0.5],
+                [min_x + width * 0.25, min_y],
+                [max_x - width * 0.25, min_y],
+            ]),
+        })
+    return hints
+
+
+def _extrusion_profile_hints(outlines: List[Any], plane: str, width: float) -> List[Dict[str, Any]]:
+    hints: List[Dict[str, Any]] = []
+    for outline in outlines[:_MAX_OUTLINES_PER_VIEW]:
+        if len(outline.edges) < 6:
+            continue
+        edges = outline.to_dict().get("edges", [])[:_MAX_EDGES_PER_OUTLINE]
+        if not edges or not _all_axis_aligned_edges(edges):
+            continue
+        points_2d = [edge.get("p0") for edge in edges if len(edge.get("p0") or []) == 2]
+        if len(points_2d) < 6:
+            continue
+        points_2d.append(points_2d[0])
+        hints.append({
+            "kind": "orthogonal_closed_profile",
+            "source_plane": plane,
+            "profile_points_2d": _round_json(points_2d),
+            "profile_points_world": _round_json([
+                _profile_point_to_world(plane, float(point[0]), float(point[1]), width)
+                for point in points_2d
+            ]),
+            "extrude_axis": _profile_extrude_axis(plane),
+            "extrude_vector_template": _profile_extrude_vector_template(plane),
+        })
+    return hints
+
+
+def _all_axis_aligned_edges(edges: List[Dict[str, Any]]) -> bool:
+    for edge in edges:
+        p0 = edge.get("p0") or []
+        p1 = edge.get("p1") or []
+        if len(p0) != 2 or len(p1) != 2:
+            return False
+        if abs(float(p0[0]) - float(p1[0])) > 1e-6 and abs(float(p0[1]) - float(p1[1])) > 1e-6:
+            return False
+    return True
+
+
+def _profile_point_to_world(plane: str, u: float, v: float, width: float) -> List[float]:
+    if plane == "XY":
+        return [u, v, 0.0]
+    if plane == "XZ":
+        return [u, 0.0, v]
+    if plane == "YZ":
+        return [0.0, width - u, v]
+    return [u, v, 0.0]
+
+
+def _profile_extrude_axis(plane: str) -> str:
+    if plane == "XY":
+        return "Z"
+    if plane == "XZ":
+        return "Y"
+    if plane == "YZ":
+        return "X"
+    return "UNKNOWN"
+
+
+def _profile_extrude_vector_template(plane: str) -> str:
+    if plane == "XY":
+        return "App.Vector(0, 0, length_z)"
+    if plane == "XZ":
+        return "App.Vector(0, length_y, 0)"
+    if plane == "YZ":
+        return "App.Vector(length_x, 0, 0)"
+    return "App.Vector(dx, dy, dz)"
 
 
 def _approximated_curve_summaries(outlines: List[Any]) -> List[Dict[str, Any]]:

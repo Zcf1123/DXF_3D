@@ -86,6 +86,7 @@ class LLMPlanner:
         self.config: Dict[str, Any] = {}
         self.client = None
         self.model: str = "(none)"
+        self.api_mode: str = "chat"
         self.disabled_reason: Optional[str] = None
 
         env_disabled = os.environ.get("DXF_3D_DISABLE_LLM", "").strip().lower()
@@ -102,6 +103,8 @@ class LLMPlanner:
         except Exception as exc:
             self.disabled_reason = f"config load failed: {exc}"
             return
+
+        self.config = _resolve_config_profile(self.config)
 
         api_key = self.config.get("api_key") or self.config.get("openai_api_key")
         if not api_key:
@@ -125,10 +128,49 @@ class LLMPlanner:
             return
 
         self.model = self.config.get("model") or self.config.get("openai_model", "(unknown)")
+        self.api_mode = _resolve_api_mode(self.config, bool(base_url))
 
     @property
     def enabled(self) -> bool:
         return self.client is not None
+
+    def complete_text(self, messages: List[Dict[str, str]],
+                      max_tokens: Optional[int] = None,
+                      timeout: Optional[int] = None) -> str:
+        if self.api_mode == "responses":
+            instructions = "\n\n".join(
+                msg.get("content", "") for msg in messages
+                if msg.get("role") == "system"
+            ).strip()
+            input_messages = [
+                {"role": msg.get("role", "user"), "content": msg.get("content", "")}
+                for msg in messages
+                if msg.get("role") != "system"
+            ]
+            kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "input": input_messages,
+            }
+            if instructions:
+                kwargs["instructions"] = instructions
+            if max_tokens is not None:
+                kwargs["max_output_tokens"] = max_tokens
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            resp = self.client.responses.create(**kwargs)
+            return (getattr(resp, "output_text", "") or "").strip()
+
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.0,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = self.client.chat.completions.create(**kwargs)
+        return (resp.choices[0].message.content or "").strip()
 
     def refine_features(self, view_bboxes: Dict[str, Any],
                         draft_features: List[Dict[str, Any]],
@@ -169,12 +211,7 @@ class LLMPlanner:
         messages.append({"role": "user", "content": user_msg})
 
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.0,
-            )
-            content = (resp.choices[0].message.content or "").strip()
+            content = self.complete_text(messages)
         except Exception as exc:
             return None, f"LLM 请求失败：{exc}"
 
@@ -233,12 +270,7 @@ class LLMPlanner:
         messages.append({"role": "user", "content": user_msg})
 
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.0,
-            )
-            content = (resp.choices[0].message.content or "").strip()
+            content = self.complete_text(messages)
         except Exception as exc:
             return None, f"LLM 请求失败：{exc}"
 
@@ -255,6 +287,35 @@ class LLMPlanner:
         if not ok:
             return None, f"LLM 视图复核未通过程序校验：{reason}"
         return data, f"LLM 视图语义复核完成（{self.model}）"
+
+
+def _resolve_config_profile(config: Dict[str, Any]) -> Dict[str, Any]:
+    profiles = config.get("profiles")
+    if not isinstance(profiles, dict):
+        return config
+
+    active = config.get("active") or config.get("active_profile")
+    if not active:
+        raise ValueError("config has profiles but no active profile")
+    profile = profiles.get(active)
+    if not isinstance(profile, dict):
+        raise ValueError(f"active profile not found: {active}")
+
+    merged = {
+        key: value for key, value in config.items()
+        if key not in {"profiles", "active", "active_profile"}
+    }
+    merged.update(profile)
+    return merged
+
+
+def _resolve_api_mode(config: Dict[str, Any], has_base_url: bool) -> str:
+    mode = str(config.get("api_mode") or config.get("api_type") or "").strip().lower()
+    if mode in {"responses", "response"}:
+        return "responses"
+    if mode in {"chat", "chat_completions", "chat.completions"}:
+        return "chat"
+    return "chat" if has_base_url else "responses"
 
 
 def _load_part_knowledge_for_refiner() -> str:

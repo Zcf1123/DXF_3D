@@ -5,6 +5,7 @@
 硬性规则：
 
 - 只输出一份完整 Python 脚本，不要解释，不要 Markdown 正文。
+- 如果必须写少量代码注释或字符串说明，必须使用中文；不要输出英文推理说明。
 - 输出必须是短脚本：不要在代码注释中写工程图推理过程，不要长篇解释坐标换算，避免脚本尾部被截断；推理只应体现在建模参数和代码结构中。
 - 除必要的函数名/变量名外，尽量少写注释；优先输出可执行建模代码。
 - 允许使用 `import FreeCAD as App`、`import Part`、`import math`。不要使用 GUI、外部网络、文件删除、shell、`subprocess`、`os.system`、`eval`、`exec`。
@@ -18,13 +19,19 @@
 - `Part.makeSphere` / `Part.makeBox` / `Part.makeCylinder` 返回的就是 Shape/Solid，不要再访问 `.Shape`。
 - 建模应使用 FreeCAD/Part 的实体布尔、拉伸、圆柱、盒体、线框轮廓等稳定 API。
 - 不存在 `Part.Extrude` 这个 API；拉伸轮廓必须先构造 `Part.Face(...)`，再调用 `face.extrude(App.Vector(dx, dy, dz))`。
+- 不要对 Wire 直接调用 `.extrude(...)`；`wire.extrude(...)` 常得到 Shell，不是实体。闭合线框必须先 `face = Part.Face(wire)`，再 `solid = face.extrude(...)`。
+- 不要给 Shape/Solid 对象设置 `.Label`；Label 只属于文档对象，建模脚本无需设置。
+- 如果使用 `Part.makePolygon(points)` 构造闭合轮廓，`points` 末尾必须追加第一个点，例如 `Part.makePolygon(points + [points[0]])`；否则不要用它构造面。
 - `Part.makeCylinder(radius, height, base, direction)` 的方向参数必须显式传入；沿 Y 方向拉伸圆筒/孔时使用 `App.Vector(0, 1, 0)`。
 - 不要写 `Part.makeCylinder(radius, height, App.Vector(0, 1, 0), 360)`；这是错误签名。正确写法是 `Part.makeCylinder(radius, height, base_point, App.Vector(0, 1, 0))`。
 - 不要调用 `Part.setMeasurePrecision`；FreeCAD 的 `Part` 模块没有这个 API。
 - 访问 `App.Vector` 分量时使用小写 `.x/.y/.z`，不要使用 `.X/.Y/.Z`。
 - 不要调用 `Part.fuse([...])`；应使用 `shape1.fuse(shape2)` 逐个融合。
 - 构造 `Part.Arc(p1, p2, p3)` 前必须确认三点不共线；如果无法确认，使用直线段或圆柱/盒体组合近似，避免 `Three points are collinear`。
+- 不要在脚本里保留“错误写法 + 修正写法”的重复代码；如果修正过某段代码，只输出最终正确版本。
 - 坐标系固定：FRONT 为 XZ，TOP 为 XY，LEFT 为 YZ。Z 是高度方向。
+- 建模坐标必须优先使用 `projected_views` 中已经归一化到 0-origin 的尺寸、bbox、圆心和半径；`views` 中的原始 DXF 图纸坐标只用于理解视图位置，不能直接作为实体坐标。
+- 从 `visible_closed_outlines[*].edges` 构造轮廓时，必须按该视图的 `plane` 和 `point_to_world` 映射二维点：TOP/XY 的 `[u,v]` 是 `(X,Y)`，FRONT/XZ 的 `[u,v]` 是 `(X,Z)`，LEFT/YZ 的 `[u,v]` 要按 `point_to_world` 中的公式映射到世界 YZ 平面。不要把 LEFT 点写成 `App.Vector(u, v, 0)` 或 `App.Vector(0, u, v)`，应使用 `App.Vector(0, view_width - u, v)` 这一方向，以匹配 LEFT 视图投影。
 - 虚线、HID、HIDDEN 图元不是外轮廓，只能作为孔、盲孔、贯穿关系、被遮挡边界的证据。
 - 坐标轴、中心线、轴线、辅助线、投影线、参考线、标注线不是模型几何，绝不能拉伸成实体，也不能作为圆柱、板、孔或槽的边界。
 - 上下文中的 `excluded_auxiliary_entity_count` 表示已经被过滤掉的辅助实体数量；这些实体只用于说明图纸清理情况，不参与建模。
@@ -37,8 +44,16 @@
 - LEFT 决定 YZ 尺寸和高度关系，并校验 TOP/FRONT 推断。
 - 圆筒、圆耳、长圆孔端耳、连杆、板臂等零件应按工程语义拆成合理实体再 fuse/cut。
 - 当图纸显示多个局部厚度时，应分别建模局部实体，再融合成整体。
+- 当某个侧向视图给出 6 条或更多正交边组成的退让/阶梯闭合轮廓时，必须使用该轮廓的 `edges` 作为真实外形约束；不要只按 bbox 建整块，也不要把多个同 footprint 的盒体沿高度堆叠。
+- 当上下文提供 `extrusion_profile_hints` 时，优先使用其中的 `profile_points_world` 直接构造闭合 Wire 和 Face，再按 `extrude_vector_template` 沿指定轴拉伸成实体；这比手工猜多个盒体更可靠。
+- 对阶梯、台阶、L 形或退让式实体，优先把最能表达退让形状的闭合轮廓拉伸成棱柱；例如 LEFT 为 YZ 阶梯轮廓时，沿 X 方向拉伸，X 宽度取 FRONT/TOP。
+- 使用 LEFT/YZ 阶梯轮廓时，二维边点 `[u,z]` 必须生成在世界 YZ 平面：`App.Vector(0, left_width - u, z)`；拉伸向量必须是 `App.Vector(width_x, 0, 0)`。
+- 若用多个盒体组合表达阶梯，每个盒体的 X/Y/Z 范围必须体现退让：高一级的块体 footprint 应比低一级更小或在对应方向后退，不能三块都覆盖完整 bbox。
 - 当上下文 `intent_mode.enabled=true` 时，必须结合 `model_intent` 和 `part_knowledge` 判断零件族、组件关系、孔槽贯穿方向和可容忍的视图漏画；不要忽略用户意图。
 - `part_knowledge` 只用于辅助理解，不是几何本身；所有尺寸、位置、半径、深度仍必须来自三视图摘要。
+- 当上下文提供 `regular_polygon_hints` 时，优先使用其中的 `recommended_vertices_2d`、中心、外接半径和内切半径建模；不要把同一视图里的参考圆半径误当成多边形外接半径。
+- 贯穿孔必须优先使用上下文 `hole_hints`。切孔圆柱必须完全穿过实体：沿 Z 时 `base.z < solid_z_min` 且 `base.z + height > solid_z_max`；沿 Y/X 同理。只写 `height > 实体高度` 不够，因为如果 base 是负数，`base + height` 仍可能没有超过实体上表面。
+- TOP 圆通常表示沿 Z 的贯穿孔；推荐写法是 `Part.makeCylinder(radius, solid_height + 2 * margin, App.Vector(cx, cy, -margin), App.Vector(0, 0, 1))`，不要写成 `base.z=-5, height=10` 这类不能保证穿过 `z_max` 的固定数值。
 - 若上下文中出现 `approximated_curves`，说明 DXF 原始圆/圆弧已被很多短 LINE 打散；建模时应优先使用这些拟合后的圆、圆筒、圆孔或长圆孔摘要，而不是逐条短线段重建。
 - `Part.makeCircle(...)` 返回的是边，不是线框；如果要生成面，必须写 `Part.Face(Part.Wire([circle_edge]))`，不要写 `Part.Face(circle_edge)`。
 
@@ -60,14 +75,16 @@ FCSTD_PATH = "{{ fcstd_path }}"
 输出要求：
 
 - 只输出 Python 脚本。
+- 如需保留少量注释，注释必须使用中文。
 - 不要输出推理过程或长注释，脚本应尽量控制在 250 行以内。
 - 最终必须有名为 `Result` 的对象。
 - 末尾必须 `doc.recompute()` 并 `doc.saveAs(FCSTD_PATH)`。
 - 推荐使用 `result = doc.addObject("Part::Feature", "Result")`，然后 `result.Shape = final_shape`。
 - 拉伸闭合轮廓时使用 `face.extrude(App.Vector(...))`，禁止使用 `Part.Extrude(...)`。
-- 如果需要构造曲线轮廓，优先使用上下文中的 `projected_views[*].approximated_curves`，再参考 `visible_closed_outlines` 的 bbox。
+- 如果需要构造曲线或折线轮廓，优先使用上下文中的 `projected_views[*].approximated_curves` 和 `visible_closed_outlines[*].edges`，再参考 bbox。
 - 如果 `intent_mode.enabled=true`，先根据 `model_intent` 和 `part_knowledge` 选择合理的零件建模策略，再用三视图摘要确定具体几何。
-- 如果需要开孔，使用 cut，并保证孔方向、半径、槽长和位置与三视图一致。
+- 如果 intent/part_knowledge 指出某些圆只是参考圆、倒角参考或构造语义，不要把它们建成主体实体。
+- 如果需要开孔，优先使用 `hole_hints` 的 axis/radius/base_world/height，使用 cut，并保证孔方向、半径、槽长和位置与三视图一致。
 
 ## OUTPUT
 
