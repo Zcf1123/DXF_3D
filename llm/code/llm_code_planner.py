@@ -9,10 +9,10 @@ import re
 import signal
 from typing import Any, Dict, List, Optional, Tuple
 
-from ...direct.code.dxf_loader import DxfEntity
-from ...direct.code.geometry_estimator import extract_closed_outlines_and_circles
+from ...dxf_loader import DxfEntity
+from ...geometry_estimator import extract_closed_outlines_and_circles
 from ...direct.code.llm_planner import Prompt, _SECTION_RE, _load_part_knowledge_for_refiner, _render
-from ...direct.code.view_classifier import ViewBundle
+from ...view_classifier import ViewBundle
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +65,7 @@ _INVALID_FREECAD_CALLS = {
     "Part.cut": "FreeCAD Part has no Part.cut module function; call shape.cut(other_shape) instead",
     "Part.common": "FreeCAD Part has no Part.common module function; call shape.common(other_shape) instead",
     "doc.close": "FreeCAD document objects have no close() method; remove doc.close() after saveAs",
+    "doc.Name": "FreeCAD document Name is read-only; pass the name to App.newDocument(...) instead",
 }
 _REQUEST_TIMEOUT_SECONDS = 180
 _MAX_SCRIPT_TOKENS = 9000
@@ -239,6 +240,7 @@ def strip_code_fence(text: str) -> str:
 def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
     script = re.sub(r"(?m)^\s*doc\.close\(\)\s*\n?", "", script)
+    script = re.sub(r"(?m)^\s*doc\.Name\s*=\s*[^\n]*\n?", "", script)
     script = re.sub(r"\.(X|Y|Z)\b", lambda m: "." + m.group(1).lower(), script)
     if "Part.Arc(" in script or "Part.Line(" in script or ".Edge" in script:
         script = script.replace("Part.Arc(", "_safe_arc(")

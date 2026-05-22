@@ -268,7 +268,7 @@ def process_dxf(dxf_path: str, llm,
 
         # 1. Parse
         banner("阶段 1 ─ 解析 DXF 实体")
-        from .dxf_loader import load_dxf
+        from ...dxf_loader import load_dxf
         entities, meta = load_dxf(dxf_path)
         log.info("解析后端      : %s", meta.get("backend"))
         log.info("整体 bbox     : %s", meta.get("bbox"))
@@ -287,7 +287,7 @@ def process_dxf(dxf_path: str, llm,
 
         # 2. Views
         banner("阶段 2 ─ 三视图分类")
-        from .view_classifier import classify_views
+        from ...view_classifier import classify_views
         bundles = classify_views(entities)
         single_view_mode = single_view_extrude_depth is not None and len(bundles) == 1
         if single_view_mode:
@@ -340,7 +340,7 @@ def process_dxf(dxf_path: str, llm,
 
         # 3. Project + features (draft)
         banner("阶段 3 ─ 投影并推断特征草案")
-        from .projection_mapper import map_views_to_3d
+        from ...projection_mapper import map_views_to_3d
         from .feature_inference import infer_features
         projected = map_views_to_3d(bundles)
         for name, pv in projected.items():
@@ -348,7 +348,7 @@ def process_dxf(dxf_path: str, llm,
                      name, pv.plane, pv.width, pv.height, len(pv.entities))
         draft = infer_features(projected, bundles, single_view_extrude_depth, model_intent)
         # Log dimension-source breakdown for W/D/H
-        from .geometry_estimator import _dim_measurements_by_axis
+        from ...geometry_estimator import _dim_measurements_by_axis
         dim_info = _dim_measurements_by_axis(bundles)
         for axis in ("W", "D", "H"):
             vals = dim_info[axis]
@@ -645,7 +645,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
             log.info("LLM 理解      : %s", _intent_understanding_description(model_intent))
 
         banner("阶段 1 ─ 解析 DXF 实体")
-        from .dxf_loader import load_dxf
+        from ...dxf_loader import load_dxf
         entities, meta = load_dxf(dxf_path)
         log.info("解析后端      : %s", meta.get("backend"))
         log.info("整体 bbox     : %s", meta.get("bbox"))
@@ -663,7 +663,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         log.info("已写出        : entities.json")
 
         banner("阶段 2 ─ 三视图分类")
-        from .view_classifier import classify_views
+        from ...view_classifier import classify_views
         bundles = classify_views(entities)
         for b in bundles:
             log.info("视图 %-18s bbox=(%.3f, %.3f) — (%.3f, %.3f)  实体数=%d",
@@ -694,7 +694,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         log.info("已写出        : views.json")
 
         banner("阶段 3 ─ 投影并生成 Auto 上下文")
-        from .projection_mapper import map_views_to_3d
+        from ...projection_mapper import map_views_to_3d
         from ...llm.code.llm_code_planner import build_auto_context, generate_freecad_script
         projected = map_views_to_3d(bundles)
         for name, pv in projected.items():

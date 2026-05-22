@@ -24,13 +24,13 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .dxf_loader import DxfEntity
-from .projection_mapper import ProjectedView
-from .geometry_estimator import (
+from ...dxf_loader import DxfEntity
+from ...projection_mapper import ProjectedView
+from ...geometry_estimator import (
     Outline, extract_outline_and_holes, extract_closed_outlines_and_circles,
     estimate_part_size,
 )
-from .view_classifier import ViewBundle
+from ...view_classifier import ViewBundle
 
 
 @dataclass

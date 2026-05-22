@@ -14,9 +14,9 @@ import os
 import textwrap
 from typing import Any, Dict, List, Optional
 
-from .dxf_loader import DxfEntity
+from ...dxf_loader import DxfEntity
 from .feature_inference import Feature, _is_hidden_entity
-from .view_classifier import ViewBundle
+from ...view_classifier import ViewBundle
 
 
 # ---------------------------------------------------------------------------
