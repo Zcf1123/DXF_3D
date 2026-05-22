@@ -42,7 +42,7 @@ import traceback
 from typing import Any, Dict, List, Optional
 
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DXF_FILES_DIR = os.path.join(HERE, "dxf_files")
 OUTPUTS_DIR = os.path.join(HERE, "outputs")
 
@@ -692,7 +692,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
 
         banner("阶段 3 ─ 投影并生成 Auto 上下文")
         from .projection_mapper import map_views_to_3d
-        from .llm_code_planner import build_auto_context, generate_freecad_script
+        from ...llm.code.llm_code_planner import build_auto_context, generate_freecad_script
         projected = map_views_to_3d(bundles)
         for name, pv in projected.items():
             log.info("投影 %-6s -> 平面 %s, 尺寸 %.3f × %.3f, 实体数=%d",

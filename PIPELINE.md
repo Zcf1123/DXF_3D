@@ -3,17 +3,22 @@
 ```
 .dxf 文件
   │
-  ▼ 阶段 1   dxf_loader          → entities.json
-  ▼ 阶段 2   view_classifier     → views_algorithm.json
-  ▼ 阶段 2.5 LLM.review_views   → views_semantic.json        ← 启用 LLM 时执行
+  ▼ 阶段 1   direct/code/dxf_loader          → entities.json
+  ▼ 阶段 2   direct/code/view_classifier     → views_algorithm.json
+  ▼ 阶段 2.5 direct/code/llm_planner.review_views → views_semantic.json  ← 启用 LLM 时执行
   │           ↓ _apply_view_review（删除辅助线、重命名视图）
-  ▼ 阶段 3   projection_mapper
-             + feature_inference  → features_draft.json
-  ▼ 阶段 4   LLM.refine_features → features.json             ← 启用 LLM 时执行
-  ▼ 阶段 5   freecad_builder     → .FCStd
-  ▼ 阶段 6   exporters           → .step / .obj / .png / _overview.png
+  ▼ 阶段 3   direct/code/projection_mapper
+             + direct/code/feature_inference  → features_draft.json
+  ▼ 阶段 4   direct/code/llm_planner.refine_features → features.json      ← 启用 LLM 时执行
+  ▼ 阶段 5   direct/code/freecad_builder     → .FCStd
+  ▼ 阶段 6   direct/code/exporters           → .step / .obj / .png / _overview.png
                                     model.json / generated_model.py / run.log
 ```
+
+`--auto` 路线复用阶段 1-3 的解析、分类和投影，但不生成 `Feature` 后交给
+`freecad_builder` 解释；它会把紧凑的 `auto_context.json` 交给
+`llm/code/llm_code_planner.py`，由 LLM 直接生成 `generated_model.py`，执行后再复用
+`direct/code/exporters.py` 导出 STEP / OBJ / PNG / model.json。
 
 每次运行在 `outputs/` 下创建一个独立子目录：
 
@@ -25,7 +30,8 @@ outputs/<YYYYMMDD>_<HHMMSS>_<文件名>/
 
 ## 阶段 0 — 启动准备
 
-`main()` 完成以下初始化：
+根入口 `run.py` 只转发到 `direct/code/run.py` 的 `main()`；实际初始化由
+`direct/code/run.py` 完成：
 
 1. 读取 `config.json`，实例化 `LLMPlanner`。  
    若 `openai_api_key` 为空或文件不存在，LLM 标记为 `disabled`，流水线退化为纯算法模式。
@@ -34,7 +40,7 @@ outputs/<YYYYMMDD>_<HHMMSS>_<文件名>/
 
 ---
 
-## 阶段 1 — DXF 解析（`dxf_loader.py`）
+## 阶段 1 — DXF 解析（`direct/code/dxf_loader.py`）
 
 **输入：** `.dxf` 文本文件
 
@@ -76,7 +82,7 @@ outputs/<YYYYMMDD>_<HHMMSS>_<文件名>/
 
 ---
 
-## 阶段 2 — 三视图分类（`view_classifier.py`）
+## 阶段 2 — 三视图分类（`direct/code/view_classifier.py`）
 
 **输入：** `List[DxfEntity]`
 
@@ -117,7 +123,7 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 
 ---
 
-## 阶段 2.5 — 视图语义复核（`llm_planner.py`，可选）
+## 阶段 2.5 — 视图语义复核（`direct/code/llm_planner.py`，可选）
 
 **输入：** 每个视图实体的语义摘要（kind / linetype / bbox，不发送完整坐标）
 
@@ -140,7 +146,7 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 
 ## 阶段 3 — 投影与特征推断
 
-### 3a — 坐标投影（`projection_mapper.py`）
+### 3a — 坐标投影（`direct/code/projection_mapper.py`）
 
 把每个 bundle 的 2D 实体平移（减去 bbox 左下角偏移），归一化到以下坐标系：
 
@@ -150,13 +156,13 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 | top | XY | X | Y |
 | left | YZ | Y | Z |
 
-### 3b — 零件尺寸估算（`geometry_estimator.py`）
+### 3b — 零件尺寸估算（`direct/code/geometry_estimator.py`）
 
 1. 从各视图的 `DIMENSION` 标注里提取线性标注（`dim_type & 0x0F == 0`）。
 2. 按旋转角判断标注方向（水平/垂直），映射到 W（宽，沿 X）/ D（深，沿 Y）/ H（高，沿 Z）轴，取各轴最大值。
 3. 没有标注的轴用视图 bbox 均值兜底。
 
-### 3c — 特征推断（`feature_inference.py`）
+### 3c — 特征推断（`direct/code/feature_inference.py`）
 
 按以下顺序处理：
 
@@ -219,7 +225,7 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 
 ---
 
-## 阶段 4 — LLM 特征精化（`llm_planner.py`，可选）
+## 阶段 4 — LLM 特征精化（`direct/code/llm_planner.py`，可选）
 
 **输入：** `view_bboxes` + `features_draft`
 
@@ -243,7 +249,7 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 
 ---
 
-## 阶段 5 — FreeCAD 建模（`freecad_builder.py`）
+## 阶段 5 — FreeCAD 建模（`direct/code/freecad_builder.py`）
 
 > 需要在 `freecadcmd` 环境下运行，普通 `python3` 无法导入 `FreeCAD / Part / Mesh`。
 
@@ -277,7 +283,7 @@ FreeCAD 文档中包含以下对象：
 
 ---
 
-## 阶段 6 — 导出附加产物（`exporters.py`）
+## 阶段 6 — 导出附加产物（`direct/code/exporters.py`）
 
 每项导出单独 try-except，失败只写 warning，不影响整体 Status：
 

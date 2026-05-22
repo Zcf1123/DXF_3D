@@ -1,15 +1,9 @@
 # Direct Route
 
-This folder is a snapshot of the current deterministic DXF-to-FreeCAD route.
-The active runtime files remain in the repository root so existing commands keep working.
+This folder contains the current deterministic DXF-to-FreeCAD route.
+The repository root keeps only the public entry script; runtime code lives here.
 
 Run from the repository root:
-
-```bash
-./direct/run_direct.sh dxf_files/00005340.dxf
-```
-
-Equivalent root command:
 
 ```bash
 ./run.sh -d dxf_files/00005340.dxf
@@ -17,7 +11,7 @@ Equivalent root command:
 
 Contents:
 
-- `code/`: current parser, classifier, projection, feature inference, FreeCAD builder, exporters, and runner snapshots.
+- `code/`: parser, classifier, projection, feature inference, FreeCAD builder, exporters, and route runner.
 - `prompts/`: prompts used by the current controlled route.
 
 Design boundary:

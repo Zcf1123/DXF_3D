@@ -9,19 +9,12 @@ DXF -> three-view JSON/images -> LLM writes FreeCAD Python -> execute/export
 Run from the repository root:
 
 ```bash
-./llm/run_llm.sh dxf_files/00005340.dxf
-```
-
-Equivalent root command:
-
-```bash
 ./run.sh -d --auto dxf_files/00005340.dxf
 ```
 
 Contents:
 
-- `code/llm_code_planner.py`: direct LLM script generation helper snapshot.
-- `code/run.py`: root runner snapshot containing the `--auto` branch.
+- `code/llm_code_planner.py`: direct LLM script generation helper used by `direct/code/run.py` when `--auto` is set.
 - `prompts/freecad_script_generator.md`: direct FreeCAD script generation prompt.
 
 Design boundary:

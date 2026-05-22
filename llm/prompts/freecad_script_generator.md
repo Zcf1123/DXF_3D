@@ -17,6 +17,8 @@
 - `Part.makeCylinder(radius, height, base, direction)` 的方向参数必须显式传入；沿 Y 方向拉伸圆筒/孔时使用 `App.Vector(0, 1, 0)`。
 - 不要写 `Part.makeCylinder(radius, height, App.Vector(0, 1, 0), 360)`；这是错误签名。正确写法是 `Part.makeCylinder(radius, height, base_point, App.Vector(0, 1, 0))`。
 - 不要调用 `Part.setMeasurePrecision`；FreeCAD 的 `Part` 模块没有这个 API。
+- 访问 `App.Vector` 分量时使用小写 `.x/.y/.z`，不要使用 `.X/.Y/.Z`。
+- 不要调用 `Part.fuse([...])`；应使用 `shape1.fuse(shape2)` 逐个融合。
 - 坐标系固定：FRONT 为 XZ，TOP 为 XY，LEFT 为 YZ。Z 是高度方向。
 - 虚线、HID、HIDDEN 图元不是外轮廓，只能作为孔、盲孔、贯穿关系、被遮挡边界的证据。
 - 优先让模型的 FRONT/TOP/LEFT 正投影贴合输入视图；不要为了代码简单把不同厚度的构件做成同一厚度。

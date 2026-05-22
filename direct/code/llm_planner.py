@@ -19,11 +19,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROMPTS_DIR = os.path.join(HERE, "prompts")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+PROMPTS_DIR = os.path.join(PROJECT_ROOT, "direct", "prompts")
+COMMON_PROMPTS_DIR = os.path.join(PROJECT_ROOT, "prompts", "common")
 
 
 # ---------------------------------------------------------------------------
-# Prompt loading (Markdown spec, see prompts/PROMPT_SPEC.md)
+# Prompt loading (Markdown spec, see direct/prompts/PROMPT_SPEC.md)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -256,6 +258,12 @@ class LLMPlanner:
 
 
 def _load_part_knowledge_for_refiner() -> str:
+    common_path = os.path.join(COMMON_PROMPTS_DIR, "part_knowledge.md")
+    try:
+        with open(common_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        pass
     try:
         prompt = load_prompt("part")
     except Exception:

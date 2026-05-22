@@ -9,10 +9,41 @@ import re
 import signal
 from typing import Any, Dict, List, Optional, Tuple
 
-from .dxf_loader import DxfEntity
-from .geometry_estimator import extract_closed_outlines_and_circles
-from .llm_planner import _load_part_knowledge_for_refiner, _render, load_prompt
-from .view_classifier import ViewBundle
+from ...direct.code.dxf_loader import DxfEntity
+from ...direct.code.geometry_estimator import extract_closed_outlines_and_circles
+from ...direct.code.llm_planner import Prompt, _SECTION_RE, _load_part_knowledge_for_refiner, _render
+from ...direct.code.view_classifier import ViewBundle
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROMPTS_DIR = os.path.join(os.path.dirname(HERE), "prompts")
+
+
+def load_prompt(name: str) -> Prompt:
+    path = os.path.join(PROMPTS_DIR, f"{name}.md")
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    sections: Dict[str, str] = {}
+    matches = list(_SECTION_RE.finditer(text))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections[m.group(1).strip()] = text[m.end():end].strip()
+
+    if "SYSTEM" not in sections or "USER" not in sections:
+        raise ValueError(f"Prompt {name}.md missing SYSTEM or USER section")
+
+    examples: List[Tuple[str, str]] = []
+    if "EXAMPLES" in sections:
+        for block in re.split(r"\n---\s*\n", sections["EXAMPLES"]):
+            if "--- output ---" in block:
+                inp, out = block.split("--- output ---", 1)
+                examples.append((inp.replace("--- input ---", "").strip(),
+                                 out.strip()))
+
+    return Prompt(system=sections["SYSTEM"],
+                  user_template=sections["USER"],
+                  examples=examples)
 
 
 _MAX_VISIBLE_ENTITIES_PER_VIEW = 0
@@ -31,6 +62,8 @@ _ALLOWED_IMPORT_ROOTS = {"FreeCAD", "Part", "math"}
 _INVALID_FREECAD_CALLS = {
     "Part.Extrude": "FreeCAD Part has no Part.Extrude; create a Part.Face and call face.extrude(App.Vector(...)) instead",
     "Part.setMeasurePrecision": "FreeCAD Part has no Part.setMeasurePrecision; remove this no-op line",
+    "Part.cut": "FreeCAD Part has no Part.cut module function; call shape.cut(other_shape) instead",
+    "Part.common": "FreeCAD Part has no Part.common module function; call shape.common(other_shape) instead",
 }
 _REQUEST_TIMEOUT_SECONDS = 180
 _MAX_SCRIPT_TOKENS = 9000
@@ -186,7 +219,30 @@ def strip_code_fence(text: str) -> str:
 
 def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
+    script = re.sub(r"\.(X|Y|Z)\b", lambda m: "." + m.group(1).lower(), script)
+    if "Part.fuse(" in script:
+        script = script.replace("Part.fuse(", "_fuse_all(")
+        script = _ensure_fuse_helper(script)
     return script.strip() + "\n"
+
+
+def _ensure_fuse_helper(script: str) -> str:
+    if "def _fuse_all(" in script:
+        return script
+    helper = (
+        "\n\ndef _fuse_all(shapes):\n"
+        "    shapes = [shape for shape in shapes if shape is not None]\n"
+        "    if not shapes:\n"
+        "        raise ValueError('no shapes to fuse')\n"
+        "    result = shapes[0]\n"
+        "    for shape in shapes[1:]:\n"
+        "        result = result.fuse(shape)\n"
+        "    return result\n"
+    )
+    insert_after = re.search(r"(?m)^(?:import .+\n)+", script)
+    if insert_after:
+        return script[:insert_after.end()] + helper + script[insert_after.end():]
+    return helper.lstrip() + "\n" + script
 
 
 def _fallback_freecad_script(context: Dict[str, Any], base_name: str, fcstd_path: str) -> str:

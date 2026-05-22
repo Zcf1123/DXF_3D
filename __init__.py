@@ -1,11 +1,11 @@
 """DXF three-view to 3D reconstruction package."""
 
-from .dxf_loader import load_dxf, DxfEntity
-from .view_classifier import classify_views, ViewBundle
-from .projection_mapper import map_views_to_3d
-from .feature_inference import infer_features, Feature
-from .freecad_builder import build_model
-from .llm_planner import LLMPlanner, load_prompt
+from .direct.code.dxf_loader import DxfEntity, load_dxf
+from .direct.code.feature_inference import Feature, infer_features
+from .direct.code.freecad_builder import build_model
+from .direct.code.llm_planner import LLMPlanner, load_prompt
+from .direct.code.projection_mapper import map_views_to_3d
+from .direct.code.view_classifier import ViewBundle, classify_views
 
 __all__ = [
     "load_dxf",
