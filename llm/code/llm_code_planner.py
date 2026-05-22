@@ -241,6 +241,19 @@ def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
     script = re.sub(r"(?m)^\s*doc\.close\(\)\s*\n?", "", script)
     script = re.sub(r"(?m)^\s*doc\.Name\s*=\s*[^\n]*\n?", "", script)
+    shape_vars = re.findall(
+        r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Part\.make(?:Sphere|Box|Cylinder|Cone|Torus)\(",
+        script,
+    )
+    for var_name in shape_vars:
+        script = re.sub(
+            rf"(?ms)^([ \t]*)if\s+{re.escape(var_name)}\.Shape\s+and\s+not\s+{re.escape(var_name)}\.Shape\.isEmpty:\s*\n"
+            rf"\1[ \t]+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*{re.escape(var_name)}\.Shape\s*\n"
+            rf"\1else:\s*\n\1[ \t]+(?:#.*\n\1[ \t]+)?\2\s*=\s*Part\.Solid\({re.escape(var_name)}\)\s*\n",
+            rf"\1\2 = {var_name}\n",
+            script,
+        )
+        script = re.sub(rf"\b{re.escape(var_name)}\.Shape\b", var_name, script)
     script = re.sub(r"\.(X|Y|Z)\b", lambda m: "." + m.group(1).lower(), script)
     if "Part.Arc(" in script or "Part.Line(" in script or ".Edge" in script:
         script = script.replace("Part.Arc(", "_safe_arc(")

@@ -14,6 +14,7 @@
 - 脚本中必须实际出现 `Result` 和 `doc.saveAs(FCSTD_PATH)`，否则会被程序拒绝。
 - 保存后不要调用 `doc.close()`；FreeCAD 文档对象没有这个方法。需要关闭文档时应由外部流程处理。
 - 不要给 `doc.Name` 赋值；这是只读属性。如需文档名，请使用 `App.newDocument(BASE_NAME)`。
+- `Part.makeSphere` / `Part.makeBox` / `Part.makeCylinder` 返回的就是 Shape/Solid，不要再访问 `.Shape`。
 - 建模应使用 FreeCAD/Part 的实体布尔、拉伸、圆柱、盒体、线框轮廓等稳定 API。
 - 不存在 `Part.Extrude` 这个 API；拉伸轮廓必须先构造 `Part.Face(...)`，再调用 `face.extrude(App.Vector(dx, dy, dz))`。
 - `Part.makeCylinder(radius, height, base, direction)` 的方向参数必须显式传入；沿 Y 方向拉伸圆筒/孔时使用 `App.Vector(0, 1, 0)`。

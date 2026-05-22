@@ -28,8 +28,8 @@ def export_step(fcstd_path: str, step_path: str) -> str:
     import Part  # type: ignore
     doc = App.openDocument(fcstd_path)
     try:
-        shape = _result_shape(doc)
-        Part.export([shape], step_path)
+        result = _result_object(doc)
+        Part.export([result], step_path)
     finally:
         App.closeDocument(doc.Name)
     return step_path
@@ -53,13 +53,20 @@ def export_obj(fcstd_path: str, obj_path: str,
 
 
 def _result_shape(doc):
-    result = doc.getObject("Result")
+    result = _result_object(doc)
     shape = getattr(result, "Shape", None)
     if shape is None or shape.isNull():
         raise RuntimeError("Result solid not found in FCStd")
     if not shape.Solids:
         raise RuntimeError("Result object has no solid geometry")
     return shape
+
+
+def _result_object(doc):
+    result = doc.getObject("Result")
+    if result is None:
+        raise RuntimeError("Result object not found in FCStd")
+    return result
 
 
 def _wrap_mesh_object(doc, mesh):

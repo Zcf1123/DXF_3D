@@ -618,7 +618,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
     the FreeCAD modeling script directly instead of emitting Feature objects.
     """
     source_base = os.path.splitext(os.path.basename(dxf_path))[0]
-    base = f"A{source_base}"
+    base = source_base
     run_dir = _make_run_dir(source_base, prefix="A")
     log = _make_logger(run_dir)
     summary: Dict[str, Any] = {
@@ -674,17 +674,6 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
             json.dump([b.to_dict() for b in bundles],
                       f, indent=2, ensure_ascii=False)
 
-        banner("阶段 2.5 ─ 工程图语义复核（LLM，可选）")
-        view_review_summary = _view_semantic_summary(bundles)
-        with open(os.path.join(run_dir, "views_semantic_input.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump(view_review_summary, f, indent=2, ensure_ascii=False)
-        with open(os.path.join(run_dir, "views_semantic.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump({"skipped": True,
-                       "reason": "auto mode sends compact projected geometry directly to the script generator"},
-                      f, indent=2, ensure_ascii=False)
-        log.info("视图语义复核  : Auto 模式跳过，沿用算法分类结果")
         view_bboxes = {b.name: list(b.bbox) for b in bundles
                        if not b.name.startswith("unknown_")}
         with open(os.path.join(run_dir, "views.json"), "w",
@@ -704,13 +693,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         with open(os.path.join(run_dir, "auto_context.json"), "w",
                   encoding="utf-8") as f:
             json.dump(auto_context, f, indent=2, ensure_ascii=False)
-        with open(os.path.join(run_dir, "features_draft.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump([], f, indent=2, ensure_ascii=False)
-        with open(os.path.join(run_dir, "features.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump([], f, indent=2, ensure_ascii=False)
-        log.info("已写出        : auto_context.json / features*.json")
+        log.info("已写出        : auto_context.json")
 
         banner("阶段 4 ─ LLM 直接生成 FreeCAD 脚本")
         fcstd_path = os.path.join(run_dir, f"{base}.FCStd")
@@ -727,6 +710,8 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         runpy.run_path(py_path, run_name="__main__")
         if not os.path.exists(fcstd_path):
             raise RuntimeError(f"LLM 脚本未生成 FCStd: {fcstd_path}")
+        from .freecad_builder import embed_projected_views
+        embed_projected_views(fcstd_path, projected)
         summary["fcstd"] = fcstd_path
         log.info("FCStd 文件    : %s", fcstd_path)
 

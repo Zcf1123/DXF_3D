@@ -42,6 +42,33 @@ def build_model(features: List[Feature], out_dir: str,
         return {"error": f"build failed: {exc}"}
 
 
+def embed_projected_views(fcstd_path: str, projected: Dict[str, Any]) -> None:
+    """Embed DXF_FRONT / DXF_TOP / DXF_LEFT into an existing FreeCAD file."""
+    import FreeCAD as App
+
+    doc = App.openDocument(fcstd_path)
+    try:
+        existing = {obj.Name for obj in doc.Objects}
+        if not any(name.startswith("DXF_") for name in existing):
+            _add_2d_views(doc, projected)
+            doc.recompute()
+            doc.saveAs(fcstd_path)
+            _remove_freecad_backups(fcstd_path)
+    finally:
+        App.closeDocument(doc.Name)
+
+
+def _remove_freecad_backups(fcstd_path: str) -> None:
+    directory = os.path.dirname(fcstd_path)
+    base = os.path.splitext(os.path.basename(fcstd_path))[0]
+    for name in os.listdir(directory):
+        if name.startswith(base + ".") and name.endswith(".FCBak"):
+            try:
+                os.remove(os.path.join(directory, name))
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 
 def _direct_build(features: List[Feature], out_dir: str,

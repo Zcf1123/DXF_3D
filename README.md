@@ -6,7 +6,8 @@
 
 代码按建模路线分区：`direct/` 是当前稳定的确定性特征路线，`llm/` 是原始目标的
 “三视图 JSON/图片摘要 -> LLM 写 FreeCAD 脚本”路线，`prompts/` 存放两条路线共用的
-工程图约定和零件语义。根目录只保留启动入口、部署文件、输入输出目录和文档。
+工程图约定和零件语义。根目录保留启动入口、部署文件、输入输出目录、文档，以及
+两条路线共用的 DXF 解析、视图分类、投影和几何摘要模块。
 
 ---
 
@@ -227,7 +228,7 @@ DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
 
 普通 direct 路线输出到 `outputs/<YYYYMMDD>_<HHMMSS>_<base>/`。
 `--auto` 路线输出到 `outputs/A_<YYYYMMDD>_<HHMMSS>_<source_base>/`，目录名前缀
-`A_` 用于和 direct 结果区分；目录内文件基名仍为 `A<source_base>`。
+`A_` 用于和 direct 结果区分；目录内文件基名保持原始 `<source_base>`，不会加 `A`。
 
 | 文件                       | 说明 |
 | -------------------------- | ---- |
@@ -240,11 +241,12 @@ DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
 | `<base>_overview.png`      | 3D 等轴侧快速总览 PNG；用于粗略预览，复杂切除件的准确性以 `.FCStd` / `.step` / `<base>_model_views.png` 为准 |
 | `entities.json`            | DXF 解析后的实体 + 元数据 |
 | `views_algorithm.json`     | 纯算法阶段的原始视图归类结果 |
-| `views_semantic_input.json` | 提交给 LLM 视图语义复核的结构化输入摘要 |
-| `views_semantic.json`      | LLM 对视图命名、保留/删除实体的复核结果 |
+| `views_semantic_input.json` | direct 路线：提交给 LLM 视图语义复核的结构化输入摘要 |
+| `views_semantic.json`      | direct 路线：LLM 对视图命名、保留/删除实体的复核结果 |
 | `views.json`               | 最终使用的视图归类结果；启用 LLM 且校验通过时为语义复核后的结果，否则为算法结果 |
-| `features_draft.json`      | LLM 介入**前**的特征草案 |
-| `features.json`            | LLM 介入**后**的最终特征（未启用 LLM 时与草案相同） |
+| `features_draft.json`      | direct 路线：LLM 介入**前**的特征草案 |
+| `features.json`            | direct 路线：LLM 介入**后**的最终特征（未启用 LLM 时与草案相同） |
+| `auto_context.json`        | auto 路线：送入 LLM 的紧凑三视图/投影几何上下文 |
 | `projection_validation.json` | 反投影验证报告：模型三视图与输入三视图的覆盖率、匹配率、bbox 差异和未覆盖线段 |
 | `model.json`               | FreeCAD 文档对象信息 |
 | `generated_model.py`       | 独立可重跑脚本：`freecadcmd generated_model.py` |
@@ -260,12 +262,12 @@ DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
 ## 六、流水线
 
 ```
-direct/code/dxf_loader → direct/code/view_classifier → direct/code/projection_mapper
+dxf_loader → view_classifier → projection_mapper
    → direct/code/feature_inference ↘ direct/code/llm_planner（可选）
    → direct/code/freecad_builder → direct/code/exporters
 
 --auto:
-direct/code/dxf_loader → direct/code/view_classifier → direct/code/projection_mapper
+dxf_loader → view_classifier → projection_mapper
    → llm/code/llm_code_planner → generated_model.py → direct/code/exporters
 ```
 
@@ -273,10 +275,10 @@ direct/code/dxf_loader → direct/code/view_classifier → direct/code/projectio
 | --- | --- |
 | `run.py` | 根入口 wrapper，供 `run.sh` / Docker 的 `DXF_3D.run.main` 调用 |
 | `direct/code/run.py` | 当前稳定路线的 CLI 编排器；未加 `--auto` 时执行确定性特征路线 |
-| `direct/code/dxf_loader.py` | 纯 Python DXF 解析，输出 `DxfEntity` 列表 + 元数据 |
-| `direct/code/view_classifier.py` | 按象限把实体分到 FRONT/TOP/LEFT 三个 `ViewBundle` |
-| `direct/code/projection_mapper.py` | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
-| `direct/code/geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
+| `dxf_loader.py` | 纯 Python DXF 解析，输出 `DxfEntity` 列表 + 元数据 |
+| `view_classifier.py` | 按象限把实体分到 FRONT/TOP/LEFT 三个 `ViewBundle` |
+| `projection_mapper.py` | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
+| `geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
 | `direct/code/feature_inference.py` | 推断拉伸轮廓、球体、同轴阶梯圆柱、圆孔/盲孔、异形贯穿孔、矩形/闭合轮廓切除和可确定的边倒角，输出 `Feature` 列表 |
 | `direct/code/llm_planner.py` | 读 `config.json` 调用 OpenAI 兼容 API，复核视图语义和特征草案 |
 | `direct/code/freecad_builder.py` | 按特征列表用 FreeCAD `Part` 建模并保存 `.FCStd` |
@@ -327,6 +329,10 @@ DXF_3D/
 ├── config.json               LLM 配置（API key / base_url / model）
 ├── run.sh                    Docker 启动脚本
 ├── run.py                    根入口 wrapper，转发到 direct/code/run.py
+├── dxf_loader.py             公共 DXF 解析器
+├── view_classifier.py        公共三视图分类
+├── projection_mapper.py      公共三视图投影映射
+├── geometry_estimator.py     公共轮廓/尺寸估计
 ├── dxf_files/                <—— 把要处理的 .dxf 放在这里
 ├── outputs/                  <—— 每次运行生成 <YYYYMMDD>_<HHMMSS>_<base>/
 ├── direct/
@@ -336,7 +342,9 @@ DXF_3D/
 │   ├── code/                 原始目标路线：LLM 生成 FreeCAD 脚本
 │   └── prompts/              llm 路线专用提示词
 ├── prompts/
-│   └── common/               两条路线共用的视图约定和零件语义
+│   ├── auto_modeling_strategy.md
+│   ├── part_knowledge.md
+│   └── view_conventions.md   两条路线共用的视图约定和零件语义
 └── PIPELINE.md               阶段级流水线说明
 ```
 
@@ -344,7 +352,7 @@ DXF_3D/
 
 ## 九、开发约定和禁区
 
-- 不引入外部 DXF 库；`direct/code/dxf_loader.py` 是纯 Python 解析器。
+- 不引入外部 DXF 库；`dxf_loader.py` 是纯 Python 解析器。
 - FreeCAD 相关导入保持在函数内部或生成脚本内，普通 Python 环境应能 import 业务模块。
 - LLM 失败不得中断稳定路线；direct 路线回退算法草案，auto 路线会校验、重试，必要时用 `auto_context` 生成保守兜底脚本。
 - 不要删除 `*D\d+` 匿名块过滤；DIMENSION 的箭头、引线、文字块会污染视图聚类和轮廓提取。
