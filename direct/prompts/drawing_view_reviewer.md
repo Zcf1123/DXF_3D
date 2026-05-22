@@ -1,4 +1,4 @@
-# Drawing View Reviewer Prompt
+# 三视图复核提示词
 
 用途：在算法完成 DXF 三视图分类之后、投影和 `features_draft.json` 生成之前，让 LLM
 作为机械工程图语义审查员，复核 FRONT / LEFT / TOP 命名是否正确，并给出应从

@@ -1,20 +1,20 @@
-# Direct Route
+# Direct 路线
 
-This folder contains the current deterministic DXF-to-FreeCAD route.
-The repository root keeps only the public entry script; runtime code lives here.
+本目录存放当前稳定的确定性 DXF 到 FreeCAD 建模路线。
+仓库根目录只保留公开入口脚本；运行时代码放在这里。
 
-Run from the repository root:
+从仓库根目录运行：
 
 ```bash
 ./run.sh -d dxf_files/00005340.dxf
 ```
 
-Contents:
+目录内容：
 
-- `code/`: parser, classifier, projection, feature inference, FreeCAD builder, exporters, and route runner.
-- `prompts/`: prompts used by the current controlled route.
+- `code/`：解析器、视图分类、投影、特征推断、FreeCAD builder、导出器和路线入口。
+- `prompts/`：当前受控路线使用的提示词。
 
-Design boundary:
+设计边界：
 
-- This route builds `features.json` first, then `freecad_builder.py` interprets those features with FreeCAD APIs.
-- It is stable fallback behavior, not the long-term place for every new part family rule.
+- 本路线先生成 `features.json`，再由 `freecad_builder.py` 用 FreeCAD API 解释这些特征。
+- 它是稳定兜底行为，不是长期堆放所有新零件族规则的地方。

@@ -15,35 +15,47 @@
 把要处理的 `.dxf` 放到 `DXF_3D/dxf_files/`，然后：
 
 ```bash
-# 跑 dxf_files/ 下所有 DXF
-./run.sh
+# 跑 dxf_files/ 下所有 DXF（开发挂载模式，推荐当前使用方式）
+./run.sh -d
 
 # 或指定文件（路径可在 DXF_3D 内或宿主机任意位置）
-./run.sh dxf_files/Drawing1.dxf
-./run.sh /path/to/some.dxf
+./run.sh -d dxf_files/xxx.dxf
+./run.sh -d dxf_files/Drawing1.dxf
+./run.sh -d /path/to/some.dxf
 
 # 单一俯视图：按给定长度沿 Z 方向直接拉伸
-./run.sh --extrude-depth 20 dxf_files/top_view_only.dxf
+./run.sh -d --extrude-depth 20 dxf_files/top_view_only.dxf
 
 # 跳过 LLM，走纯算法路径（复杂图纸调试时更快）
-./run.sh --no-llm dxf_files/Drawing1.dxf
+./run.sh -d --no-llm dxf_files/Drawing1.dxf
 
 # 给 LLM 受控建模意图，辅助理解隐藏线较多的复杂零件
-./run.sh --model-intent "先拉伸圆柱；侧面矩形孔贯穿切除；上端圆孔盲切" dxf_files/part.dxf
+./run.sh -d --model-intent "先拉伸圆柱；侧面矩形孔贯穿切除；上端圆孔盲切" dxf_files/part.dxf
 
 # 原始目标路线：直接让 LLM 根据三视图 JSON/摘要生成 FreeCAD 建模脚本
-./run.sh --auto dxf_files/Drawing1.dxf
+./run.sh -d --auto dxf_files/Drawing1.dxf
 ```
 
-镜像名可用环境变量 `DXF_3D_IMAGE` 覆盖（默认 `dxf-3d`）。
-开发调试时可加 `-d`，让容器挂载当前源码目录，避免每次改代码后重建镜像。
+镜像名可用环境变量 `DXF_3D_IMAGE` 覆盖（默认 `dxf-3d`）。本文所有示例默认使用
+`-d` 开发挂载模式，让容器挂载当前源码目录，避免每次改代码后重建镜像。
+
+### Auto 路线为什么会参考 direct
+
+`--auto` 会让 LLM 直接编写 FreeCAD Python。LLM 容易写出两类错误：一类是
+FreeCAD API 细节错误，例如把 `Part.makeCircle` 返回的边直接传给 `Part.Face`；另一类是
+工程语义错误，例如生成了 solid，但 FRONT/TOP/LEFT 反投影和原图不匹配。
+
+为减少这类错误，Auto 路线现在会先运行 direct 模式的确定性特征推断，把得到的
+`direct_reference.features` 写入 `auto_context.json`，要求 LLM 优先按这些实体、孔、切除、
+拉伸方向和尺寸生成脚本。如果 LLM 脚本执行失败、没有生成有效 `Result` solid，或反投影
+验证不是 `OK`，流水线会自动切换到 direct 参考脚本兜底，避免把错误模型当作成功结果。
 
 ### 单一俯视图拉伸
 
 如果 DXF 中只包含一个俯视图轮廓，可以在命令行提供拉伸长度：
 
 ```bash
-./run.sh --extrude-depth 20 dxf_files/top_view_only.dxf
+./run.sh -d --extrude-depth 20 dxf_files/top_view_only.dxf
 ```
 
 该模式只在识别到单一几何视图时触发，会把该视图固定按 TOP/XY 平面处理并沿 Z
@@ -74,7 +86,7 @@
 3. 按需修改 `config.json`（OpenAI 兼容协议的 API key / base_url / model），
    把 DXF 放进 `dxf_files/`，运行：
    ```bash
-   ./run.sh
+   ./run.sh -d
    ```
 
 ### 方案 B：导出镜像离线传输
@@ -93,7 +105,7 @@ docker save dxf-3d | gzip > dxf-3d.tar.gz
 ssh user@host "docker load < dxf-3d.tar.gz"
 # 在目标主机
 cd /path/to/DXF_3D
-./run.sh
+./run.sh -d
 ```
 
 > 提示：`run.sh` 通过卷挂载 `dxf_files/`、`outputs/`、`config.json`，
@@ -135,9 +147,9 @@ Status      : OK
 如果只想走确定性算法、跳过 LLM 复核以缩短复杂图纸的运行时间，可以使用：
 
 ```bash
-./run.sh --no-llm dxf_files/Drawing1.dxf
+./run.sh -d --no-llm dxf_files/Drawing1.dxf
 # 或
-DXF_3D_DISABLE_LLM=1 ./run.sh dxf_files/Drawing1.dxf
+DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
 ```
 
 如果复杂零件靠三视图隐藏线仍容易歧义，可以给 LLM 一段受控建模意图，帮助它把
@@ -145,7 +157,7 @@ DXF_3D_DISABLE_LLM=1 ./run.sh dxf_files/Drawing1.dxf
 特征精修，不能让 LLM 输出当前 builder 不支持的自由特征：
 
 ```bash
-./run.sh --model-intent "先拉伸一个圆柱；侧面矩形孔贯穿切除；上底面圆孔切除但不贯穿；中间再做一个不贯穿矩形切除" dxf_files/00996032.dxf
+./run.sh -d --model-intent "先拉伸一个圆柱；侧面矩形孔贯穿切除；上底面圆孔切除但不贯穿；中间再做一个不贯穿矩形切除" dxf_files/00996032.dxf
 ```
 
 ---

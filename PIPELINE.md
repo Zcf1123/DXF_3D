@@ -15,10 +15,11 @@
                                     model.json / generated_model.py / run.log
 ```
 
-`--auto` 路线复用阶段 1-3 的解析、分类和投影，但不生成 `Feature` 后交给
-`freecad_builder` 解释；它会把紧凑的 `auto_context.json` 交给
-`llm/code/llm_code_planner.py`，由 LLM 直接生成 `generated_model.py`，执行后再复用
-`direct/code/exporters.py` 导出 STEP / OBJ / PNG / model.json。
+`--auto` 路线复用阶段 1-3 的解析、分类和投影，同时运行 direct 模式的确定性特征推断，
+把 `direct_reference.features` 写入 `auto_context.json` 作为 LLM 建模参考。随后
+`llm/code/llm_code_planner.py` 让 LLM 直接生成 `generated_model.py`。如果 LLM 脚本执行失败、
+没有生成有效 `Result` solid，或反投影验证不是 `OK`，会自动切换到 direct 参考脚本兜底；
+最终再复用 `direct/code/exporters.py` 导出 STEP / OBJ / PNG / model.json。
 
 每次运行在 `outputs/` 下创建一个独立子目录：
 

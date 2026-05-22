@@ -1,7 +1,7 @@
-# Prompt 文件规范
+# 提示词文件规范
 
-`DXF_3D/prompts/` 下的每个 `.md` 文件就是一个可被流水线加载的 prompt。
-一个 prompt 文件由若干 `## <SECTION>` 二级标题分块组成。`load_prompt(name)`
+提示词目录下的每个 `.md` 文件就是一个可被流水线加载的提示词。
+一个提示词文件由若干 `## <SECTION>` 二级标题分块组成。`load_prompt(name)`
 会按下列约定解析：
 
 | 区块名      | 是否必需 | 含义 |

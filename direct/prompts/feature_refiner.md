@@ -1,4 +1,4 @@
-# Feature Refiner Prompt
+# 特征精修提示词
 
 用途：在算法已经从 DXF 推断出一个特征列表（base solid + holes + 可识别倒角）后，
 让 LLM **作为受约束的建模语义复核器**给出确定性 JSON 形式的修正版本。

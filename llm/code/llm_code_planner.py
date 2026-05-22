@@ -220,6 +220,13 @@ def strip_code_fence(text: str) -> str:
 def _sanitize_generated_script(script: str) -> str:
     script = re.sub(r"(?m)^\s*Part\.setMeasurePrecision\([^\n]*\)\s*\n?", "", script)
     script = re.sub(r"\.(X|Y|Z)\b", lambda m: "." + m.group(1).lower(), script)
+    circle_vars = re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Part\.makeCircle\(", script)
+    for var_name in circle_vars:
+        script = re.sub(
+            rf"Part\.Face\(\s*{re.escape(var_name)}\s*\)",
+            f"Part.Face(Part.Wire([{var_name}]))",
+            script,
+        )
     if "Part.fuse(" in script:
         script = script.replace("Part.fuse(", "_fuse_all(")
         script = _ensure_fuse_helper(script)

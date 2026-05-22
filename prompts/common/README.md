@@ -1,15 +1,15 @@
-# Common Prompt Knowledge
+# 公共提示词知识
 
-This folder stores prompt knowledge shared by both routes:
+本目录存放两条路线共享的提示词知识：
 
-- Direct route: deterministic `features.json` generation plus `freecad_builder.py`.
-- LLM route: JSON/images plus direct FreeCAD Python generation.
+- Direct 路线：确定性生成 `features.json`，再交给 `freecad_builder.py` 建模。
+- LLM 路线：使用 JSON/图片摘要，直接生成 FreeCAD Python 脚本。
 
-Files here should describe stable project conventions, not route-specific output formats.
+这里的文件应描述稳定的项目约定，不描述某条路线专用的输出格式。
 
-Route-specific prompts stay in:
+路线专用提示词放在：
 
 - `direct/prompts/`
 - `llm/prompts/`
 
-The root `prompts/` files are still kept for backward compatibility with the current runtime loader.
+根目录 `prompts/` 只保留公共知识，不再放路线专用提示词。

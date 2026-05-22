@@ -1,31 +1,31 @@
-# View Conventions
+# 视图约定
 
-Use these conventions in every DXF_3D prompt and modeling path.
+所有 DXF_3D 提示词和建模路径都必须使用这些约定。
 
-## Fixed Layout
+## 固定布局
 
-- FRONT: upper-left view, main/front view.
-- LEFT: upper-right view, true left view, canonical name `left`.
-- TOP: lower-left view.
-- Lower-right quadrant is empty/reserved.
+- FRONT：左上视图，主视图。
+- LEFT：右上视图，真正的左视图，规范名称为 `left`。
+- TOP：左下视图，俯视图。
+- 右下象限为空或保留。
 
-## World Mapping
+## 世界坐标映射
 
-- FRONT maps to world XZ: drawing x -> X, drawing y -> Z.
-- TOP maps to world XY: drawing x -> X, drawing y -> Y.
-- LEFT maps to world YZ: drawing x -> Y, drawing y -> Z.
-- Z is height, X is width, Y is depth.
+- FRONT 映射到世界 XZ：图纸 x -> X，图纸 y -> Z。
+- TOP 映射到世界 XY：图纸 x -> X，图纸 y -> Y。
+- LEFT 映射到世界 YZ：图纸 x -> Y，图纸 y -> Z。
+- Z 是高度，X 是宽度，Y 是深度。
 
-## Entity Semantics
+## 实体语义
 
-- Visible outline lines define external profiles and visible steps.
-- Hidden/dashed lines are not external outlines; use them as evidence for holes, slots, blind cuts, and obscured edges.
-- Center lines are axis/position evidence, not solid material.
-- Dimension annotations should inform sizes but should not become model geometry.
-- If DXF curves have been exploded into many short LINE entities, prefer fitted circle/arc/rounded-slot summaries over raw line sequences.
+- 可见轮廓线定义外轮廓和可见台阶。
+- 隐藏线/虚线不是外轮廓，只作为孔、槽、盲切和被遮挡边的证据。
+- 中心线只表示轴线或位置证据，不表示实体材料。
+- 尺寸标注可用于辅助尺寸判断，但不能变成模型几何。
+- 如果 DXF 曲线被打散成大量短 `LINE`，优先使用拟合后的圆、圆弧或长圆孔摘要，而不是逐条短线重建。
 
-## Modeling Priority
+## 建模优先级
 
-- FRONT usually controls XZ profile shape.
-- TOP usually controls Y-depth, Y-offset, and local thickness.
-- LEFT validates YZ height/depth relationships and hidden-line evidence.
+- FRONT 通常控制 XZ 轮廓形状。
+- TOP 通常控制 Y 向深度、Y 向偏移和局部厚度。
+- LEFT 用于校验 YZ 高度/深度关系和隐藏线证据。
