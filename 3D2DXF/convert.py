@@ -358,9 +358,24 @@ def convert(input_path, output_path):
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 
+def expand_input_files(inputs):
+    """展开输入路径：文件直接转换，目录转换其中所有 STEP/STP 文件。"""
+    result = []
+    for item in inputs:
+        path = os.path.abspath(item)
+        if os.path.isdir(path):
+            result += glob.glob(os.path.join(path, "*.step"))
+            result += glob.glob(os.path.join(path, "*.stp"))
+        elif not os.path.exists(path):
+            print(f"[3D2DXF] 路径不存在，已跳过: {path}")
+        else:
+            result.append(path)
+    return sorted(result)
+
+
 def main(files=None):
     """
-    files: list of input file paths, or None to process all files in ./3d/
+    files: list of input file/dir paths, or None to process STEP/STP files in ./3d/
     返回值: 错误数量（0 表示全部成功）
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -369,12 +384,14 @@ def main(files=None):
     os.makedirs(output_dir, exist_ok=True)
 
     if files is None:
-        exts = ("*.step", "*.stp", "*.iges", "*.igs", "*.stl", "*.obj")
-        files = []
-        for pat in exts:
-            files += glob.glob(os.path.join(input_dir, pat))
+        files = expand_input_files([input_dir])
         if not files:
-            print(f"[3D2DXF] 3d/ 目录下没有找到支持的文件: {input_dir}")
+            print(f"[3D2DXF] 3d/ 目录下没有找到 STEP/STP 文件: {input_dir}")
+            return 1
+    else:
+        files = expand_input_files(files)
+        if not files:
+            print("[3D2DXF] 指定路径下没有找到 STEP/STP 文件")
             return 1
 
     errors = 0

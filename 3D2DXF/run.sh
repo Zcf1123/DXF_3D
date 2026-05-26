@@ -2,9 +2,10 @@
 # 3D2DXF/run.sh — 3D 文件 → DXF 三视图转换
 #
 # 用法:
-#   ./run.sh                         # 转换 ./3d/ 下所有支持的文件
+#   ./run.sh                         # 转换 ./3d/ 下所有 STEP/STP 文件
+#   ./run.sh path/to/step_folder     # 转换指定目录下所有 STEP/STP 文件
 #   ./run.sh path/to/model.step      # 转换指定文件（可多个）
-#   ./run.sh -d [files...]           # 开发模式：挂载本地源码，无需重建镜像
+#   ./run.sh -d [files_or_dirs...]   # 开发模式：挂载本地源码，无需重建镜像
 #
 # 依赖: dxf-3d Docker 镜像（与上级项目共用，镜像名可用 DXF_3D_IMAGE 覆盖）
 # 构建镜像: cd .. && docker build -t dxf-3d .
@@ -52,9 +53,8 @@ if [[ $DEV_MODE -eq 1 ]]; then
 else
     exec docker run --rm \
         -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e HOME=/var/tmp -e TZ="${TZ_NAME}" \
-        -v "${HERE}/3d:/work/3d:ro" \
+    -v "${HERE}:/work:ro" \
         -v "${HERE}/output:/work/output" \
-        -v "${HERE}/convert.py:/work/convert.py:ro" \
         ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"} \
         "${IMAGE}" \
         freecadcmd -c "${INNER_CMD}" >/dev/null

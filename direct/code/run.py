@@ -252,7 +252,8 @@ def _make_logger(run_dir: str) -> logging.Logger:
 
 def process_dxf(dxf_path: str, llm,
                 single_view_extrude_depth: Optional[float] = None,
-                model_intent: str = "") -> Dict[str, Any]:
+                model_intent: str = "",
+                run_validation: bool = False) -> Dict[str, Any]:
     started_at = time.perf_counter()
     base = os.path.splitext(os.path.basename(dxf_path))[0]
     run_dir = _make_run_dir(base)
@@ -489,91 +490,94 @@ def process_dxf(dxf_path: str, llm,
         py_path = os.path.join(run_dir, "generated_model.py")
         validation_path = os.path.join(run_dir, "projection_validation.json")
 
-        try:
-            validation = validate_projection_against_views(
-                fcstd_path, projected, features, validation_path)
-            log.info("反投影验证    : %s", validation.get("status"))
-            _say(f"Projection   : {validation.get('status')}")
-            view_display = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}
-            for view_name in ("front", "left", "top"):
-                report = validation.get("views", {}).get(view_name)
-                if not report:
-                    continue
-                log.info(
-                    "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
-                    view_display.get(view_name, view_name.upper()),
-                    report.get("status"),
-                    float(report.get("input_coverage", 0.0)) * 100.0,
-                    float(report.get("model_match", 0.0)) * 100.0,
-                    float(report.get("model_extra_ratio", 0.0)) * 100.0,
-                    report.get("bbox_error"),
-                )
-                _say(
-                    "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
-                        name=view_display.get(view_name, view_name.upper()),
-                        status=str(report.get("status", "")),
-                        input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
-                        model_match=float(report.get("model_match", 0.0)) * 100.0,
-                        extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+        if run_validation:
+            try:
+                validation = validate_projection_against_views(
+                    fcstd_path, projected, features, validation_path)
+                log.info("反投影验证    : %s", validation.get("status"))
+                _say(f"Projection   : {validation.get('status')}")
+                view_display = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}
+                for view_name in ("front", "left", "top"):
+                    report = validation.get("views", {}).get(view_name)
+                    if not report:
+                        continue
+                    log.info(
+                        "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
+                        view_display.get(view_name, view_name.upper()),
+                        report.get("status"),
+                        float(report.get("input_coverage", 0.0)) * 100.0,
+                        float(report.get("model_match", 0.0)) * 100.0,
+                        float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                        report.get("bbox_error"),
                     )
-                )
-            log.info("已写出        : projection_validation.json")
-            if (llm.enabled and not allow_rebuild and
-                    _projection_validation_is_poor(validation)):
-                log.info("反投影较差    : 自动启用受控重建模式并二次精修")
-                retry_intent = (model_intent + "\n" if model_intent else "") + \
-                    "反投影验证很差，允许重选主体外轮廓和基础特征；优先保持真实视图尺寸、厚度、孔位。"
-                rebuilt, retry_msg = llm.refine_features(
-                    view_bboxes, final_dicts, feature_view_summary,
-                    retry_intent, allow_rebuild=True)
-                log.info("二次 LLM 返回  : %s", retry_msg)
-                if rebuilt is not None:
-                    final_dicts = rebuilt
-                    with open(os.path.join(run_dir, "features.json"), "w",
-                              encoding="utf-8") as f:
-                        json.dump(final_dicts, f, indent=2, ensure_ascii=False)
-                    features = [Feature(kind=d["kind"], params=d["params"])
-                                for d in final_dicts]
-                    retry_artifacts = build_model(features, run_dir, base_name=base,
-                                                  projected=projected)
-                    if "error" in retry_artifacts:
-                        log.warning("二次重建失败: %s", retry_artifacts["error"])
-                    else:
-                        for warning in retry_artifacts.get("warnings", []):
-                            log.warning("二次建模警告: %s", warning)
-                        fcstd_path = retry_artifacts["fcstd"]
-                        summary["fcstd"] = fcstd_path
-                        validation = validate_projection_against_views(
-                            fcstd_path, projected, features, validation_path)
-                        log.info("二次反投影验证: %s", validation.get("status"))
-                        _say(f"Projection   : {validation.get('status')} (auto rebuild)")
-                        for view_name in ("front", "left", "top"):
-                            report = validation.get("views", {}).get(view_name)
-                            if not report:
-                                continue
-                            log.info(
-                                "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
-                                view_display.get(view_name, view_name.upper()),
-                                report.get("status"),
-                                float(report.get("input_coverage", 0.0)) * 100.0,
-                                float(report.get("model_match", 0.0)) * 100.0,
-                                float(report.get("model_extra_ratio", 0.0)) * 100.0,
-                                report.get("bbox_error"),
-                            )
-                            _say(
-                                "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
-                                    name=view_display.get(view_name, view_name.upper()),
-                                    status=str(report.get("status", "")),
-                                    input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
-                                    model_match=float(report.get("model_match", 0.0)) * 100.0,
-                                    extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                    _say(
+                        "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
+                            name=view_display.get(view_name, view_name.upper()),
+                            status=str(report.get("status", "")),
+                            input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
+                            model_match=float(report.get("model_match", 0.0)) * 100.0,
+                            extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                        )
+                    )
+                log.info("已写出        : projection_validation.json")
+                if (llm.enabled and not allow_rebuild and
+                        _projection_validation_is_poor(validation)):
+                    log.info("反投影较差    : 自动启用受控重建模式并二次精修")
+                    retry_intent = (model_intent + "\n" if model_intent else "") + \
+                        "反投影验证很差，允许重选主体外轮廓和基础特征；优先保持真实视图尺寸、厚度、孔位。"
+                    rebuilt, retry_msg = llm.refine_features(
+                        view_bboxes, final_dicts, feature_view_summary,
+                        retry_intent, allow_rebuild=True)
+                    log.info("二次 LLM 返回  : %s", retry_msg)
+                    if rebuilt is not None:
+                        final_dicts = rebuilt
+                        with open(os.path.join(run_dir, "features.json"), "w",
+                                  encoding="utf-8") as f:
+                            json.dump(final_dicts, f, indent=2, ensure_ascii=False)
+                        features = [Feature(kind=d["kind"], params=d["params"])
+                                    for d in final_dicts]
+                        retry_artifacts = build_model(features, run_dir, base_name=base,
+                                                      projected=projected)
+                        if "error" in retry_artifacts:
+                            log.warning("二次重建失败: %s", retry_artifacts["error"])
+                        else:
+                            for warning in retry_artifacts.get("warnings", []):
+                                log.warning("二次建模警告: %s", warning)
+                            fcstd_path = retry_artifacts["fcstd"]
+                            summary["fcstd"] = fcstd_path
+                            validation = validate_projection_against_views(
+                                fcstd_path, projected, features, validation_path)
+                            log.info("二次反投影验证: %s", validation.get("status"))
+                            _say(f"Projection   : {validation.get('status')} (auto rebuild)")
+                            for view_name in ("front", "left", "top"):
+                                report = validation.get("views", {}).get(view_name)
+                                if not report:
+                                    continue
+                                log.info(
+                                    "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
+                                    view_display.get(view_name, view_name.upper()),
+                                    report.get("status"),
+                                    float(report.get("input_coverage", 0.0)) * 100.0,
+                                    float(report.get("model_match", 0.0)) * 100.0,
+                                    float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                                    report.get("bbox_error"),
                                 )
-                            )
-                else:
-                    log.info("二次重建未生效，保留首次建模结果")
-        except Exception as exc:
-            log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
-            _say(f"Projection   : WARN — validation failed: {exc}")
+                                _say(
+                                    "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
+                                        name=view_display.get(view_name, view_name.upper()),
+                                        status=str(report.get("status", "")),
+                                        input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
+                                        model_match=float(report.get("model_match", 0.0)) * 100.0,
+                                        extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                                    )
+                                )
+                    else:
+                        log.info("二次重建未生效，保留首次建模结果")
+            except Exception as exc:
+                log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
+                _say(f"Projection   : WARN — validation failed: {exc}")
+        else:
+            log.info("反投影验证    : 跳过（命令行加 --val 可启用）")
 
         for name, fn in (
             ("STEP",            lambda: export_step(fcstd_path, step_path)),
@@ -624,7 +628,8 @@ def process_dxf(dxf_path: str, llm,
     return summary
 
 
-def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, Any]:
+def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
+                     run_validation: bool = False) -> Dict[str, Any]:
     """Direct LLM FreeCAD-script modeling route.
 
     This keeps parsing, view classification, projection, exports, and
@@ -699,7 +704,11 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
 
         banner("阶段 3 ─ 投影并生成 Auto 上下文")
         from ...projection_mapper import map_views_to_3d
-        from ...llm.code.llm_code_planner import build_auto_context, generate_freecad_script
+        from ...llm.code.llm_code_planner import (
+            build_auto_context, cache_successful_freecad_script,
+            generate_freecad_script, repair_freecad_script_after_execution,
+            normalize_fcstd_dimensions, validate_fcstd_dimensions,
+        )
         projected = map_views_to_3d(bundles)
         for name, pv in projected.items():
             log.info("投影 %-6s -> 平面 %s, 尺寸 %.3f × %.3f, 实体数=%d",
@@ -713,7 +722,8 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         banner("阶段 4 ─ LLM 直接生成 FreeCAD 脚本")
         fcstd_path = os.path.join(run_dir, f"{base}.FCStd")
         py_path = os.path.join(run_dir, "generated_model.py")
-        script, script_msg = generate_freecad_script(llm, auto_context, base, fcstd_path, run_dir)
+        script, script_msg = generate_freecad_script(
+            llm, auto_context, base, fcstd_path, run_dir, use_cache=run_validation)
         log.info("LLM 返回      : %s", script_msg)
         if script is None:
             raise RuntimeError(script_msg)
@@ -732,9 +742,83 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         log.info("已写出        : generated_model.py")
 
         banner("阶段 5 ─ 执行 LLM 生成脚本")
-        runpy.run_path(py_path, run_name="__main__")
+        try:
+            runpy.run_path(py_path, run_name="__main__")
+        except Exception as exc:
+            exec_reason = f"脚本执行失败：{type(exc).__name__}: {exc}"
+            log.warning("LLM 脚本执行  : FAIL — %s", exec_reason)
+            repaired_script, repair_msg = repair_freecad_script_after_execution(
+                llm, auto_context, base, fcstd_path, script, exec_reason, run_dir)
+            log.info("LLM 执行修复  : %s", repair_msg)
+            if repaired_script is None:
+                raise RuntimeError(f"LLM 脚本执行失败且自动修复失败：{exec_reason}；{repair_msg}")
+            script = repaired_script
+            with open(py_path, "w", encoding="utf-8") as f:
+                f.write(script)
+            if os.path.exists(fcstd_path):
+                os.remove(fcstd_path)
+            runpy.run_path(py_path, run_name="__main__")
+            repaired_understanding = _extract_model_understanding(script)
+            if repaired_understanding:
+                log.info("LLM 模型理解  : %s", repaired_understanding)
+            repaired_dimensions = _extract_dimensions_used(script)
+            if repaired_dimensions:
+                log.info("LLM 使用尺寸  : %s", json.dumps(repaired_dimensions, ensure_ascii=False, sort_keys=True))
         if not os.path.exists(fcstd_path):
             raise RuntimeError(f"LLM 脚本未生成 FCStd: {fcstd_path}")
+        dim_ok, dim_reason, dim_details = validate_fcstd_dimensions(fcstd_path, auto_context)
+        with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
+            json.dump(dim_details, f, indent=2, ensure_ascii=False)
+        if not dim_ok:
+            log.warning("尺寸契约校验  : FAIL — %s", dim_reason)
+            norm_ok, norm_reason, norm_details = normalize_fcstd_dimensions(fcstd_path, auto_context)
+            with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
+                json.dump(norm_details, f, indent=2, ensure_ascii=False)
+            if norm_ok:
+                log.info("尺寸归一化    : OK（按三视图总尺寸缩放 LLM 生成的 Result）")
+                dim_ok = True
+                dim_reason = "OK"
+                dim_details = norm_details
+            else:
+                log.info("尺寸归一化    : FAIL — %s；尝试 LLM 尺寸修复", norm_reason)
+                repaired_script, repair_msg = repair_freecad_script_after_execution(
+                    llm, auto_context, base, fcstd_path, script, dim_reason, run_dir)
+                log.info("LLM 尺寸修复  : %s", repair_msg)
+                if repaired_script is None:
+                    raise RuntimeError(f"LLM 脚本未通过尺寸契约校验：{dim_reason}；尺寸归一化失败：{norm_reason}；{repair_msg}")
+                script = repaired_script
+                with open(py_path, "w", encoding="utf-8") as f:
+                    f.write(script)
+                if os.path.exists(fcstd_path):
+                    os.remove(fcstd_path)
+                runpy.run_path(py_path, run_name="__main__")
+                if not os.path.exists(fcstd_path):
+                    raise RuntimeError(f"LLM 修复脚本未生成 FCStd: {fcstd_path}")
+                dim_ok, dim_reason, dim_details = validate_fcstd_dimensions(fcstd_path, auto_context)
+                with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
+                    json.dump(dim_details, f, indent=2, ensure_ascii=False)
+                if not dim_ok:
+                    norm_ok, norm_reason, norm_details = normalize_fcstd_dimensions(fcstd_path, auto_context)
+                    with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
+                        json.dump(norm_details, f, indent=2, ensure_ascii=False)
+                    if not norm_ok:
+                        raise RuntimeError(f"LLM 修复脚本仍未通过尺寸契约校验：{dim_reason}；尺寸归一化失败：{norm_reason}")
+                    log.info("尺寸归一化    : OK（LLM 修复后按三视图总尺寸缩放 Result）")
+                    dim_ok = True
+                    dim_reason = "OK"
+                    dim_details = norm_details
+                repaired_understanding = _extract_model_understanding(script)
+                if repaired_understanding:
+                    log.info("LLM 模型理解  : %s", repaired_understanding)
+                repaired_dimensions = _extract_dimensions_used(script)
+                if repaired_dimensions:
+                    log.info("LLM 使用尺寸  : %s", json.dumps(repaired_dimensions, ensure_ascii=False, sort_keys=True))
+        log.info("尺寸契约校验  : OK")
+        if run_validation:
+            cache_successful_freecad_script(llm, auto_context, base, script)
+            log.info("LLM 脚本缓存  : 已记录成功脚本（--val）")
+        else:
+            log.info("LLM 脚本缓存  : 跳过（命令行加 --val 才保存）")
         from .freecad_builder import embed_projected_views
         embed_projected_views(fcstd_path, projected)
         summary["fcstd"] = fcstd_path
@@ -757,38 +841,41 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "") -> Dict[str, An
         json_path = os.path.join(run_dir, "model.json")
         validation_path = os.path.join(run_dir, "projection_validation.json")
 
-        try:
-            validation = validate_projection_against_views(
-                fcstd_path, projected, None, validation_path)
-            log.info("反投影验证    : %s", validation.get("status"))
-            _say(f"Projection   : {validation.get('status')}")
-            view_display = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}
-            for view_name in ("front", "left", "top"):
-                report = validation.get("views", {}).get(view_name)
-                if not report:
-                    continue
-                log.info(
-                    "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
-                    view_display.get(view_name, view_name.upper()),
-                    report.get("status"),
-                    float(report.get("input_coverage", 0.0)) * 100.0,
-                    float(report.get("model_match", 0.0)) * 100.0,
-                    float(report.get("model_extra_ratio", 0.0)) * 100.0,
-                    report.get("bbox_error"),
-                )
-                _say(
-                    "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
-                        name=view_display.get(view_name, view_name.upper()),
-                        status=str(report.get("status", "")),
-                        input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
-                        model_match=float(report.get("model_match", 0.0)) * 100.0,
-                        extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+        if run_validation:
+            try:
+                validation = validate_projection_against_views(
+                    fcstd_path, projected, None, validation_path)
+                log.info("反投影验证    : %s", validation.get("status"))
+                _say(f"Projection   : {validation.get('status')}")
+                view_display = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}
+                for view_name in ("front", "left", "top"):
+                    report = validation.get("views", {}).get(view_name)
+                    if not report:
+                        continue
+                    log.info(
+                        "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
+                        view_display.get(view_name, view_name.upper()),
+                        report.get("status"),
+                        float(report.get("input_coverage", 0.0)) * 100.0,
+                        float(report.get("model_match", 0.0)) * 100.0,
+                        float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                        report.get("bbox_error"),
                     )
-                )
-            log.info("已写出        : projection_validation.json")
-        except Exception as exc:
-            log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
-            _say(f"Projection   : WARN — validation failed: {exc}")
+                    _say(
+                        "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
+                            name=view_display.get(view_name, view_name.upper()),
+                            status=str(report.get("status", "")),
+                            input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
+                            model_match=float(report.get("model_match", 0.0)) * 100.0,
+                            extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                        )
+                    )
+                log.info("已写出        : projection_validation.json")
+            except Exception as exc:
+                log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
+                _say(f"Projection   : WARN — validation failed: {exc}")
+        else:
+            log.info("反投影验证    : 跳过（命令行加 --val 可启用）")
 
         for name, fn in (
             ("STEP",            lambda: export_step(fcstd_path, step_path)),
@@ -850,6 +937,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Use direct LLM-generated FreeCAD script modeling route")
     p.add_argument("--model-intent", default=os.environ.get("DXF_3D_MODEL_INTENT", ""),
                    help="Natural-language modeling intent for constrained LLM feature refinement")
+    p.add_argument("--val", action="store_true",
+                   help="Run projection validation and print Projection details")
     args = p.parse_args(argv)
 
     if args.dxf:
@@ -875,10 +964,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     rc = 0
     for t in targets:
         if args.auto:
-            s = process_dxf_auto(t, llm, model_intent=args.model_intent)
+            s = process_dxf_auto(t, llm, model_intent=args.model_intent,
+                                 run_validation=args.val)
         else:
             s = process_dxf(t, llm, single_view_extrude_depth=args.extrude_depth,
-                            model_intent=args.model_intent)
+                            model_intent=args.model_intent,
+                            run_validation=args.val)
         _say(f"Output dir  : {s['output_dir']}")
         _say(f"Elapsed     : {float(s.get('elapsed_s', 0.0)):.3f}s")
         _say(f"Status      : {s['status']}"

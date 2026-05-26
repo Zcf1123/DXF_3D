@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import math
 import os
@@ -27,6 +28,7 @@ _MAX_VISIBLE_ENTITIES_PER_VIEW = 0
 _MAX_HIDDEN_ENTITIES_PER_VIEW = 4
 _MAX_OUTLINES_PER_VIEW = 4
 _MAX_EDGES_PER_OUTLINE = 12
+_MAX_PROFILE_SAMPLE_POINTS = 240
 
 _BANNED_TEXT = (
     "os.system", "subprocess", "shutil", "socket", "requests", "urllib",
@@ -41,6 +43,7 @@ _INVALID_FREECAD_CALLS = {
     "Part.setMeasurePrecision": "FreeCAD Part has no Part.setMeasurePrecision; remove this no-op line",
     "Part.cut": "FreeCAD Part has no Part.cut module function; call shape.cut(other_shape) instead",
     "Part.common": "FreeCAD Part has no Part.common module function; call shape.common(other_shape) instead",
+    "Part.Fuse": "FreeCAD Part has no Part.Fuse; call shape1.fuse(shape2) instead",
     "Part.makeRevolution": "Do not use Part.makeRevolution; create a closed Part.Face and call face.revolve(axis_point, axis_dir, 360) instead",
     "Part.makePrism": "FreeCAD Part has no stable Part.makePrism helper here; create Part.Face(wire).extrude(vector) instead",
     "App.setActiveDocument": "Do not call App.setActiveDocument; keep and use the document returned by App.newDocument(...) instead",
@@ -49,6 +52,7 @@ _INVALID_FREECAD_CALLS = {
 }
 _REQUEST_TIMEOUT_SECONDS = 180
 _MAX_SCRIPT_TOKENS = 9000
+_SCRIPT_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(HERE)), "outputs", ".llm_script_cache")
 
 _AUXILIARY_TOKENS = frozenset({
     "CENTER", "CENTRE", "CENTRO", "AXIS", "AXES", "CONSTRUCTION",
@@ -73,10 +77,10 @@ def build_auto_context(
         "intent_mode": {
             "enabled": bool(intent),
             "instruction": (
-                "用户提供了建模意图。请结合 part_knowledge 解释零件类型、组件关系、孔槽贯穿方向和允许容忍的视图简化；"
-                "但最终几何仍必须由三视图证据支撑。"
+                "用户提供的 model_intent 只作为弱参考和歧义消解线索。必须先根据 projected_views/views 自主识别三视图表达的零件类型，"
+                "再把识别结果与 part_knowledge 中的零件族和建模策略匹配；不得因为用户简短术语而覆盖三视图证据。"
                 if intent else
-                "未提供建模意图。请只根据三视图几何摘要保守建模。"
+                "未提供建模意图。必须根据 projected_views/views 自主识别三视图表达的零件类型，再在 part_knowledge 中匹配建模策略。"
             ),
         },
         "coordinate_convention": {
@@ -91,8 +95,11 @@ def build_auto_context(
             for name, pv in projected.items()
         },
     }
-    context["hole_hints"] = _through_hole_hints(context["projected_views"])
     context["model_understanding_hints"] = _model_understanding_hints(context["projected_views"])
+    context["hole_hints"] = _through_hole_hints(
+        context["projected_views"],
+        context["model_understanding_hints"],
+    )
     context["dimension_constraints"] = _dimension_constraints(context["projected_views"])
     return context
 
@@ -104,7 +111,7 @@ def _dimension_constraints(projected_views: Dict[str, Dict[str, Any]]) -> Dict[s
     width_x = _view_extent(front, "width", _view_extent(top, "width", 0.0))
     depth_y = _view_extent(left, "width", _view_extent(top, "height", 0.0))
     height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
-    tolerance = max(width_x, depth_y, height_z, 1.0) * 0.02
+    tolerance = max(max(width_x, depth_y, height_z) * 0.02, 1e-6)
     return {
         "overall_size": {
             "width_x": _round_num(width_x),
@@ -130,10 +137,321 @@ def _dimension_constraints(projected_views: Dict[str, Dict[str, Any]]) -> Dict[s
 
 def _model_understanding_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     hints: List[Dict[str, Any]] = []
+    cylinder_on_hex_hint = _central_cylinder_on_hex_prism_hint(projected_views)
+    if cylinder_on_hex_hint is not None:
+        hints.append(cylinder_on_hex_hint)
+    tube_hint = _hollow_cylinder_from_left_hint(projected_views)
+    if tube_hint is not None:
+        hints.append(tube_hint)
+    hex_prism_hint = _regular_hex_prism_from_top_hint(projected_views)
+    if hex_prism_hint is not None:
+        hints.append(hex_prism_hint)
     nut_hint = _hex_nut_arc_revolve_hint(projected_views)
     if nut_hint is not None:
         hints.append(nut_hint)
+    gear_hint = _toothed_disk_from_top_hint(projected_views)
+    if gear_hint is not None:
+        hints.append(gear_hint)
     return hints
+
+
+def _central_cylinder_on_hex_prism_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    polygons = [hint for hint in top.get("regular_polygon_hints") or []
+                if hint.get("kind") == "regular_hexagon_bbox"]
+    if not polygons:
+        return None
+    circle = _largest_centered_top_solid_circle(top, polygons[0])
+    if circle is None:
+        return None
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if height_z <= 0.0:
+        return None
+    base_height = _support_plate_height_from_side_views(front, left, height_z)
+    if base_height is None:
+        return None
+    cylinder_height = height_z - base_height
+    if cylinder_height <= max(height_z * 0.08, 1e-6):
+        return None
+    center = circle.get("center") or []
+    if len(center) != 2:
+        return None
+    return {
+        "kind": "central_cylinder_on_hex_prism",
+        "confidence": "high",
+        "understanding": "组合件：TOP 六边形是下部六棱柱外轮廓，中间大圆是叠加的实心圆柱，不是切除孔。",
+        "construction": {
+            "base": {
+                "source_view": "top",
+                "plane": "XY",
+                "vertices_2d": polygons[0].get("recommended_vertices_2d"),
+                "height_z": _round_num(base_height),
+                "operation": "Create a closed XY hexagon face and extrude along Z from z=0 to base_height.",
+            },
+            "cylinder": {
+                "axis": "Z",
+                "center": _round_json(center),
+                "radius": _round_num(float(circle.get("radius") or 0.0)),
+                "base_z": _round_num(base_height),
+                "height_z": _round_num(cylinder_height),
+                "operation": "Create a solid Z-axis cylinder on top of the hex prism and fuse it with the base. Do not cut this circle as a hole.",
+            },
+        },
+        "evidence": [
+            "top.regular_polygon_hints contains a regular hexagon outer footprint",
+            "top contains one large centered approximated circle inside the hexagon",
+            "front/left show a higher, narrower rectangular projection over the lower hex prism projection",
+        ],
+    }
+
+
+def _largest_centered_top_solid_circle(top: Dict[str, Any], hex_hint: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    center = hex_hint.get("center") or []
+    inradius = float(hex_hint.get("inradius") or 0.0)
+    if len(center) != 2 or inradius <= 0.0:
+        return None
+    candidates = []
+    for circle in _deduped_circle_sources(top):
+        circle_center = circle.get("center") or []
+        radius = float(circle.get("radius") or 0.0)
+        if len(circle_center) != 2 or radius <= 0.0:
+            continue
+        center_tol = max(inradius * 0.08, 1e-6)
+        if abs(float(circle_center[0]) - float(center[0])) > center_tol:
+            continue
+        if abs(float(circle_center[1]) - float(center[1])) > center_tol:
+            continue
+        if radius < inradius * 0.75 or radius > inradius * 1.02:
+            continue
+        candidates.append(circle)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: float(item.get("radius") or 0.0))
+
+
+def _support_plate_height_from_side_views(front: Dict[str, Any], left: Dict[str, Any], height_z: float) -> Optional[float]:
+    candidates: List[float] = []
+    for view in (front, left):
+        for outline in view.get("visible_closed_outlines") or []:
+            bbox = outline.get("bbox") or []
+            if len(bbox) != 4:
+                continue
+            z_max = float(bbox[3])
+            if height_z * 0.35 <= z_max <= height_z * 0.85:
+                candidates.append(z_max)
+        for entity in view.get("key_hidden_entities") or []:
+            bbox = entity.get("bbox") or []
+            if len(bbox) != 4:
+                continue
+            if abs(float(bbox[1]) - float(bbox[3])) > max(height_z * 0.01, 1e-6):
+                continue
+            z = float(bbox[1])
+            if height_z * 0.35 <= z <= height_z * 0.85:
+                candidates.append(z)
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[len(candidates) // 2]
+
+
+def _hollow_cylinder_from_left_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    front = projected_views.get("front") or {}
+    top = projected_views.get("top") or {}
+    left = projected_views.get("left") or {}
+    width_x = _view_extent(front, "width", _view_extent(top, "width", 0.0))
+    depth_y = _view_extent(left, "width", _view_extent(top, "height", 0.0))
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0:
+        return None
+    circles = [curve for curve in left.get("approximated_curves") or []
+               if curve.get("kind") == "approximated_circle"]
+    if not circles:
+        return None
+    outer = max(circles, key=lambda item: float(item.get("radius") or 0.0))
+    outer_center = outer.get("center") or []
+    outer_radius = float(outer.get("radius") or 0.0)
+    if len(outer_center) != 2 or outer_radius <= 0.0:
+        return None
+    if outer_radius < min(depth_y, height_z) * 0.35:
+        return None
+    inner = _inner_circle_from_left_outlines(left, outer_center, outer_radius)
+    if inner is None:
+        return None
+    center_u = float(outer_center[0])
+    center_z = float(outer_center[1])
+    return {
+        "kind": "hollow_cylinder_from_left_annulus",
+        "confidence": "high",
+        "understanding": "空心圆筒/套筒：LEFT 的同心圆环给出 YZ 截面，FRONT/TOP 的矩形和虚线只给出 X 向长度与内孔投影。",
+        "construction": {
+            "axis": "X",
+            "length_x": _round_num(width_x),
+            "center_world": [0.0, _round_num(depth_y - center_u), _round_num(center_z)],
+            "outer_radius": _round_num(outer_radius),
+            "inner_radius": _round_num(inner["radius"]),
+            "base_world": [0.0, _round_num(depth_y - center_u), _round_num(center_z)],
+            "direction": [1.0, 0.0, 0.0],
+            "operation": "Create an X-axis outer cylinder from base_world with length_x and outer_radius, then cut a coaxial X-axis cylinder using inner_radius. Do not build a solid cylinder and do not place the YZ circle in the XY plane.",
+        },
+        "evidence": [
+            "left.approximated_curves contains a large centered circle spanning the view height/depth",
+            "left.visible_closed_outlines contains a smaller centered square-like closed loop for the bore",
+            "front/top are rectangles with hidden horizontal lines, consistent with a through bore along X",
+        ],
+    }
+
+
+def _inner_circle_from_left_outlines(
+    left: Dict[str, Any],
+    outer_center: List[float],
+    outer_radius: float,
+) -> Optional[Dict[str, float]]:
+    candidates = []
+    for outline in left.get("visible_closed_outlines") or []:
+        bbox = outline.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        width = float(bbox[2]) - float(bbox[0])
+        height = float(bbox[3]) - float(bbox[1])
+        if width <= 0.0 or height <= 0.0:
+            continue
+        radius = (width + height) * 0.25
+        if radius <= 0.0 or radius >= outer_radius * 0.9:
+            continue
+        if abs(width - height) > max(radius * 0.08, 1e-6):
+            continue
+        center = [(float(bbox[0]) + float(bbox[2])) * 0.5,
+                  (float(bbox[1]) + float(bbox[3])) * 0.5]
+        tol = max(outer_radius * 0.08, 1e-6)
+        if abs(center[0] - float(outer_center[0])) > tol or abs(center[1] - float(outer_center[1])) > tol:
+            continue
+        candidates.append({"center_u": center[0], "center_z": center[1], "radius": radius})
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item["radius"])
+
+
+def _regular_hex_prism_from_top_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    polygons = [hint for hint in top.get("regular_polygon_hints") or []
+                if hint.get("kind") == "regular_hexagon_bbox"]
+    if not polygons:
+        return None
+    has_circle = bool(top.get("visible_circles") or top.get("approximated_curves") or _deduped_circle_sources(top))
+    has_arc = any(
+        edge.get("kind") == "ARC"
+        for view in (front, left)
+        for outline in view.get("visible_closed_outlines") or []
+        for edge in outline.get("edges") or []
+    )
+    if has_circle or has_arc:
+        return None
+    hex_hint = polygons[0]
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if height_z <= 0.0:
+        return None
+    return {
+        "kind": "regular_hex_prism_from_top",
+        "confidence": "high",
+        "understanding": "简单六棱柱：TOP 六边形是实体外轮廓，FRONT/LEFT 矩形内竖线是六边形侧棱投影，不是孔、槽或倒角。",
+        "construction": {
+            "source_view": "top",
+            "plane": "XY",
+            "vertices_2d": hex_hint.get("recommended_vertices_2d"),
+            "height_z": _round_num(height_z),
+            "operation": "Create a closed XY hexagon face from vertices_2d and extrude along Z by height_z. Do not add center holes, chamfers, fillets, revolved envelopes, or cuts unless an explicit circle/arc hint exists.",
+        },
+        "evidence": [
+            "top.regular_polygon_hints contains a regular hexagon",
+            "top has no visible or approximated circles",
+            "front/left contain only rectangular projections without circular arc evidence",
+        ],
+    }
+
+
+def _toothed_disk_from_top_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    outlines = top.get("visible_closed_outlines") or []
+    if not outlines:
+        return None
+    top_width = _view_extent(top, "width", 0.0)
+    top_height = _view_extent(top, "height", 0.0)
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if top_width <= 0.0 or top_height <= 0.0 or height_z <= 0.0:
+        return None
+    full_outline = max(outlines, key=lambda item: int(item.get("edge_count") or 0))
+    edge_count = int(full_outline.get("edge_count") or 0)
+    if edge_count < 80:
+        return None
+    bbox = full_outline.get("bbox") or []
+    if len(bbox) != 4:
+        return None
+    bbox_width = float(bbox[2]) - float(bbox[0])
+    bbox_height = float(bbox[3]) - float(bbox[1])
+    if bbox_width <= 0.0 or bbox_height <= 0.0:
+        return None
+    if bbox_width < top_width * 0.85 or bbox_height < top_height * 0.85:
+        return None
+    if abs(bbox_width - bbox_height) > max(top_width, top_height) * 0.08:
+        return None
+    bore = _largest_centered_top_circle(top, bbox)
+    if bore is None:
+        return None
+    profile_points = full_outline.get("profile_points_2d") or full_outline.get("sample_points_2d") or []
+    if len(profile_points) < 12:
+        return None
+    center = [_round_num((float(bbox[0]) + float(bbox[2])) * 0.5),
+              _round_num((float(bbox[1]) + float(bbox[3])) * 0.5)]
+    return {
+        "kind": "toothed_disk_from_top_profile",
+        "confidence": "medium",
+        "understanding": "齿轮/带齿圆盘：TOP 给出真实齿形外轮廓和中心孔，FRONT/LEFT 主要给出厚度，不应拆成多个矩形块。",
+        "source_view": "top",
+        "construction": {
+            "outer_profile_plane": "XY",
+            "outer_profile_points_2d": _round_json(profile_points),
+            "extrude_axis": "Z",
+            "height_z": _round_num(height_z),
+            "center": center,
+            "bore_hole": bore,
+            "operation": "Create a closed XY wire from outer_profile_points_2d, make a face, extrude along Z by height_z, then cut a Z-axis center bore. Ignore front/left rectangular tooth projections as separate blocks.",
+        },
+        "evidence": [
+            f"top largest closed outline has {edge_count} short LINE edges and spans the full view bbox",
+            "top contains a centered approximated circle used as the bore hole",
+            "front/left height is small compared with top width/depth, consistent with a thin extruded gear disk",
+        ],
+    }
+
+
+def _largest_centered_top_circle(top: Dict[str, Any], bbox: List[float]) -> Optional[Dict[str, Any]]:
+    center_x = (float(bbox[0]) + float(bbox[2])) * 0.5
+    center_y = (float(bbox[1]) + float(bbox[3])) * 0.5
+    max_radius = max(float(bbox[2]) - float(bbox[0]), float(bbox[3]) - float(bbox[1])) * 0.5
+    candidates = []
+    for circle in _deduped_circle_sources(top):
+        center = circle.get("center") or []
+        radius = float(circle.get("radius") or 0.0)
+        if len(center) != 2 or radius <= 0.0 or radius >= max_radius * 0.85:
+            continue
+        tol = max(max_radius * 0.08, 1e-6)
+        if abs(float(center[0]) - center_x) > tol or abs(float(center[1]) - center_y) > tol:
+            continue
+        candidates.append(circle)
+    if not candidates:
+        return None
+    circle = max(candidates, key=lambda item: float(item.get("radius") or 0.0))
+    return {
+        "axis": "Z",
+        "center": _round_json(circle.get("center") or []),
+        "radius": _round_num(float(circle.get("radius") or 0.0)),
+    }
 
 
 def _hex_nut_arc_revolve_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -234,7 +552,10 @@ def _side_arc_chamfer_distance(*views: Dict[str, Any]) -> Optional[float]:
     return float(candidates[len(candidates) // 2])
 
 
-def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _through_hole_hints(
+    projected_views: Dict[str, Dict[str, Any]],
+    model_understanding_hints: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     top = projected_views.get("top") or {}
     front = projected_views.get("front") or {}
     left = projected_views.get("left") or {}
@@ -243,11 +564,14 @@ def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict
     height_z = _view_extent(front, "height", _view_extent(left, "height", 1.0))
     margin = max(width_x, depth_y, height_z, 1.0) * 0.05
     hints: List[Dict[str, Any]] = []
+    solid_top_circles = _solid_top_circle_keys(model_understanding_hints or [])
     for circle in _deduped_circle_sources(top):
         center = circle.get("center") or []
         radius = float(circle.get("radius") or 0.0)
         if len(center) == 2 and radius > 0.0:
             cx, cy = float(center[0]), float(center[1])
+            if _circle_key(cx, cy, radius) in solid_top_circles:
+                continue
             hints.append({
                 "source_view": "top",
                 "axis": "Z",
@@ -287,6 +611,23 @@ def _through_hole_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict
                 "rule": "base.x < solid_x_min and base.x + height > solid_x_max",
             })
     return hints
+
+
+def _solid_top_circle_keys(model_understanding_hints: List[Dict[str, Any]]) -> set[Tuple[float, float, float]]:
+    keys: set[Tuple[float, float, float]] = set()
+    for hint in model_understanding_hints:
+        if hint.get("kind") != "central_cylinder_on_hex_prism":
+            continue
+        cylinder = ((hint.get("construction") or {}).get("cylinder") or {})
+        center = cylinder.get("center") or []
+        radius = float(cylinder.get("radius") or 0.0)
+        if len(center) == 2 and radius > 0.0:
+            keys.add(_circle_key(float(center[0]), float(center[1]), radius))
+    return keys
+
+
+def _circle_key(cx: float, cy: float, radius: float) -> Tuple[float, float, float]:
+    return (round(cx, 5), round(cy, 5), round(radius, 5))
 
 
 def _deduped_circle_sources(view: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -352,6 +693,7 @@ def generate_freecad_script(
     base_name: str,
     fcstd_path: str,
     debug_dir: Optional[str] = None,
+    use_cache: bool = True,
 ) -> Tuple[Optional[str], str]:
     """Return (script_or_none, message) from the direct FreeCAD generator."""
     if not getattr(llm, "enabled", False):
@@ -361,6 +703,15 @@ def generate_freecad_script(
         prompt = load_prompt("freecad_script_generator")
     except Exception as exc:
         return None, f"提示词加载失败：{exc}"
+
+    if use_cache:
+        cache_key = _script_cache_key(llm, prompt, context, base_name)
+        cached = _read_cached_script(cache_key, base_name, fcstd_path)
+        if cached is not None:
+            ok, reason = validate_generated_script(cached)
+            if ok:
+                _write_debug_text(debug_dir, "llm_cache_key.txt", cache_key)
+                return cached, f"复用 LLM 成功脚本缓存（{llm.model}）"
 
     user_msg = render_template(prompt.user_template, {
         "base_name": base_name,
@@ -395,6 +746,294 @@ def generate_freecad_script(
     return script, f"LLM 直接建模脚本生成完成（{llm.model}）"
 
 
+def repair_freecad_script_after_execution(
+    llm: Any,
+    context: Dict[str, Any],
+    base_name: str,
+    fcstd_path: str,
+    bad_script: str,
+    reason: str,
+    debug_dir: Optional[str] = None,
+) -> Tuple[Optional[str], str]:
+    """Ask the LLM to repair a script that executed but violated model checks."""
+    if not getattr(llm, "enabled", False):
+        return None, f"LLM 已禁用：{getattr(llm, 'disabled_reason', None)}"
+    try:
+        prompt = load_prompt("freecad_script_generator")
+    except Exception as exc:
+        return None, f"提示词加载失败：{exc}"
+    user_msg = render_template(prompt.user_template, {
+        "base_name": base_name,
+        "fcstd_path": fcstd_path,
+        "auto_context": context,
+    })
+    messages: List[Dict[str, str]] = [{"role": "system", "content": prompt.system}]
+    for inp, out in prompt.examples:
+        messages.append({"role": "user", "content": inp})
+        messages.append({"role": "assistant", "content": out})
+    messages.append({"role": "user", "content": user_msg})
+    messages.append({"role": "assistant", "content": bad_script[:6000]})
+    messages.append({
+        "role": "user",
+        "content": (
+            "上一次脚本没有通过执行后校验：" + reason + "\n"
+            "请重新输出一份完整 Python 脚本，不要解释。必须修正实际建模代码，而不是只修改 DIMENSIONS_USED。\n"
+            "硬性要求：\n"
+            "1. 如果 TOP 给出 footprint，而 FRONT/LEFT 给出完整高度，沿 Z 的实体高度必须使用 dimension_constraints.overall_size.height_z。\n"
+            "2. DIMENSIONS_USED 中记录的 width_x/depth_y/height_z 必须真实反映 Result.Shape.BoundBox 的 X/Y/Z 长度。\n"
+            "3. 不要用局部闭合轮廓的小高度、视觉线宽、0.0075/0.033 等小数替代 FRONT/LEFT 的完整拉伸长度。\n"
+            "4. 保持原有孔、圆、轮廓位置来自上下文 JSON；只修正错误的拉伸轴和拉伸长度。\n"
+            "5. 尺寸修复时不得改变 TOP 最大外轮廓的形状；矩形/正方形仍必须用矩形/正方形顶点，不要替换成圆或 12 边形。\n"
+            "6. 如果错误原因是 Python/FreeCAD API 不存在，改用稳定 API；不要调用 Vector.rotate、Part.Vertex 造 Wire 或 _edge(Part)。\n"
+            "7. 只输出最终正确代码，不要 Markdown 解释。"
+        ),
+    })
+    try:
+        with _alarm_timeout(_REQUEST_TIMEOUT_SECONDS):
+            content = llm.complete_text(
+                messages,
+                max_tokens=_MAX_SCRIPT_TOKENS,
+                timeout=_REQUEST_TIMEOUT_SECONDS,
+            )
+    except Exception as exc:
+        return None, f"尺寸校验后自动修复失败：{exc}"
+
+    _write_debug_text(debug_dir, "llm_raw_response_dimension_retry.txt", content)
+    script = _sanitize_generated_script(strip_code_fence(content))
+    ok, repair_reason = validate_generated_script(script)
+    if not ok:
+        return None, f"尺寸校验后自动修复仍未通过脚本校验：{repair_reason}"
+    return script, f"LLM 直接建模脚本生成完成（{llm.model}，尺寸校验后自动修复一次）"
+
+
+def validate_fcstd_dimensions(fcstd_path: str, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """Validate Result.Shape bbox lengths against dimension_constraints."""
+    constraints = (context.get("dimension_constraints") or {}).get("overall_size") or {}
+    expected = {
+        "width_x": float(constraints.get("width_x") or 0.0),
+        "depth_y": float(constraints.get("depth_y") or 0.0),
+        "height_z": float(constraints.get("height_z") or 0.0),
+    }
+    tolerance = float(constraints.get("tolerance") or 0.0)
+    if tolerance <= 0.0:
+        tolerance = max(max(expected.values(), default=0.0) * 0.02, 1e-6)
+    import FreeCAD as App  # type: ignore
+    doc = App.openDocument(fcstd_path)
+    try:
+        result = doc.getObject("Result")
+        if result is None:
+            return False, "Result object not found", {}
+        shape = getattr(result, "Shape", None)
+        if shape is None or shape.isNull() or not shape.Solids:
+            return False, "Result object has no solid geometry", {}
+        bb = shape.BoundBox
+        actual = {
+            "width_x": float(bb.XLength),
+            "depth_y": float(bb.YLength),
+            "height_z": float(bb.ZLength),
+        }
+    finally:
+        App.closeDocument(doc.Name)
+    failures = []
+    for key in ("width_x", "depth_y", "height_z"):
+        exp = expected[key]
+        if exp <= 0.0:
+            continue
+        diff = abs(actual[key] - exp)
+        if diff > tolerance:
+            failures.append(f"{key}: expected {exp:.6g}, actual {actual[key]:.6g}, diff {diff:.6g}, tolerance {tolerance:.6g}")
+    details = {"expected": expected, "actual": actual, "tolerance": tolerance, "failures": failures}
+    if failures:
+        return False, "; ".join(failures), details
+    return True, "OK", details
+
+
+def normalize_fcstd_dimensions(fcstd_path: str, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """Scale the generated Result shape to the dimension contract when possible."""
+    constraints = (context.get("dimension_constraints") or {}).get("overall_size") or {}
+    expected = {
+        "width_x": float(constraints.get("width_x") or 0.0),
+        "depth_y": float(constraints.get("depth_y") or 0.0),
+        "height_z": float(constraints.get("height_z") or 0.0),
+    }
+    tolerance = float(constraints.get("tolerance") or 0.0)
+    if tolerance <= 0.0:
+        tolerance = max(max(expected.values(), default=0.0) * 0.02, 1e-6)
+    import FreeCAD as App  # type: ignore
+    doc = App.openDocument(fcstd_path)
+    try:
+        result = doc.getObject("Result")
+        if result is None:
+            return False, "Result object not found", {}
+        shape = getattr(result, "Shape", None)
+        if shape is None or shape.isNull() or not shape.Solids:
+            return False, "Result object has no solid geometry", {}
+        bb = shape.BoundBox
+        actual = {
+            "width_x": float(bb.XLength),
+            "depth_y": float(bb.YLength),
+            "height_z": float(bb.ZLength),
+        }
+        zero_axes = [key for key in ("width_x", "depth_y", "height_z")
+                     if expected[key] > 0.0 and actual[key] <= 1e-9]
+        if zero_axes:
+            thickened, thicken_reason = _thicken_zero_axis_shape(result, shape, zero_axes, expected)
+            if not thickened:
+                return False, thicken_reason, {
+                    "expected": expected,
+                    "actual_before": actual,
+                    "tolerance": tolerance,
+                    "failures": [thicken_reason],
+                }
+            doc.recompute()
+            shape = result.Shape
+            bb = shape.BoundBox
+            actual = {
+                "width_x": float(bb.XLength),
+                "depth_y": float(bb.YLength),
+                "height_z": float(bb.ZLength),
+            }
+        scale = {}
+        failures = []
+        for key in ("width_x", "depth_y", "height_z"):
+            exp = expected[key]
+            act = actual[key]
+            if exp <= 0.0:
+                scale[key] = 1.0
+                continue
+            if act <= 1e-9:
+                failures.append(f"{key}: expected {exp:.6g}, actual zero-length axis")
+                scale[key] = 1.0
+                continue
+            scale[key] = exp / act
+        if failures:
+            return False, "; ".join(failures), {
+                "expected": expected,
+                "actual_before": actual,
+                "tolerance": tolerance,
+                "failures": failures,
+            }
+        matrix = App.Matrix(
+            scale["width_x"], 0.0, 0.0, -float(bb.XMin) * scale["width_x"],
+            0.0, scale["depth_y"], 0.0, -float(bb.YMin) * scale["depth_y"],
+            0.0, 0.0, scale["height_z"], -float(bb.ZMin) * scale["height_z"],
+            0.0, 0.0, 0.0, 1.0,
+        )
+        result.Shape = shape.transformGeometry(matrix)
+        doc.recompute()
+        doc.saveAs(fcstd_path)
+    finally:
+        App.closeDocument(doc.Name)
+    ok, reason, details = validate_fcstd_dimensions(fcstd_path, context)
+    details["normalization"] = {
+        "expected": expected,
+        "actual_before": actual,
+        "scale": scale,
+    }
+    if not ok:
+        return False, reason, details
+    return True, "OK", details
+
+
+def _thicken_zero_axis_shape(
+    result: Any,
+    shape: Any,
+    zero_axes: List[str],
+    expected: Dict[str, float],
+) -> Tuple[bool, str]:
+    if len(zero_axes) != 1:
+        return False, "multiple zero-length axes cannot be repaired by thickness extrusion"
+    axis = zero_axes[0]
+    vector_by_axis = {
+        "width_x": (expected[axis], 0.0, 0.0),
+        "depth_y": (0.0, expected[axis], 0.0),
+        "height_z": (0.0, 0.0, expected[axis]),
+    }
+    import FreeCAD as App  # type: ignore
+    vector = App.Vector(*vector_by_axis[axis])
+    faces = list(getattr(shape, "Faces", []) or [])
+    if not faces:
+        return False, f"{axis}: expected {expected[axis]:.6g}, actual zero-length axis and no face to extrude"
+    candidates = []
+    for face in faces:
+        bb = face.BoundBox
+        lengths = {
+            "width_x": float(bb.XLength),
+            "depth_y": float(bb.YLength),
+            "height_z": float(bb.ZLength),
+        }
+        if lengths[axis] > 1e-8:
+            continue
+        other_lengths = [length for key, length in lengths.items() if key != axis]
+        if any(length <= 1e-9 for length in other_lengths):
+            continue
+        candidates.append(face)
+    if not candidates:
+        return False, f"{axis}: expected {expected[axis]:.6g}, actual zero-length axis and no planar face matches missing thickness axis"
+    face = max(candidates, key=lambda item: float(getattr(item, "Area", 0.0)))
+    try:
+        thickened = face.extrude(vector)
+    except Exception as exc:
+        return False, f"{axis}: failed to extrude zero-thickness face: {exc}"
+    if thickened.isNull() or not thickened.Solids:
+        return False, f"{axis}: face extrusion did not produce solid geometry"
+    result.Shape = thickened
+    return True, "OK"
+
+
+def cache_successful_freecad_script(
+    llm: Any,
+    context: Dict[str, Any],
+    base_name: str,
+    script: str,
+) -> None:
+    try:
+        prompt = load_prompt("freecad_script_generator")
+    except Exception:
+        return
+    key = _script_cache_key(llm, prompt, context, base_name)
+    _write_cached_script(key, script)
+
+
+def _script_cache_key(llm: Any, prompt: Prompt, context: Dict[str, Any], base_name: str) -> str:
+    payload = {
+        "model": getattr(llm, "model", ""),
+        "base_name": base_name,
+        "prompt_system": prompt.system,
+        "prompt_user_template": prompt.user_template,
+        "context": context,
+    }
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _read_cached_script(cache_key: str, base_name: str, fcstd_path: str) -> Optional[str]:
+    path = os.path.join(_SCRIPT_CACHE_DIR, f"{cache_key}.py")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            script = fh.read()
+    except Exception:
+        return None
+    return _retarget_script_constants(script, base_name, fcstd_path)
+
+
+def _write_cached_script(cache_key: str, script: str) -> None:
+    try:
+        os.makedirs(_SCRIPT_CACHE_DIR, exist_ok=True)
+        with open(os.path.join(_SCRIPT_CACHE_DIR, f"{cache_key}.py"), "w", encoding="utf-8") as fh:
+            fh.write(script)
+            if script and not script.endswith("\n"):
+                fh.write("\n")
+    except Exception:
+        pass
+
+
+def _retarget_script_constants(script: str, base_name: str, fcstd_path: str) -> str:
+    script = re.sub(r'(?m)^\s*BASE_NAME\s*=\s*(["\']).*?\1', f'BASE_NAME = {base_name!r}', script, count=1)
+    script = re.sub(r'(?m)^\s*FCSTD_PATH\s*=\s*(["\']).*?\1', f'FCSTD_PATH = {fcstd_path!r}', script, count=1)
+    return script
+
+
 def _repair_generated_script(
     llm: Any,
     original_messages: List[Dict[str, str]],
@@ -415,7 +1054,7 @@ def _repair_generated_script(
             "4. 脚本末尾必须包含 `doc.recompute()` 和 `doc.saveAs(FCSTD_PATH)`。\n"
             "4a. 必须定义 `DIMENSIONS_USED = {...}`，记录关键尺寸来自上下文 JSON 的数值。\n"
             "5. 不要使用不存在的 `Part.Extrude`；拉伸必须使用 `Part.Face(...).extrude(App.Vector(...))`。\n"
-            "6. `Part.makeCylinder` 正确签名是 `Part.makeCylinder(radius, height, base, direction)` 或带第 5 个 angle；第 4 个参数必须是方向向量，不是数字。\n"
+            "6. `Part.makeCylinder` 正确签名是 `Part.makeCylinder(radius, height, base, direction)` 或带第 5 个 angle；第 3 个参数必须是 App.Vector base，第 4 个参数必须是方向向量。\n"
             "7. 直接给短脚本，不要写工程图推理过程，不要写长段注释，避免输出被截断。\n"
             "8. 不要输出 Markdown 解释文字。\n"
             "9. 不要保留错误代码和修正代码的两个版本；只输出最终正确版本。\n"
@@ -462,6 +1101,9 @@ def strip_code_fence(text: str) -> str:
     else:
         text = re.sub(r"^```(?:python)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
+        first_import = re.search(r"(?m)^(?:import FreeCAD as App|import Part|from FreeCAD import)", text)
+        if first_import:
+            text = text[first_import.start():]
     return text.strip() + "\n"
 
 
@@ -503,6 +1145,11 @@ def _sanitize_generated_script(script: str) -> str:
     script = re.sub(
         r"Part\.makePrism\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^\n]+?)\)",
         r"Part.Face(\1).extrude(\2)",
+        script,
+    )
+    script = re.sub(
+        r"Part\.Fuse\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        r"\1.fuse(\2)",
         script,
     )
     if "Part.Arc(" in script or "Part.makeArc(" in script or "Part.Line(" in script or ".Edge" in script:
@@ -580,7 +1227,7 @@ def _ensure_geometry_helper(script: str) -> str:
         "    return Part.LineSegment(p1, p2).toShape()\n"
         "\n"
         "def _valid_edges(edges):\n"
-        "    return [edge for edge in edges if edge is not None]\n"
+        "    return [_edge(edge) for edge in edges if edge is not None]\n"
     )
     insert_after = re.search(r"(?m)^(?:import .+\n)+", script)
     if insert_after:
@@ -654,10 +1301,15 @@ def validate_generated_script(script: str) -> Tuple[bool, str]:
         return False, "arc-revolve chamfer envelope must clip the hex body with common(), not fuse() with the body"
     if _has_untranslated_rz_profile(script):
         return False, "R-Z profile points must be translated to App.Vector(center_x + r, center_y, z) before revolve"
+    if _regular_hex_prism_script_has_extra_features(script):
+        return False, "regular hex prism scripts must not add holes, fillets, chamfers, or revolved envelopes without explicit circle/arc hints"
+    if "_edge(Part)" in script:
+        return False, "do not call _edge(Part) or Part.Vertex to build wires; create line/arc edges or use Part.makePolygon(points)"
     try:
         tree = ast.parse(script)
     except SyntaxError as exc:
         return False, f"syntax error: {exc}"
+    numeric_names = _numeric_assignments(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -674,13 +1326,34 @@ def validate_generated_script(script: str) -> Tuple[bool, str]:
                 return False, f"call {func_name!r} is not allowed"
             if func_name in _INVALID_FREECAD_CALLS:
                 return False, _INVALID_FREECAD_CALLS[func_name]
+            if func_name.endswith(".rotate"):
+                return False, "FreeCAD App.Vector.rotate is not available here; compute rotated coordinates with math.cos/math.sin instead"
             if _call_name(node.func).endswith(".extrude"):
                 owner = node.func.value if isinstance(node.func, ast.Attribute) else None
                 if isinstance(owner, ast.Name) and owner.id.lower().endswith(("wire", "polyline", "polygon")):
                     return False, "wire extrusion creates a shell; create Part.Face(wire).extrude(...) to produce a solid"
             if func_name == "Part.makeCylinder" and len(node.args) >= 4 and _is_number_literal(node.args[3]):
                 return False, "Part.makeCylinder fourth argument must be a direction App.Vector, not a number; use Part.makeCylinder(radius, height, base, App.Vector(...))"
+            if func_name == "Part.makeCylinder" and len(node.args) >= 3 and _is_numeric_expr(node.args[2], numeric_names):
+                return False, "Part.makeCylinder third argument must be a base App.Vector, not a number; use App.Vector(cx, cy, z) or App.Vector(x, y, z)"
     return True, "ok"
+
+
+def _numeric_assignments(tree: ast.AST) -> set:
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not _is_number_literal(node.value):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _is_numeric_expr(node: ast.AST, numeric_names: set) -> bool:
+    if _is_number_literal(node):
+        return True
+    return isinstance(node, ast.Name) and node.id in numeric_names
 
 
 def _has_flattened_arc_profile(script: str) -> bool:
@@ -703,6 +1376,19 @@ def _has_untranslated_rz_profile(script: str) -> bool:
     if any(token in script for token in ("center_x +", "center[0] +", "+ r,")):
         return False
     return bool(re.search(r"_safe_arc\(\s*App\.Vector\(\s*(?:8\.66|9\.33|10\.0)\s*,\s*0\.0", script))
+
+
+def _regular_hex_prism_script_has_extra_features(script: str) -> bool:
+    understanding_match = re.search(r'(?m)^\s*MODEL_UNDERSTANDING\s*=\s*(["\'])(.*?)\1', script)
+    if not understanding_match:
+        return False
+    understanding = understanding_match.group(2)
+    if "六棱柱" not in understanding and "六角柱" not in understanding:
+        return False
+    if "圆柱" in understanding or "组合" in understanding:
+        return False
+    banned = ("makeFillet", "makeChamfer", ".revolve(", "Part.makeCylinder", ".cut(")
+    return any(token in script for token in banned)
 
 
 def _is_number_literal(node: ast.AST) -> bool:
@@ -831,13 +1517,37 @@ def _annotation_summary(entity: DxfEntity) -> Dict[str, Any]:
 
 def _outline_summary(outline: Any) -> Dict[str, Any]:
     edges = outline.to_dict().get("edges", [])[:_MAX_EDGES_PER_OUTLINE]
+    sample_points = _sample_outline_points(outline, 24) if len(outline.edges) > _MAX_EDGES_PER_OUTLINE else []
+    profile_points = _sample_outline_points(outline, _MAX_PROFILE_SAMPLE_POINTS) if len(outline.edges) >= 80 else []
     return {
         "bbox": _round_list(outline.bbox),
         "width": _round_num(outline.width),
         "height": _round_num(outline.height),
         "edge_count": len(outline.edges),
         "edges": _round_json(edges),
+        "sample_points_2d": _round_json(sample_points),
+        "profile_points_2d": _round_json(profile_points),
     }
+
+
+def _sample_outline_points(outline: Any, limit: int) -> List[List[float]]:
+    raw_edges = outline.to_dict().get("edges", [])
+    points = [edge.get("p0") for edge in raw_edges if len(edge.get("p0") or []) == 2]
+    if len(points) < 2:
+        return []
+    if len(points) <= limit:
+        return [[float(point[0]), float(point[1])] for point in points]
+    step = len(points) / float(limit)
+    sampled = []
+    used = set()
+    for idx in range(limit):
+        point_index = min(int(round(idx * step)), len(points) - 1)
+        if point_index in used:
+            continue
+        used.add(point_index)
+        point = points[point_index]
+        sampled.append([float(point[0]), float(point[1])])
+    return sampled
 
 
 def _outline_bbox_summary(outline: Any) -> Dict[str, Any]:

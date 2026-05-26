@@ -2,8 +2,7 @@
 dxf_files/
 outputs/
 3D2DXF/3d/
-3D2DXF/3d_stl/
-3D2DXF/output/
+3D2DXF/
 
 # 配置文件
 config.json

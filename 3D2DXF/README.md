@@ -42,8 +42,12 @@ DXF_3D_IMAGE=my-image ./run.sh
 ```bash
 cd 3D2DXF
 
-# 转换 3d/ 目录下所有支持的文件
+# 转换 3d/ 目录下所有 STEP/STP 文件
 ./run.sh
+
+# 转换指定目录下所有 STEP/STP 文件
+./run.sh 3d
+./run.sh /path/to/step_folder
 
 # 转换指定文件（可同时指定多个）
 ./run.sh 3d/model.step
@@ -57,7 +61,8 @@ cd 3D2DXF
 
 ```bash
 ./run.sh -d 3d/model.step
-./run.sh -d          # 处理 3d/ 下所有文件
+./run.sh -d 3d       # 处理指定目录下所有 STEP/STP 文件
+./run.sh -d          # 处理 3d/ 下所有 STEP/STP 文件
 ```
 
 ### 输出
