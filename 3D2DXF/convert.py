@@ -37,6 +37,10 @@ class DXFWriter:
         self._ents.append(dict(type="ARC", layer=layer, lt=lt,
                                cx=cx, cy=cy, r=r, a0=a0, a1=a1))
 
+    def polyline(self, pts, closed=False, layer="0", lt=""):
+        self._ents.append(dict(type="POLYLINE", layer=layer, lt=lt,
+                               pts=list(pts), closed=closed))
+
     def write(self, path):
         rows = []
 
@@ -92,6 +96,14 @@ class DXFWriter:
                 rows += ["10", _f(e["cx"]), "20", _f(e["cy"]), "30", "0.0",
                          "40", _f(e["r"]),
                          "50", _f(e["a0"]), "51", _f(e["a1"])]
+            elif t == "POLYLINE":
+                rows += ["66", "1", "70", "1" if e.get("closed") else "0"]
+                for x, y in e["pts"]:
+                    rows += ["0", "VERTEX", "8", la]
+                    if lt:
+                        rows += ["6", lt]
+                    rows += ["10", _f(x), "20", _f(y), "30", "0.0"]
+                rows += ["0", "SEQEND"]
 
         rows += ["0", "ENDSEC", "0", "EOF"]
 
@@ -100,6 +112,69 @@ class DXFWriter:
 
 
 # ── 几何投影 ──────────────────────────────────────────────────────────────────
+
+def _is_closed_pts(pts, tol=1e-6):
+    if len(pts) < 3:
+        return False
+    return math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]) <= tol
+
+
+def _normalize_angle(a):
+    a = a % 360.0
+    return a + 360.0 if a < 0.0 else a
+
+
+def _fit_circle_2d(pts, tol=1e-4):
+    """用采样点拟合圆；成功返回 (cx, cy, r)，否则返回 None。"""
+    was_closed = _is_closed_pts(pts)
+    if was_closed:
+        pts = pts[:-1]
+    if len(pts) < 5:
+        return None
+    x1, y1 = pts[0]
+    if was_closed:
+        xm, ym = pts[len(pts) // 3]
+        x2, y2 = pts[(len(pts) * 2) // 3]
+    else:
+        xm, ym = pts[len(pts) // 2]
+        x2, y2 = pts[-1]
+    d = 2.0 * (x1 * (ym - y2) + xm * (y2 - y1) + x2 * (y1 - ym))
+    if abs(d) < 1e-12:
+        return None
+    ux = ((x1 * x1 + y1 * y1) * (ym - y2) +
+          (xm * xm + ym * ym) * (y2 - y1) +
+          (x2 * x2 + y2 * y2) * (y1 - ym)) / d
+    uy = ((x1 * x1 + y1 * y1) * (x2 - xm) +
+          (xm * xm + ym * ym) * (x1 - x2) +
+          (x2 * x2 + y2 * y2) * (xm - x1)) / d
+    rs = [math.hypot(x - ux, y - uy) for x, y in pts]
+    r = sum(rs) / len(rs)
+    if r <= 1e-9:
+        return None
+    max_err = max(abs(v - r) for v in rs)
+    if max_err > max(tol, r * tol):
+        return None
+    return ux, uy, r
+
+
+def _arc_or_circle_from_pts(pts, layer="0", lt=""):
+    fit = _fit_circle_2d(pts)
+    if fit is None:
+        return None
+    cx, cy, r = fit
+    a0 = _normalize_angle(math.degrees(math.atan2(pts[0][1] - cy, pts[0][0] - cx)))
+    a1 = _normalize_angle(math.degrees(math.atan2(pts[-1][1] - cy, pts[-1][0] - cx)))
+    if _is_closed_pts(pts, max(1e-6, r * 1e-5)):
+        return dict(type="CIRCLE", layer=layer, lt=lt, cx=cx, cy=cy, r=r)
+
+    amid = _normalize_angle(math.degrees(math.atan2(pts[len(pts) // 2][1] - cy,
+                                                    pts[len(pts) // 2][0] - cx)))
+    ccw_span = (a1 - a0) % 360.0
+    mid_span = (amid - a0) % 360.0
+    if mid_span > ccw_span:
+        a0, a1 = a1, a0
+    return dict(type="ARC", layer=layer, lt=lt, cx=cx, cy=cy, r=r, a0=a0, a1=a1)
+
 
 def edge_to_ents(edge, ax, ay, sx=1.0, sy=1.0, layer="0", lt=""):
     """
@@ -113,8 +188,6 @@ def edge_to_ents(edge, ax, ay, sx=1.0, sy=1.0, layer="0", lt=""):
         return float(p[ax]) * sx, float(p[ay]) * sy
 
     result = []
-    curve = edge.Curve
-
     try:
         # TechDraw.projectEx 对直线也返回 BSplineCurve，统一离散化处理。
         # 对近似直线使用 2 点，对曲线使用 64 点以保证圆弧精度。
@@ -144,12 +217,18 @@ def edge_to_ents(edge, ax, ay, sx=1.0, sy=1.0, layer="0", lt=""):
                                        x1=x0, y1=y0, x2=xe, y2=ye))
                     return result
 
-        for i in range(len(pts) - 1):
-            x1, y1 = pts[i]
-            x2, y2 = pts[i + 1]
-            if abs(x1 - x2) > 1e-9 or abs(y1 - y2) > 1e-9:
-                result.append(dict(type="LINE", layer=layer, lt=lt,
-                                   x1=x1, y1=y1, x2=x2, y2=y2))
+        arc_ent = _arc_or_circle_from_pts(pts, layer, lt)
+        if arc_ent is not None:
+            result.append(arc_ent)
+            return result
+
+        clean_pts = []
+        for x, y in pts:
+            if not clean_pts or math.hypot(x - clean_pts[-1][0], y - clean_pts[-1][1]) > 1e-9:
+                clean_pts.append((x, y))
+        if len(clean_pts) >= 2:
+            result.append(dict(type="POLYLINE", layer=layer, lt=lt,
+                               pts=clean_pts, closed=_is_closed_pts(clean_pts)))
 
     except Exception as ex:
         print(f"  [warn] edge_to_ents: {ex}")
@@ -221,12 +300,14 @@ def _line_fully_covered_by(ent, covers, tol=1e-6):
 
 def _remove_covered_lines(ents, tol=1e-6):
     """去掉被同组更长/已保留共线线段完全覆盖的 LINE。"""
-    ordered = sorted(ents, key=_line_length, reverse=True)
+    line_ents = [e for e in ents if e.get("type") == "LINE"]
+    other_ents = [e for e in ents if e.get("type") != "LINE"]
+    ordered = sorted(line_ents, key=_line_length, reverse=True)
     kept = []
     for ent in ordered:
         if not _line_fully_covered_by(ent, kept, tol):
             kept.append(ent)
-    return kept
+    return kept + other_ents
 
 
 def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
@@ -295,6 +376,9 @@ def bbox_of_ents(ents):
         if e["type"] == "LINE":
             xs += [e["x1"], e["x2"]]
             ys += [e["y1"], e["y2"]]
+        elif e["type"] == "POLYLINE":
+            xs += [p[0] for p in e["pts"]]
+            ys += [p[1] for p in e["pts"]]
         elif e["type"] in ("ARC", "CIRCLE"):
             r = e["r"]
             xs += [e["cx"] - r, e["cx"] + r]
@@ -312,6 +396,8 @@ def shift_ents(ents, dx, dy):
         if e["type"] == "LINE":
             e["x1"] += dx; e["y1"] += dy
             e["x2"] += dx; e["y2"] += dy
+        elif e["type"] == "POLYLINE":
+            e["pts"] = [(x + dx, y + dy) for x, y in e["pts"]]
         else:
             e["cx"] += dx; e["cy"] += dy
         result.append(e)
@@ -421,6 +507,8 @@ def convert(input_path, output_path):
             dxf.circle(e["cx"], e["cy"], e["r"], la, lt)
         elif t == "ARC":
             dxf.arc(e["cx"], e["cy"], e["r"], e["a0"], e["a1"], la, lt)
+        elif t == "POLYLINE":
+            dxf.polyline(e["pts"], e.get("closed", False), la, lt)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     dxf.write(output_path)
