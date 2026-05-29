@@ -166,6 +166,69 @@ def _line_key(ent, tol=1e-6):
     return tuple(sorted((p1, p2)))
 
 
+def _line_length(ent):
+    if ent.get("type") != "LINE":
+        return 0.0
+    return math.hypot(ent["x2"] - ent["x1"], ent["y2"] - ent["y1"])
+
+
+def _line_fully_covered_by(ent, covers, tol=1e-6):
+    """判断 ent 是否被 covers 中一条或多条共线线段完全覆盖。"""
+    if ent.get("type") != "LINE":
+        return False
+
+    x1, y1, x2, y2 = ent["x1"], ent["y1"], ent["x2"], ent["y2"]
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length <= tol:
+        return True
+
+    intervals = []
+    len2 = length * length
+    for other in covers:
+        if other.get("type") != "LINE":
+            continue
+        ox1, oy1 = other["x1"], other["y1"]
+        ox2, oy2 = other["x2"], other["y2"]
+
+        # other 的两个端点都必须落在 ent 所在直线上。
+        d1 = abs(dx * (oy1 - y1) - dy * (ox1 - x1)) / length
+        d2 = abs(dx * (oy2 - y1) - dy * (ox2 - x1)) / length
+        if d1 > tol or d2 > tol:
+            continue
+
+        t1 = ((ox1 - x1) * dx + (oy1 - y1) * dy) / len2
+        t2 = ((ox2 - x1) * dx + (oy2 - y1) * dy) / len2
+        lo, hi = sorted((t1, t2))
+        lo = max(0.0, lo)
+        hi = min(1.0, hi)
+        if hi - lo > tol / length:
+            intervals.append((lo, hi))
+
+    if not intervals:
+        return False
+
+    intervals.sort()
+    cover_start, cover_end = intervals[0]
+    if cover_start > tol / length:
+        return False
+    for lo, hi in intervals[1:]:
+        if lo > cover_end + tol / length:
+            break
+        cover_end = max(cover_end, hi)
+    return cover_end >= 1.0 - tol / length
+
+
+def _remove_covered_lines(ents, tol=1e-6):
+    """去掉被同组更长/已保留共线线段完全覆盖的 LINE。"""
+    ordered = sorted(ents, key=_line_length, reverse=True)
+    kept = []
+    for ent in ordered:
+        if not _line_fully_covered_by(ent, kept, tol):
+            kept.append(ent)
+    return kept
+
+
 def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
                  lvis="0", lhid="HIDDEN"):
     """
@@ -174,9 +237,9 @@ def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
     result[5..9]:  隐藏边 (hard/smooth/sewn/outline/iso)
 
     TechDraw.projectEx 返回的投影边均在 Z=0 平面：
-      - 沿 +Y 投影（front）: result.x=worldZ, result.y=worldX  → ax=1, ay=0
+            - 前视图（front，从 -Y 看向 +Y）: result.x=-worldZ, result.y=worldX → ax=1, ay=0, sy=-1
       - 沿 +Z 投影（top）  : result.x=worldX, result.y=worldY  → ax=0, ay=1
-    - 沿 +X 投影（left） : result.x=worldZ, result.y=worldY  → ax=1, ay=0
+            - 左视图（left，从 -X 看向 +X） : result.x=-worldZ, result.y=-worldY → ax=1, ay=0, sy=-1
     """
     import FreeCAD
     import TechDraw
@@ -201,18 +264,26 @@ def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
                 visible_ents += edge_to_ents(edge, ax, ay, sx, sy, layer=lvis, lt="")
         except Exception:
             pass
+    visible_ents = _remove_covered_lines(visible_ents)
 
     visible_keys = {key for key in (_line_key(e) for e in visible_ents) if key is not None}
     hidden_ents = []
+    hidden_keys = set()
     for idx in HIDDEN_IDX:
         try:
             for edge in result[idx].Edges:
                 for ent in edge_to_ents(edge, ax, ay, sx, sy, layer=lhid, lt="HIDDEN"):
                     key = _line_key(ent)
-                    if key is None or key not in visible_keys:
-                        hidden_ents.append(ent)
+                    if key is not None:
+                        if key in visible_keys or key in hidden_keys:
+                            continue
+                        if _line_fully_covered_by(ent, visible_ents) or _line_fully_covered_by(ent, hidden_ents):
+                            continue
+                        hidden_keys.add(key)
+                    hidden_ents.append(ent)
         except Exception:
             pass
+    hidden_ents = _remove_covered_lines(hidden_ents)
 
     return visible_ents + hidden_ents
 
@@ -303,22 +374,22 @@ def convert(input_path, output_path):
     # 三视图投影（第一角投影 / 国标 GB/T 4458.1）
     #
     # TechDraw.projectEx 投影结果均在 Z=0 平面，坐标映射：
-    #   正视图 +Y: result.x=worldZ(高), result.y=worldX(宽)
-    #             ax=1→DXF_x=worldX, ay=0→DXF_y=worldZ
+    #   正视图 -Y→+Y: result.x=-worldZ(高), result.y=worldX(宽)
+    #             ax=1→DXF_x=worldX, ay=0 + sy=-1→DXF_y=worldZ
     #   俯视图 +Z: result.x=worldX(宽), result.y=worldY(深)
     #             ax=0→DXF_x=worldX, ay=1→DXF_y=worldY，保持 FreeCAD 顶视图方向
-    #   左视图 -X: result.x=-worldZ(高), result.y=worldY(深)
-    #             ax=1→DXF_x=worldY, ay=0→DXF_y=worldZ (sy=-1 抵消 result.x 的 Z 翻转)
+    #   左视图 -X→+X: result.x=-worldZ(高), result.y=-worldY(深)
+    #             ax=1→DXF_x=-worldY, ay=0 + sy=-1→DXF_y=worldZ
 
-    print("  投影正视图 (front, 沿 +Y) ...")
-    front = project_view(shape, (0, 1, 0), ax=1, ay=0, sx=1.0, sy=1.0,
+    print("  投影正视图 (front, 从 -Y 看向 +Y) ...")
+    front = project_view(shape, (0, -1, 0), ax=1, ay=0, sx=1.0, sy=-1.0,
                          lvis="FRONT", lhid="FRONT_HID")
 
-    print("  投影俯视图 (top, 沿 +Z) ...")
+    print("  投影俯视图 (top, 从 +Z 看向原点) ...")
     top = project_view(shape, (0, 0, 1), ax=0, ay=1, sx=1.0, sy=1.0,
                        lvis="TOP", lhid="TOP_HID")
 
-    print("  投影左视图 (left, 沿 -X) ...")
+    print("  投影左视图 (left, 从 -X 看向 +X) ...")
     left = project_view(shape, (-1, 0, 0), ax=1, ay=0, sx=1.0, sy=-1.0,
                         lvis="LEFT", lhid="LEFT_HID")
 
