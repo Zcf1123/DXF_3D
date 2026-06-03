@@ -9,13 +9,14 @@ DXF -> 三视图 JSON/投影几何摘要 -> auto_context.json -> LLM 编写 Free
 从仓库根目录运行：
 
 ```bash
-./run.sh -d --auto dxf_files/00005340.dxf
+./run.sh -d dxf_files/00005340.dxf
 ```
 
 目录内容：
 
-- `code/llm_code_planner.py`：`--auto` 开启时由 `direct/code/run.py` 调用的 LLM 脚本生成辅助模块。
+- `code/llm_code_planner.py`：默认路线下由 `direct/code/run.py` 调用的 LLM 脚本生成辅助模块。
 - `prompts/freecad_script_generator.md`：直接生成 FreeCAD 脚本的提示词。
+- `prompts/auto_modeling_strategy.md`：LLM 直接建模路线专用策略说明。
 
 设计边界：
 

@@ -3,14 +3,12 @@ set -u -o pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 INPUT_DIR="${DXF_3D_BATCH_INPUT_DIR:-${ROOT}/dxf_files/test}"
-OUTPUT_SUBDIR="${DXF_3D_BATCH_OUTPUT_SUBDIR:-contrast}"
+OUTPUT_SUBDIR="${DXF_3D_BATCH_OUTPUT_SUBDIR:-dxf_test}"
 OUTPUT_DIR="${ROOT}/outputs/${OUTPUT_SUBDIR}"
-TIME_FILE="${OUTPUT_DIR}/time.txt"
-STEP_DIR="${OUTPUT_DIR}/step"
+SUMMARY_FILE="${OUTPUT_DIR}/summary.txt"
 
 mkdir -p "${OUTPUT_DIR}"
-mkdir -p "${STEP_DIR}"
-touch "${TIME_FILE}"
+printf 'part\tstatus\tllm_model\tmodel_accuracy\telapsed_s\tllm_understanding\tfcstd\toutput_dir\n' > "${SUMMARY_FILE}"
 
 shopt -s nullglob
 dxf_files=("${INPUT_DIR}"/*.dxf "${INPUT_DIR}"/*.DXF)
@@ -24,21 +22,41 @@ fi
 overall_rc=0
 total=${#dxf_files[@]}
 index=0
+args=()
+model_profile=""
+for arg in "$@"; do
+    case "${arg}" in
+        --gpt|--qwen|--openai)
+            model_profile="${arg#--}"
+            args+=("${arg}")
+            ;;
+        *)
+            args+=("${arg}")
+            ;;
+    esac
+done
+has_val=0
+for arg in "${args[@]}"; do
+    if [[ "${arg}" == "--val" ]]; then
+        has_val=1
+        break
+    fi
+done
+if (( has_val == 0 )); then
+    args+=("--val")
+fi
 
 for dxf in "${dxf_files[@]}"; do
     index=$((index + 1))
     part="$(basename "${dxf}" .dxf)"
     part="$(basename "${part}" .DXF)"
-    batch_log="${OUTPUT_DIR}/${part}.batch.log"
 
     printf '[%d/%d] %s\n' "${index}" "${total}" "${dxf}" >&2
 
     started_ns="$(date +%s%N)"
-    output="$(DXF_3D_OUTPUT_SUBDIR="${OUTPUT_SUBDIR}" "${ROOT}/run.sh" -d --auto "$@" "${dxf}" 2>&1)"
+    output="$(DXF_3D_OUTPUT_SUBDIR="${OUTPUT_SUBDIR}" "${ROOT}/run.sh" -d "${args[@]}" "${dxf}" 2>&1)"
     rc=$?
     ended_ns="$(date +%s%N)"
-
-    printf '%s\n' "${output}" > "${batch_log}"
 
     elapsed="$(printf '%s\n' "${output}" | awk -F: '/^Elapsed[[:space:]]*:/ {gsub(/^[ \t]+|s[ \t]*$/, "", $2); print $2; exit}')"
     if [[ -z "${elapsed}" ]]; then
@@ -50,24 +68,58 @@ for dxf in "${dxf_files[@]}"; do
         status="FAILED - exit ${rc}"
     fi
 
+    llm_model="$(printf '%s\n' "${output}" | sed -n 's/^LLM[[:space:]]*:[[:space:]]*//p' | tail -n 1)"
+    if [[ -z "${llm_model}" ]]; then
+        llm_model="${model_profile:-default}"
+    fi
+
     output_dir="$(printf '%s\n' "${output}" | sed -n 's/^Output dir[[:space:]]*:[[:space:]]*//p' | tail -n 1)"
     if [[ -z "${output_dir}" ]]; then
         output_dir="-"
     fi
 
     local_output_dir="${output_dir/#\/app\/DXF_3D/${ROOT}}"
-    step_src="${local_output_dir}/${part}.step"
-    if [[ -f "${step_src}" ]]; then
-        cp -f "${step_src}" "${STEP_DIR}/${part}.step"
+    fcstd_src="${local_output_dir}/${part}.FCStd"
+    fcstd_dst="-"
+    if [[ -f "${fcstd_src}" ]]; then
+        fcstd_dst="${OUTPUT_DIR}/${part}.FCStd"
+        cp -f "${fcstd_src}" "${fcstd_dst}"
     fi
 
-    printf '%s\t%s\t%s\t%s\n' "${part}" "${status}" "${elapsed}" "${output_dir}" >> "${TIME_FILE}"
-    printf '  %s  %ss  %s\n' "${status}" "${elapsed}" "${output_dir}" >&2
+    model_accuracy="$(printf '%s\n' "${output}" | awk '
+        /^[[:space:]]*(FRONT|LEFT|TOP|RIGHT)[[:space:]]/ {
+            name=$1
+            if (match($0, /model=[[:space:]]*[0-9.]+%/)) {
+                value=substr($0, RSTART, RLENGTH)
+                sub(/^model=[[:space:]]*/, "", value)
+                items[++n]=name "=" value
+            }
+        }
+        END {
+            for (i=1; i<=n; i++) {
+                printf "%s%s", (i == 1 ? "" : ", "), items[i]
+            }
+        }')"
+    if [[ -z "${model_accuracy}" ]]; then
+        model_accuracy="-"
+    fi
+
+    llm_understanding="-"
+    run_log="${local_output_dir}/run.log"
+    if [[ -f "${run_log}" ]]; then
+        llm_understanding="$(sed -n 's/^.*LLM 模型理解[[:space:]]*:[[:space:]]*//p; s/^.*LLM 理解[[:space:]]*:[[:space:]]*//p' "${run_log}" | tail -n 1)"
+        if [[ -z "${llm_understanding}" ]]; then
+            llm_understanding="-"
+        fi
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${part}" "${status}" "${llm_model}" "${model_accuracy}" "${elapsed}" "${llm_understanding}" "${fcstd_dst}" "${output_dir}" >> "${SUMMARY_FILE}"
+    printf '  %s  llm:%s  model:%s  %ss  %s\n' "${status}" "${llm_model}" "${model_accuracy}" "${elapsed}" "${fcstd_dst}" >&2
 
     if (( rc != 0 )); then
         overall_rc=2
     fi
 done
 
-printf 'Time log: %s\n' "${TIME_FILE}" >&2
+printf 'Summary: %s\n' "${SUMMARY_FILE}" >&2
 exit "${overall_rc}"

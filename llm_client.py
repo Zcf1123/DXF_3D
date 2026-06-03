@@ -158,7 +158,11 @@ def _resolve_config_profile(config: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(profiles, dict):
         return config
 
-    active = config.get("active") or config.get("active_profile")
+    active = (
+        os.environ.get("DXF_3D_CONFIG_PROFILE")
+        or config.get("active")
+        or config.get("active_profile")
+    )
     if not active:
         raise ValueError("config has profiles but no active profile")
     profile = profiles.get(active)

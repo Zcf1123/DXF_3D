@@ -28,6 +28,7 @@ _MAX_VISIBLE_ENTITIES_PER_VIEW = 0
 _MAX_HIDDEN_ENTITIES_PER_VIEW = 4
 _MAX_OUTLINES_PER_VIEW = 4
 _MAX_EDGES_PER_OUTLINE = 12
+_MAX_FULL_EDGES_PER_OUTLINE = 64
 _MAX_PROFILE_SAMPLE_POINTS = 240
 
 _BANNED_TEXT = (
@@ -137,6 +138,21 @@ def _dimension_constraints(projected_views: Dict[str, Dict[str, Any]]) -> Dict[s
 
 def _model_understanding_hints(projected_views: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     hints: List[Dict[str, Any]] = []
+    front_arc_plate_hint = _front_arc_profile_plate_with_y_holes_hint(projected_views)
+    if front_arc_plate_hint is not None:
+        hints.append(front_arc_plate_hint)
+    smooth_front_plate_hint = _smooth_front_profile_plate_with_y_holes_hint(projected_views)
+    if smooth_front_plate_hint is not None:
+        hints.append(smooth_front_plate_hint)
+    top_polygon_prism_hint = _polygon_prism_from_top_outline_hint(projected_views)
+    if top_polygon_prism_hint is not None:
+        hints.append(top_polygon_prism_hint)
+    simple_top_cylinder_hint = _simple_z_cylinder_from_top_circle_hint(projected_views)
+    if simple_top_cylinder_hint is not None:
+        hints.append(simple_top_cylinder_hint)
+    stacked_y_cylinders_hint = _stacked_flat_cylinders_along_y_hint(projected_views)
+    if stacked_y_cylinders_hint is not None:
+        hints.append(stacked_y_cylinders_hint)
     cylinder_on_hex_hint = _central_cylinder_on_hex_prism_hint(projected_views)
     if cylinder_on_hex_hint is not None:
         hints.append(cylinder_on_hex_hint)
@@ -153,6 +169,413 @@ def _model_understanding_hints(projected_views: Dict[str, Dict[str, Any]]) -> Li
     if gear_hint is not None:
         hints.append(gear_hint)
     return hints
+
+
+def _polygon_prism_from_top_outline_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    top_width = _view_extent(top, "width", 0.0)
+    top_height = _view_extent(top, "height", 0.0)
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if top_width <= 0.0 or top_height <= 0.0 or height_z <= 0.0:
+        return None
+
+    outlines = top.get("visible_closed_outlines") or []
+    if not outlines:
+        return None
+    outline = max(outlines, key=lambda item: float(item.get("width") or 0.0) * float(item.get("height") or 0.0))
+    edge_count = int(outline.get("edge_count") or 0)
+    edges = outline.get("edges") or []
+    bbox = outline.get("bbox") or []
+    if len(bbox) != 4 or not edges or outline.get("edges_complete") is not True:
+        return None
+    if edge_count < 5 or edge_count > 16:
+        return None
+    if any(edge.get("kind") != "LINE" for edge in edges):
+        return None
+    bbox_width = float(bbox[2]) - float(bbox[0])
+    bbox_height = float(bbox[3]) - float(bbox[1])
+    if bbox_width < top_width * 0.85 or bbox_height < top_height * 0.85:
+        return None
+    if top.get("visible_circles"):
+        return None
+
+    vertices: List[List[float]] = []
+    for edge in edges:
+        p0 = edge.get("p0") or []
+        if len(p0) == 2:
+            vertices.append([float(p0[0]), float(p0[1])])
+    if len(vertices) < 5:
+        return None
+
+    return {
+        "kind": "polygon_prism_from_top_outline",
+        "confidence": "high",
+        "understanding": "多边形棱柱：TOP 的低边数直线闭合多边形是真实 footprint，FRONT/LEFT 给高度。",
+        "source_view": "top",
+        "construction": {
+            "profile_plane": "XY",
+            "vertices_2d": _round_json(vertices),
+            "edge_count": edge_count,
+            "height_z": _round_num(height_z),
+            "operation": "Create a closed XY polygon from vertices_2d and extrude along Z by height_z. Do not replace this low-edge polygon with an approximated circle/cylinder.",
+        },
+        "evidence": [
+            f"top largest closed outline has {edge_count} complete LINE edges",
+            "top has no true visible circle entity",
+            "front/left provide height and side projections only",
+        ],
+    }
+
+
+def _simple_z_cylinder_from_top_circle_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    width_x = _view_extent(front, "width", _view_extent(top, "width", 0.0))
+    depth_y = _view_extent(left, "width", _view_extent(top, "height", 0.0))
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    top_width = _view_extent(top, "width", 0.0)
+    top_height = _view_extent(top, "height", 0.0)
+    if width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0 or top_width <= 0.0 or top_height <= 0.0:
+        return None
+
+    front_outlines = front.get("visible_closed_outlines") or []
+    left_outlines = left.get("visible_closed_outlines") or []
+    if not front_outlines or not left_outlines:
+        return None
+    front_full = max(front_outlines, key=lambda item: float(item.get("width") or 0.0) * float(item.get("height") or 0.0))
+    left_full = max(left_outlines, key=lambda item: float(item.get("width") or 0.0) * float(item.get("height") or 0.0))
+    if int(front_full.get("edge_count") or 0) != 4 or int(left_full.get("edge_count") or 0) != 4:
+        return None
+
+    low_edge_polygon = False
+    for outline in top.get("visible_closed_outlines") or []:
+        edge_count = int(outline.get("edge_count") or 0)
+        if outline.get("edges_complete") is True and 5 <= edge_count <= 16:
+            edges = outline.get("edges") or []
+            if edges and all(edge.get("kind") == "LINE" for edge in edges):
+                low_edge_polygon = True
+                break
+
+    circles = [circle for circle in top.get("visible_circles") or [] if not circle.get("hidden")]
+    if not circles and not low_edge_polygon:
+        circles += [curve for curve in top.get("approximated_curves") or []
+                    if curve.get("kind") == "approximated_circle" and int(curve.get("edge_count") or 0) >= 24]
+    if not circles:
+        return None
+    circle = max(circles, key=lambda item: float(item.get("radius") or 0.0))
+    center = circle.get("center") or []
+    radius = float(circle.get("radius") or 0.0)
+    bbox = circle.get("bbox") or []
+    if len(center) != 2 or len(bbox) != 4 or radius <= 0.0:
+        return None
+    diameter = radius * 2.0
+    tol = max(top_width, top_height, width_x, depth_y, 1.0) * 0.03
+    spans_top = abs(diameter - top_width) <= tol and abs(diameter - top_height) <= tol
+    centered = abs(float(center[0]) - top_width * 0.5) <= tol and abs(float(center[1]) - top_height * 0.5) <= tol
+    matches_rect = abs(width_x - diameter) <= tol and abs(depth_y - diameter) <= tol
+    if not (spans_top and centered and matches_rect):
+        return None
+
+    return {
+        "kind": "simple_z_cylinder_from_top_circle",
+        "confidence": "high",
+        "understanding": "简单竖直圆柱：TOP 为完整圆形 footprint，FRONT/LEFT 为矩形投影且只给高度。",
+        "source_view": "top",
+        "construction": {
+            "axis": "Z",
+            "center_xy": [_round_num(float(center[0])), _round_num(float(center[1]))],
+            "radius": _round_num(radius),
+            "height_z": _round_num(height_z),
+            "operation": "Create a Z-axis solid cylinder from TOP circle center/radius and extrude height_z. Do not replace it with a box just because FRONT/LEFT are rectangular projections.",
+        },
+        "evidence": [
+            "top.visible_circles contains a centered circle spanning the TOP bbox",
+            "front and left are rectangular projections with width/depth matching the TOP circle diameter",
+            "front/left rectangles provide cylinder height only",
+        ],
+    }
+
+
+def _front_arc_profile_plate_with_y_holes_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    front = projected_views.get("front") or {}
+    top = projected_views.get("top") or {}
+    left = projected_views.get("left") or {}
+    width_x = _view_extent(front, "width", _view_extent(top, "width", 0.0))
+    depth_y = _view_extent(left, "width", _view_extent(top, "height", 0.0))
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0:
+        return None
+
+    edges = front.get("ordered_profile_edges") or []
+    if not edges:
+        for outline in front.get("visible_closed_outlines") or []:
+            outline_edges = outline.get("edges") or []
+            if outline.get("edges_complete") is True and outline_edges:
+                edges = outline_edges
+                break
+    if len(edges) < 3 or not any(edge.get("kind") == "ARC" for edge in edges):
+        return None
+
+    circles = front.get("visible_circles") or []
+    visible_circles = [circle for circle in circles if not circle.get("hidden")]
+    if len(visible_circles) < 1:
+        return None
+
+    return {
+        "kind": "front_arc_profile_plate_with_y_holes",
+        "confidence": "high",
+        "understanding": "等厚真实圆弧轮廓连接板：FRONT 完整 ARC 外轮廓沿 Y 拉伸，FRONT 圆为沿 Y 贯穿孔。",
+        "source_view": "front",
+        "construction": {
+            "outer_profile_plane": "XZ",
+            "ordered_profile_edges": _round_json(edges),
+            "extrude_axis": "Y",
+            "depth_y": _round_num(depth_y),
+            "width_x": _round_num(width_x),
+            "height_z": _round_num(height_z),
+            "hole_axis": "Y",
+            "hole_circle_candidates": _round_json(visible_circles),
+            "operation": "Use the FRONT ordered_profile_edges as the true outer profile in XZ, build each ARC with Part.Arc on points (x, 0, z), make a face, extrude along Y by depth_y, then cut Y-axis holes using hole_hints. Do not use TOP rectangular sub-outlines as the body footprint.",
+        },
+        "evidence": [
+            "front.ordered_profile_edges contains true ARC edges for a closed outer profile",
+            "front.visible_circles provide through-hole evidence",
+            "top/left provide Y depth and height cross-checks",
+        ],
+    }
+
+
+def _smooth_front_profile_plate_with_y_holes_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    front = projected_views.get("front") or {}
+    top = projected_views.get("top") or {}
+    left = projected_views.get("left") or {}
+    width_x = _view_extent(front, "width", _view_extent(top, "width", 0.0))
+    depth_y = _view_extent(left, "width", _view_extent(top, "height", 0.0))
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0:
+        return None
+
+    outlines = front.get("visible_closed_outlines") or []
+    if not outlines:
+        return None
+    full_outline = max(outlines, key=lambda item: int(item.get("edge_count") or 0))
+    edge_count = int(full_outline.get("edge_count") or 0)
+    if edge_count < 80:
+        return None
+
+    bbox = full_outline.get("bbox") or []
+    if len(bbox) != 4:
+        return None
+    bbox_width = float(bbox[2]) - float(bbox[0])
+    bbox_height = float(bbox[3]) - float(bbox[1])
+    if bbox_width < width_x * 0.85 or bbox_height < height_z * 0.85:
+        return None
+
+    profile_points = full_outline.get("profile_points_2d") or full_outline.get("sample_points_2d") or []
+    if len(profile_points) < 24:
+        return None
+
+    rounded_slots = [curve for curve in front.get("approximated_curves") or []
+                     if curve.get("kind") == "approximated_rounded_slot"]
+    hole_circles = [curve for curve in front.get("approximated_curves") or []
+                    if curve.get("kind") == "approximated_circle"]
+    if not rounded_slots or not hole_circles:
+        return None
+
+    return {
+        "kind": "smooth_front_profile_plate_with_y_holes",
+        "confidence": "medium",
+        "understanding": "等厚平滑轮廓连接板：FRONT 高密度外轮廓沿 Y 拉伸，FRONT 圆为沿 Y 贯穿孔。",
+        "source_view": "front",
+        "construction": {
+            "outer_profile_plane": "XZ",
+            "outer_profile_points_2d": _round_json(profile_points),
+            "extrude_axis": "Y",
+            "depth_y": _round_num(depth_y),
+            "width_x": _round_num(width_x),
+            "height_z": _round_num(height_z),
+            "hole_axis": "Y",
+            "hole_circle_candidates": _round_json(hole_circles),
+            "operation": "Create one closed Part.BSplineCurve from outer_profile_points_2d in the FRONT/XZ plane, make a face and extrude along Y by depth_y, then cut Y-axis holes using hole_hints. Do not replace the outer profile with a standard rounded slot/capsule. Do not create hundreds of LineSegment edges from these points unless the BSpline face fails, because that creates vertical seam lines on the side surface.",
+        },
+        "evidence": [
+            f"front largest outline has {edge_count} short LINE edges and spans the full FRONT bbox",
+            "front.approximated_curves includes an approximated_rounded_slot for the outer contour",
+            "front.approximated_curves includes approximated circles that match Y-axis through holes",
+            "top/left provide the extrusion depth and height cross-check for an equal-thickness plate",
+        ],
+    }
+
+
+def _stacked_flat_cylinders_along_y_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    front = projected_views.get("front") or {}
+    top = projected_views.get("top") or {}
+    left = projected_views.get("left") or {}
+    width_x = _view_extent(front, "width", _view_extent(top, "width", 0.0))
+    depth_y = _view_extent(left, "width", _view_extent(top, "height", 0.0))
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0:
+        return None
+    circles = [curve for curve in front.get("approximated_curves") or []
+               if curve.get("kind") == "approximated_circle"]
+    if not circles:
+        return None
+    circle = max(circles, key=lambda item: float(item.get("radius") or 0.0))
+    radius = float(circle.get("radius") or 0.0)
+    center = circle.get("center") or []
+    if len(center) != 2 or radius <= 0.0:
+        return None
+    if abs(radius * 2.0 - width_x) > max(width_x * 0.08, 1e-6):
+        return None
+    if abs(radius * 2.0 - height_z) > max(height_z * 0.08, 1e-6):
+        return None
+    y_breaks = _axis_break_positions_from_views(top, left, depth_y)
+    if len(y_breaks) < 4:
+        return None
+    segments = []
+    for y0, y1 in zip(y_breaks, y_breaks[1:]):
+        thickness = y1 - y0
+        if thickness <= max(depth_y * 0.03, 1e-6):
+            continue
+        segment_radius = _segment_radius_from_projection_spans(top, left, y0, y1, depth_y, radius)
+        segments.append({
+            "y0": _round_num(y0),
+            "y1": _round_num(y1),
+            "depth_y": _round_num(thickness),
+            "radius": _round_num(segment_radius),
+        })
+    if len(segments) < 3:
+        return None
+    return {
+        "kind": "stacked_flat_cylinders_along_y",
+        "confidence": "high",
+        "understanding": "同轴多个扁圆柱沿 Y 方向堆叠：FRONT 圆表示最大外圆截面，TOP/LEFT 的多条平行隐藏线/窄矩形给出轴向分段和各段直径，不是单个长圆柱。",
+        "construction": {
+            "axis": "Y",
+            "center_xz": [_round_num(float(center[0])), _round_num(float(center[1]))],
+            "radius": _round_num(radius),
+            "segments": segments,
+            "operation": "For each segment, create a Y-axis cylinder using that segment's radius and the common center_xz, from y0 to y1, then fuse all segments. Preserve visible/hidden segment boundaries as circular end faces; do not replace with one long cylinder or one radius.",
+        },
+        "evidence": [
+            "front.approximated_curves contains one circle spanning width_x and height_z, used as the maximum outer radius",
+            "top/left contain multiple parallel hidden or visible boundary lines along the Y direction",
+            "line spans in top/left give per-segment X/Z diameters, so segments may have different radii",
+        ],
+    }
+
+
+def _segment_radius_from_projection_spans(
+    top: Dict[str, Any],
+    left: Dict[str, Any],
+    y0: float,
+    y1: float,
+    depth_y: float,
+    default_radius: float,
+) -> float:
+    mid_y = (y0 + y1) * 0.5
+    tol = max(depth_y * 0.035, 1e-6)
+    x_spans: List[float] = []
+    z_spans: List[float] = []
+    for outline in top.get("visible_closed_outlines") or []:
+        bbox = outline.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        if _range_overlaps(mid_y, float(bbox[1]), float(bbox[3]), tol):
+            x_spans.append(float(bbox[2]) - float(bbox[0]))
+    for entity in top.get("key_hidden_entities") or []:
+        bbox = entity.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        if abs(float(bbox[1]) - float(bbox[3])) <= tol and abs(float(bbox[1]) - mid_y) <= max((y1 - y0) * 0.55, tol):
+            x_spans.append(float(bbox[2]) - float(bbox[0]))
+    for group in ((top.get("hidden_line_groups") or {}).get("horizontal") or []):
+        coord = float(group.get("coord") or 0.0)
+        if abs(coord - mid_y) <= max((y1 - y0) * 0.55, tol):
+            span = float(group.get("max_span") or 0.0)
+            if span > 0.0:
+                x_spans.append(span)
+    for outline in left.get("visible_closed_outlines") or []:
+        bbox = outline.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        yl0 = depth_y - float(bbox[2])
+        yl1 = depth_y - float(bbox[0])
+        if _range_overlaps(mid_y, yl0, yl1, tol):
+            z_spans.append(float(bbox[3]) - float(bbox[1]))
+    for entity in left.get("key_hidden_entities") or []:
+        bbox = entity.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        if abs(float(bbox[0]) - float(bbox[2])) <= tol:
+            y = depth_y - float(bbox[0])
+            if abs(y - mid_y) <= max((y1 - y0) * 0.55, tol):
+                z_spans.append(float(bbox[3]) - float(bbox[1]))
+    for group in ((left.get("hidden_line_groups") or {}).get("vertical") or []):
+        y = depth_y - float(group.get("coord") or 0.0)
+        if abs(y - mid_y) <= max((y1 - y0) * 0.55, tol):
+            span = float(group.get("max_span") or 0.0)
+            if span > 0.0:
+                z_spans.append(span)
+    radii = []
+    if x_spans:
+        radii.append(max(x_spans) * 0.5)
+    if z_spans:
+        radii.append(max(z_spans) * 0.5)
+    if not radii:
+        return default_radius
+    radius = min(max(radii), default_radius)
+    return radius if radius > 1e-9 else default_radius
+
+
+def _range_overlaps(value: float, start: float, end: float, tol: float) -> bool:
+    lo = min(start, end) - tol
+    hi = max(start, end) + tol
+    return lo <= value <= hi
+
+
+def _axis_break_positions_from_views(top: Dict[str, Any], left: Dict[str, Any], depth_y: float) -> List[float]:
+    positions = [0.0, depth_y]
+    tol = max(depth_y * 0.02, 1e-6)
+    for outline in top.get("visible_closed_outlines") or []:
+        bbox = outline.get("bbox") or []
+        if len(bbox) == 4:
+            positions.extend([float(bbox[1]), float(bbox[3])])
+    for entity in top.get("key_hidden_entities") or []:
+        bbox = entity.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        if abs(float(bbox[1]) - float(bbox[3])) <= tol:
+            positions.append(float(bbox[1]))
+    for group in ((top.get("hidden_line_groups") or {}).get("horizontal") or []):
+        positions.append(float(group.get("coord") or 0.0))
+    left_width = _view_extent(left, "width", depth_y)
+    for outline in left.get("visible_closed_outlines") or []:
+        bbox = outline.get("bbox") or []
+        if len(bbox) == 4:
+            positions.extend([depth_y - float(bbox[0]), depth_y - float(bbox[2])])
+    for entity in left.get("key_hidden_entities") or []:
+        bbox = entity.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        if abs(float(bbox[0]) - float(bbox[2])) <= tol:
+            positions.append(depth_y - float(bbox[0]))
+    for group in ((left.get("hidden_line_groups") or {}).get("vertical") or []):
+        positions.append(depth_y - float(group.get("coord") or 0.0))
+    positions = [min(max(pos, 0.0), depth_y) for pos in positions]
+    positions.sort()
+    deduped: List[float] = []
+    for pos in positions:
+        if not deduped or abs(pos - deduped[-1]) > tol:
+            deduped.append(pos)
+    if deduped and deduped[0] > tol:
+        deduped.insert(0, 0.0)
+    if deduped and abs(deduped[-1] - depth_y) > tol:
+        deduped.append(depth_y)
+    return deduped
 
 
 def _central_cylinder_on_hex_prism_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -377,14 +800,14 @@ def _toothed_disk_from_top_hint(projected_views: Dict[str, Dict[str, Any]]) -> O
     top = projected_views.get("top") or {}
     front = projected_views.get("front") or {}
     left = projected_views.get("left") or {}
-    outlines = top.get("visible_closed_outlines") or []
-    if not outlines:
-        return None
     top_width = _view_extent(top, "width", 0.0)
     top_height = _view_extent(top, "height", 0.0)
     height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
     if top_width <= 0.0 or top_height <= 0.0 or height_z <= 0.0:
         return None
+    outlines = top.get("visible_closed_outlines") or []
+    if not outlines:
+        return _toothed_disk_from_open_top_profile(top, front, left, top_width, top_height, height_z)
     full_outline = max(outlines, key=lambda item: int(item.get("edge_count") or 0))
     edge_count = int(full_outline.get("edge_count") or 0)
     if edge_count < 80:
@@ -404,6 +827,8 @@ def _toothed_disk_from_top_hint(projected_views: Dict[str, Dict[str, Any]]) -> O
     if bore is None:
         return None
     profile_points = full_outline.get("profile_points_2d") or full_outline.get("sample_points_2d") or []
+    profile_points = _ensure_profile_points_cover_bbox(
+        profile_points, bbox, full_outline.get("sample_points_2d") or [])
     if len(profile_points) < 12:
         return None
     center = [_round_num((float(bbox[0]) + float(bbox[2])) * 0.5),
@@ -430,6 +855,55 @@ def _toothed_disk_from_top_hint(projected_views: Dict[str, Dict[str, Any]]) -> O
     }
 
 
+def _toothed_disk_from_open_top_profile(
+    top: Dict[str, Any],
+    front: Dict[str, Any],
+    left: Dict[str, Any],
+    top_width: float,
+    top_height: float,
+    height_z: float,
+) -> Optional[Dict[str, Any]]:
+    arcs = [entity for entity in top.get("key_profile_entities") or [] if entity.get("kind") == "ARC"]
+    segments = [entity for entity in top.get("key_profile_entities") or [] if entity.get("kind") in {"LINE", "LWPOLYLINE", "POLYLINE"}]
+    if len(arcs) < 6 or len(segments) < 12:
+        return None
+    bore_candidates = _deduped_circle_sources(top)
+    if not bore_candidates:
+        return None
+    center = [_round_num(top_width * 0.5), _round_num(top_height * 0.5)]
+    bore = max(bore_candidates, key=lambda item: float(item.get("radius") or 0.0))
+    profile_points = _gear_points_from_radial_entities(arcs + segments, center)
+    if len(profile_points) < 24:
+        return None
+    bbox = _points_bbox_2d(profile_points)
+    if bbox[2] - bbox[0] < top_width * 0.85 or bbox[3] - bbox[1] < top_height * 0.85:
+        return None
+    return {
+        "kind": "toothed_disk_from_open_top_profile",
+        "confidence": "high",
+        "understanding": "齿轮/带齿圆盘：TOP 由开口线段和圆弧给出齿顶/齿根外轮廓，中心圆为贯穿孔，FRONT/LEFT 给厚度。",
+        "source_view": "top",
+        "construction": {
+            "outer_profile_plane": "XY",
+            "outer_profile_points_2d": _round_json(profile_points),
+            "extrude_axis": "Z",
+            "height_z": _round_num(height_z),
+            "center": center,
+            "bore_hole": {
+                "axis": "Z",
+                "center": _round_json(bore.get("center") or center),
+                "radius": _round_num(float(bore.get("radius") or 0.0)),
+            },
+            "operation": "Create a closed XY polygon from outer_profile_points_2d, extrude along Z by height_z, then cut the Z-axis center bore. Do not replace the gear by a box.",
+        },
+        "evidence": [
+            "top has no single closed outline, but contains repeated radial tooth line segments and arcs around the same center",
+            "front/left are thin rectangular projections, consistent with an extruded gear disk",
+            "top contains one centered visible circle used as the bore hole",
+        ],
+    }
+
+
 def _largest_centered_top_circle(top: Dict[str, Any], bbox: List[float]) -> Optional[Dict[str, Any]]:
     center_x = (float(bbox[0]) + float(bbox[2])) * 0.5
     center_y = (float(bbox[1]) + float(bbox[3])) * 0.5
@@ -452,6 +926,112 @@ def _largest_centered_top_circle(top: Dict[str, Any], bbox: List[float]) -> Opti
         "center": _round_json(circle.get("center") or []),
         "radius": _round_num(float(circle.get("radius") or 0.0)),
     }
+
+
+def _gear_points_from_radial_entities(entities: List[Dict[str, Any]], center: List[float]) -> List[List[float]]:
+    cx, cy = float(center[0]), float(center[1])
+    candidates: List[Tuple[float, float, float, float]] = []
+    for entity in entities:
+        for point in _entity_profile_points(entity):
+            x, y = float(point[0]), float(point[1])
+            radius = math.hypot(x - cx, y - cy)
+            if radius <= 1e-9:
+                continue
+            angle = math.atan2(y - cy, x - cx) % (2.0 * math.pi)
+            candidates.append((angle, radius, x, y))
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: (item[0], -item[1]))
+    deduped: List[Tuple[float, float, float, float]] = []
+    angle_tol = math.radians(0.4)
+    for item in candidates:
+        if deduped and abs(item[0] - deduped[-1][0]) <= angle_tol:
+            if item[1] > deduped[-1][1]:
+                deduped[-1] = item
+        else:
+            deduped.append(item)
+    # Merge wrap-around duplicate angles.
+    if len(deduped) > 1 and abs((deduped[0][0] + 2.0 * math.pi) - deduped[-1][0]) <= angle_tol:
+        if deduped[-1][1] > deduped[0][1]:
+            deduped[0] = (deduped[0][0], deduped[-1][1], deduped[-1][2], deduped[-1][3])
+        deduped.pop()
+    return [[item[2], item[3]] for item in deduped]
+
+
+def _entity_profile_points(entity: Dict[str, Any]) -> List[List[float]]:
+    if entity.get("kind") == "ARC" and len(entity.get("center") or []) == 2:
+        center = entity.get("center") or []
+        radius = float(entity.get("radius") or 0.0)
+        start = float(entity.get("start_angle") or 0.0)
+        end = float(entity.get("end_angle") or 0.0)
+        if radius <= 0.0:
+            return []
+        start_rad = math.radians(start)
+        end_rad = math.radians(end)
+        if end_rad < start_rad:
+            end_rad += 2.0 * math.pi
+        span = max(end_rad - start_rad, 0.0)
+        # Dense enough that each original outer arc remains visibly curved in
+        # the generated polygon; 5-degree steps are a good compact compromise.
+        steps = max(4, int(math.ceil(span / math.radians(5.0))))
+        angles = [start_rad + span * i / float(steps) for i in range(steps + 1)]
+        return [[
+            float(center[0]) + radius * math.cos(angle),
+            float(center[1]) + radius * math.sin(angle),
+        ] for angle in angles]
+    points: List[List[float]] = []
+    if len(entity.get("points") or []) >= 2:
+        points.extend([[float(p[0]), float(p[1])] for p in entity.get("points") or [] if len(p or []) == 2])
+    for key in ("p0", "p1"):
+        point = entity.get(key) or []
+        if len(point) == 2:
+            points.append([float(point[0]), float(point[1])])
+    return points
+
+
+def _points_bbox_2d(points: List[List[float]]) -> List[float]:
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _ensure_profile_points_cover_bbox(
+    points: List[Any],
+    bbox: List[float],
+    extra_points: Optional[List[Any]] = None,
+) -> List[List[float]]:
+    """Add sampled outline points nearest to bbox extremes.
+
+    Long toothed outlines are down-sampled before being sent to the LLM.  A
+    uniform sample can miss the true left/right/top/bottom extreme vertices,
+    so scripts generated from the sampled polygon get a smaller bbox and then
+    fail the dimension contract.  Keep the compact profile, but force the
+    sampled polygon to include points near all four bbox extremes.
+    """
+    if len(bbox) != 4:
+        return [[float(p[0]), float(p[1])] for p in points if len(p or []) == 2]
+    cleaned = [[float(p[0]), float(p[1])] for p in points if len(p or []) == 2]
+    candidates = list(cleaned)
+    if extra_points:
+        candidates.extend([[float(p[0]), float(p[1])] for p in extra_points if len(p or []) == 2])
+    if not cleaned:
+        return []
+    min_x, min_y, max_x, max_y = [float(value) for value in bbox]
+    targets = [
+        (min_x, (min_y + max_y) * 0.5),
+        (max_x, (min_y + max_y) * 0.5),
+        ((min_x + max_x) * 0.5, min_y),
+        ((min_x + max_x) * 0.5, max_y),
+    ]
+    result = list(cleaned)
+    for tx, ty in targets:
+        nearest = min(candidates, key=lambda p: (p[0] - tx) ** 2 + (p[1] - ty) ** 2)
+        if all(abs(nearest[0] - p[0]) > 1e-9 or abs(nearest[1] - p[1]) > 1e-9 for p in result):
+            insert_at = min(range(len(result)), key=lambda idx: (result[idx][0] - tx) ** 2 + (result[idx][1] - ty) ** 2)
+            # Insert after the closest predecessor in the existing order to
+            # preserve the outline winding as much as possible.
+            result.insert(min(insert_at + 1, len(result)), nearest)
+    return result
 
 
 def _hex_nut_arc_revolve_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -848,6 +1428,56 @@ def validate_fcstd_dimensions(fcstd_path: str, context: Dict[str, Any]) -> Tuple
     return True, "OK", details
 
 
+def validate_fcstd_arc_edges(fcstd_path: str, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """Validate that ARC-bearing source profiles remain circular edges."""
+    expected_arc_count = _expected_profile_arc_count(context)
+    if expected_arc_count <= 0:
+        return True, "SKIP", {"expected_arc_count": 0, "actual_circular_edge_count": 0}
+    import FreeCAD as App  # type: ignore
+    doc = App.openDocument(fcstd_path)
+    try:
+        result = doc.getObject("Result")
+        if result is None:
+            return False, "Result object not found", {"expected_arc_count": expected_arc_count}
+        shape = getattr(result, "Shape", None)
+        if shape is None or shape.isNull():
+            return False, "Result object has no geometry", {"expected_arc_count": expected_arc_count}
+        type_ids = []
+        circular_edge_count = 0
+        for edge in getattr(shape, "Edges", []) or []:
+            curve = getattr(edge, "Curve", None)
+            type_id = str(getattr(curve, "TypeId", ""))
+            if type_id:
+                type_ids.append(type_id)
+            if type_id == "Part::GeomCircle":
+                circular_edge_count += 1
+    finally:
+        App.closeDocument(doc.Name)
+    details = {
+        "expected_arc_count": expected_arc_count,
+        "actual_circular_edge_count": circular_edge_count,
+        "curve_type_counts": {type_id: type_ids.count(type_id) for type_id in sorted(set(type_ids))},
+    }
+    if circular_edge_count < expected_arc_count:
+        return False, f"expected at least {expected_arc_count} circular arc edges, actual {circular_edge_count}", details
+    return True, "OK", details
+
+
+def _expected_profile_arc_count(context: Dict[str, Any]) -> int:
+    projected = context.get("projected_views") or {}
+    top = projected.get("top") or {}
+    ordered_edges = top.get("ordered_profile_edges") or []
+    count = sum(1 for edge in ordered_edges if edge.get("kind") == "ARC")
+    if count > 0:
+        return count
+    for outline in top.get("visible_closed_outlines") or []:
+        edges = outline.get("edges") or []
+        count = sum(1 for edge in edges if edge.get("kind") == "ARC")
+        if count > 0:
+            return count
+    return 0
+
+
 def normalize_fcstd_dimensions(fcstd_path: str, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
     """Scale the generated Result shape to the dimension contract when possible."""
     constraints = (context.get("dimension_constraints") or {}).get("overall_size") or {}
@@ -914,9 +1544,9 @@ def normalize_fcstd_dimensions(fcstd_path: str, context: Dict[str, Any]) -> Tupl
                 "failures": failures,
             }
         matrix = App.Matrix(
-            scale["width_x"], 0.0, 0.0, -float(bb.XMin) * scale["width_x"],
-            0.0, scale["depth_y"], 0.0, -float(bb.YMin) * scale["depth_y"],
-            0.0, 0.0, scale["height_z"], -float(bb.ZMin) * scale["height_z"],
+            scale["width_x"], 0.0, 0.0, float(bb.XMin) * (1.0 - scale["width_x"]),
+            0.0, scale["depth_y"], 0.0, float(bb.YMin) * (1.0 - scale["depth_y"]),
+            0.0, 0.0, scale["height_z"], float(bb.ZMin) * (1.0 - scale["height_z"]),
             0.0, 0.0, 0.0, 1.0,
         )
         result.Shape = shape.transformGeometry(matrix)
@@ -993,6 +1623,260 @@ def cache_successful_freecad_script(
         return
     key = _script_cache_key(llm, prompt, context, base_name)
     _write_cached_script(key, script)
+
+
+def generate_outline_fallback_script(
+    context: Dict[str, Any],
+    base_name: str,
+    fcstd_path: str,
+) -> Optional[str]:
+    """Generate a deterministic script for a closed LINE/ARC outline."""
+    projected = context.get("projected_views") or {}
+    view_name = "top"
+    view = projected.get("top") or {}
+
+    for hint in context.get("model_understanding_hints") or []:
+        if hint.get("kind") == "front_arc_profile_plate_with_y_holes":
+            view_name = "front"
+            view = projected.get("front") or {}
+            break
+
+    if view_name != "front":
+        front = projected.get("front") or {}
+        front_edges = front.get("ordered_profile_edges") or []
+        front_circles = front.get("visible_circles") or []
+        if any(edge.get("kind") == "ARC" for edge in front_edges) and front_circles:
+            view_name = "front"
+            view = front
+
+    edges = view.get("ordered_profile_edges") or []
+    outlines = view.get("visible_closed_outlines") or []
+    if not edges:
+        for candidate in outlines:
+            candidate_edges = candidate.get("edges") or []
+            if candidate.get("edges_complete") is True and candidate_edges:
+                edges = candidate_edges
+                break
+    if edges:
+        points = _discretize_outline_edges(edges)
+    else:
+        points = _outline_points_from_model_hint(context)
+    if len(points) < 4:
+        return None
+
+    dims = ((context.get("dimension_constraints") or {}).get("overall_size") or {})
+    width_x = float(dims.get("width_x") or (projected.get("top") or {}).get("width") or 0.0)
+    depth_y = float(dims.get("depth_y") or (projected.get("top") or {}).get("height") or 0.0)
+    height_z = float(dims.get("height_z") or 0.0)
+    if width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0:
+        return None
+
+    if view_name == "front":
+        extrusion = (0.0, depth_y, 0.0)
+        plane = "XZ"
+        holes = [h for h in context.get("hole_hints") or [] if h.get("axis") == "Y"]
+        understanding = "基于FRONT有序线弧轮廓沿Y拉伸的异形连接板，孔按hole_hints切除"
+    else:
+        extrusion = (0.0, 0.0, height_z)
+        plane = "XY"
+        holes = [h for h in context.get("hole_hints") or [] if h.get("axis") == "Z"]
+        understanding = "基于TOP有序线弧轮廓拉伸的异形板，中心孔按hole_hints切除"
+
+    edges_literal = repr(_round_json(edges))
+    points_literal = repr(_round_json(points))
+    hole_lines = "final_shape = body\n"
+    dim_extra = ""
+    if holes:
+        cut_lines: List[str] = []
+        hole_dims: List[str] = []
+        for idx, hole in enumerate(holes):
+            radius = float(hole.get("radius") or 0.0)
+            base = hole.get("base_world") or []
+            center = hole.get("center_world") or []
+            cutter_height = float(hole.get("height") or 0.0)
+            if radius <= 0.0 or len(base) != 3 or len(center) < 3 or cutter_height <= 0.0:
+                continue
+            axis = hole.get("axis")
+            direction = (0, 1, 0) if axis == "Y" else (0, 0, 1)
+            cut_lines.append(
+                f"cutter_{idx} = Part.makeCylinder({radius!r}, {cutter_height!r}, "
+                f"App.Vector({float(base[0])!r}, {float(base[1])!r}, {float(base[2])!r}), "
+                f"App.Vector({direction[0]}, {direction[1]}, {direction[2]}))"
+            )
+            cut_lines.append(f"final_shape = final_shape.cut(cutter_{idx})")
+            hole_dims.append(f'{{"radius": {radius!r}, "center": [{float(center[0])!r}, {float(center[1])!r}, {float(center[2])!r}]}}')
+        if cut_lines:
+            hole_lines = "final_shape = body\n" + "\n".join(cut_lines) + "\n"
+            dim_extra = f', "holes": [{", ".join(hole_dims)}]'
+    ex, ey, ez = extrusion
+    return f'''import FreeCAD as App
+import Part
+import math
+
+BASE_NAME = {base_name!r}
+FCSTD_PATH = {fcstd_path!r}
+MODEL_UNDERSTANDING = {understanding!r}
+DIMENSIONS_USED = {{"width_x": {width_x!r}, "depth_y": {depth_y!r}, "height_z": {height_z!r}{dim_extra}}}
+
+
+def _vec(point):
+    if {plane!r} == "XZ":
+        return App.Vector(float(point[0]), 0.0, float(point[1]))
+    return App.Vector(float(point[0]), float(point[1]), 0.0)
+
+
+def _arc_midpoint(edge):
+    center = edge["center"]
+    radius = float(edge["radius"])
+    p0 = edge["p0"]
+    p1 = edge["p1"]
+    a0 = math.atan2(float(p0[1]) - float(center[1]), float(p0[0]) - float(center[0]))
+    a1 = math.atan2(float(p1[1]) - float(center[1]), float(p1[0]) - float(center[0]))
+    if edge.get("clockwise"):
+        span = (a0 - a1) % (2.0 * math.pi)
+        angle = a0 - span * 0.5
+    else:
+        span = (a1 - a0) % (2.0 * math.pi)
+        angle = a0 + span * 0.5
+    return _vec([
+        float(center[0]) + radius * math.cos(angle),
+        float(center[1]) + radius * math.sin(angle),
+    ])
+
+
+def _point_gap(a, b):
+    return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+def _copy_edge(edge):
+    item = dict(edge)
+    if edge.get("p0"):
+        item["p0"] = [float(edge["p0"][0]), float(edge["p0"][1])]
+    if edge.get("p1"):
+        item["p1"] = [float(edge["p1"][0]), float(edge["p1"][1])]
+    return item
+
+
+def _snap_profile_edges(profile_edges, tol):
+    snapped = [_copy_edge(edge) for edge in profile_edges]
+    if len(snapped) < 3:
+        return snapped
+    for idx in range(len(snapped)):
+        cur = snapped[idx]
+        nxt = snapped[(idx + 1) % len(snapped)]
+        p = cur.get("p1")
+        q = nxt.get("p0")
+        if not p or not q:
+            continue
+        gap = _point_gap(p, q)
+        if gap <= tol:
+            merged = [(float(p[0]) + float(q[0])) * 0.5, (float(p[1]) + float(q[1])) * 0.5]
+            cur["p1"] = merged
+            nxt["p0"] = merged
+        else:
+            raise ValueError("线弧轮廓断点过大，不能吸附")
+    return snapped
+
+
+def _wire_from_edges(profile_edges):
+    fc_edges = []
+    for edge in profile_edges:
+        p0 = edge.get("p0")
+        p1 = edge.get("p1")
+        if not p0 or not p1:
+            continue
+        v0 = _vec(p0)
+        v1 = _vec(p1)
+        if v0.distanceToPoint(v1) <= 1e-9:
+            continue
+        if edge.get("kind") == "ARC" and edge.get("center") and float(edge.get("radius") or 0.0) > 0.0:
+            vm = _arc_midpoint(edge)
+            try:
+                if edge.get("clockwise"):
+                    fc_edges.append(Part.Arc(v1, vm, v0).toShape())
+                else:
+                    fc_edges.append(Part.Arc(v0, vm, v1).toShape())
+            except Exception:
+                fc_edges.append(Part.LineSegment(v0, v1).toShape())
+        else:
+            fc_edges.append(Part.LineSegment(v0, v1).toShape())
+    return Part.Wire(fc_edges)
+
+doc = App.newDocument(BASE_NAME)
+profile_edges = {edges_literal}
+profile_points = {points_literal}
+try:
+    if profile_edges and any(edge.get("kind") == "ARC" for edge in profile_edges):
+        snap_tol = max({width_x!r}, {depth_y!r}, {height_z!r}, 1.0) * 1e-5
+        profile_edges = _snap_profile_edges(profile_edges, snap_tol)
+        wire = _wire_from_edges(profile_edges)
+    else:
+        raise ValueError("无可用圆弧边")
+    if not wire.isClosed():
+        raise ValueError("线弧轮廓未闭合")
+except Exception:
+    vectors = [App.Vector(float(x), float(y), 0.0) for x, y in profile_points]
+    if vectors[0].distanceToPoint(vectors[-1]) > 1e-9:
+        vectors.append(vectors[0])
+    wire = Part.makePolygon(vectors)
+face = Part.Face(wire)
+body = face.extrude(App.Vector({ex!r}, {ey!r}, {ez!r}))
+{hole_lines}result = doc.addObject("Part::Feature", "Result")
+result.Shape = final_shape
+doc.recompute()
+doc.saveAs(FCSTD_PATH)
+'''
+
+
+def _discretize_outline_edges(edges: List[Dict[str, Any]]) -> List[List[float]]:
+    points: List[List[float]] = []
+    for edge in edges:
+        p0 = edge.get("p0") or []
+        p1 = edge.get("p1") or []
+        if len(p0) != 2 or len(p1) != 2:
+            continue
+        if not points:
+            points.append([float(p0[0]), float(p0[1])])
+        if edge.get("kind") == "ARC" and len(edge.get("center") or []) == 2 and float(edge.get("radius") or 0.0) > 0.0:
+            center = edge.get("center") or []
+            radius = float(edge.get("radius") or 0.0)
+            a0 = math.atan2(float(p0[1]) - float(center[1]), float(p0[0]) - float(center[0]))
+            a1 = math.atan2(float(p1[1]) - float(center[1]), float(p1[0]) - float(center[0]))
+            if edge.get("clockwise"):
+                span = (a0 - a1) % (2.0 * math.pi)
+                if span > math.pi:
+                    span = 2.0 * math.pi - span
+                    clockwise = False
+                else:
+                    clockwise = True
+            else:
+                span = (a1 - a0) % (2.0 * math.pi)
+                if span > math.pi:
+                    span = 2.0 * math.pi - span
+                    clockwise = True
+                else:
+                    clockwise = False
+            steps = max(4, int(math.ceil(span / (math.pi / 36.0))))
+            for i in range(1, steps):
+                t = i / float(steps)
+                angle = a0 - span * t if clockwise else a0 + span * t
+                points.append([
+                    float(center[0]) + radius * math.cos(angle),
+                    float(center[1]) + radius * math.sin(angle),
+                ])
+        points.append([float(p1[0]), float(p1[1])])
+    return points
+
+
+def _outline_points_from_model_hint(context: Dict[str, Any]) -> List[List[float]]:
+    for hint in context.get("model_understanding_hints") or []:
+        if hint.get("kind") not in {"toothed_disk_from_open_top_profile", "toothed_disk_from_top_profile"}:
+            continue
+        construction = hint.get("construction") or {}
+        points = construction.get("outer_profile_points_2d") or []
+        if len(points) >= 4:
+            return [[float(p[0]), float(p[1])] for p in points if len(p or []) == 2]
+    return []
 
 
 def _script_cache_key(llm: Any, prompt: Prompt, context: Dict[str, Any], base_name: str) -> str:
@@ -1303,6 +2187,13 @@ def validate_generated_script(script: str) -> Tuple[bool, str]:
         return False, "R-Z profile points must be translated to App.Vector(center_x + r, center_y, z) before revolve"
     if _regular_hex_prism_script_has_extra_features(script):
         return False, "regular hex prism scripts must not add holes, fillets, chamfers, or revolved envelopes without explicit circle/arc hints"
+    if _has_naive_arc_midpoint(script):
+        return False, "ARC midpoint angle must handle start/end crossing 360 degrees; if end_angle < start_angle, add 2*pi before averaging"
+    ok_arc, arc_reason = _validate_literal_arc_midpoints(script)
+    if not ok_arc:
+        return False, arc_reason
+    if _has_fixed_extra_hole_height(script):
+        return False, "hole cutter height must come from hole_hints.height or use height_z + 2*margin with matching base -margin; do not use height + 0.2 with base -0.1"
     if "_edge(Part)" in script:
         return False, "do not call _edge(Part) or Part.Vertex to build wires; create line/arc edges or use Part.makePolygon(points)"
     try:
@@ -1391,6 +2282,103 @@ def _regular_hex_prism_script_has_extra_features(script: str) -> bool:
     return any(token in script for token in banned)
 
 
+def _has_naive_arc_midpoint(script: str) -> bool:
+    return (
+        "Part.Arc" in script and
+        "start_a" in script and
+        "end_a" in script and
+        "mid_a = (start_a + end_a) / 2" in script and
+        "end_a < start_a" not in script and
+        "end_a += 2" not in script
+    )
+
+
+def _has_fixed_extra_hole_height(script: str) -> bool:
+    return bool(re.search(
+        r"Part\.makeCylinder\([^\n]*height\s*\+\s*0\.2[^\n]*App\.Vector\([^\n]*-0\.1",
+        script,
+    ))
+
+
+def _validate_literal_arc_midpoints(script: str) -> Tuple[bool, str]:
+    """Validate common literal edge dictionaries used by LLM scripts.
+
+    For the project outline format, ARC p0/p1 are ordered around the loop.  A
+    valid Part.Arc(p0, pmid, p1) midpoint must lie on the minor CCW interval
+    from p0 to p1, or on the corresponding interval after swapping p0/p1.
+    Qwen often computes a CCW angle from start/end but keeps p0/p1 in the
+    opposite order; FreeCAD then creates the complementary large arc, expanding
+    the bbox while static API checks still pass.
+    """
+    if "'kind': 'ARC'" not in script and '"kind": "ARC"' not in script:
+        return True, "ok"
+    try:
+        tree = ast.parse(script)
+    except SyntaxError:
+        return True, "ok"
+    arc_items: List[Dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        try:
+            value = ast.literal_eval(node)
+        except Exception:
+            continue
+        if not isinstance(value, dict) or value.get("kind") != "ARC":
+            continue
+        if all(key in value for key in ("p0", "p1", "center", "radius")):
+            arc_items.append(value)
+    for idx, item in enumerate(arc_items):
+        p0 = item.get("p0") or []
+        p1 = item.get("p1") or []
+        center = item.get("center") or []
+        if len(p0) != 2 or len(p1) != 2 or len(center) != 2:
+            continue
+        radius = float(item.get("radius") or 0.0)
+        if radius <= 0.0:
+            continue
+        start = item.get("start_angle", item.get("start"))
+        end = item.get("end_angle", item.get("end"))
+        if start is None or end is None:
+            continue
+        start_a = math.radians(float(start))
+        end_a = math.radians(float(end))
+        if end_a < start_a:
+            end_a += 2.0 * math.pi
+        mid_a = (start_a + end_a) * 0.5
+        pmid = [
+            float(center[0]) + radius * math.cos(mid_a),
+            float(center[1]) + radius * math.sin(mid_a),
+        ]
+        clockwise = bool(item.get("clockwise"))
+        if clockwise:
+            valid = _point_on_minor_arc(p1, pmid, p0, center)
+        else:
+            valid = _point_on_minor_arc(p0, pmid, p1, center)
+        if valid:
+            continue
+        return False, (
+            f"ARC literal #{idx} midpoint does not match the edge direction; "
+            "respect clockwise=true by constructing the clockwise small arc, otherwise construct the counter-clockwise small arc"
+        )
+    return True, "ok"
+
+
+def _point_on_minor_arc(p0: List[float], pmid: List[float], p1: List[float], center: List[float]) -> bool:
+    a0 = _angle_from_center(p0, center)
+    am = _angle_from_center(pmid, center)
+    a1 = _angle_from_center(p1, center)
+    span = (a1 - a0) % (2.0 * math.pi)
+    if span <= 1e-9 or span > math.pi + 1e-6:
+        return False
+    mid_span = (am - a0) % (2.0 * math.pi)
+    return -1e-6 <= mid_span <= span + 1e-6
+
+
+def _angle_from_center(point: List[float], center: List[float]) -> float:
+    return math.atan2(float(point[1]) - float(center[1]), float(point[0]) - float(center[0])) % (2.0 * math.pi)
+
+
 def _is_number_literal(node: ast.AST) -> bool:
     return isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
 
@@ -1432,6 +2420,9 @@ def _projected_view_summary(name: str, pv: Any) -> Dict[str, Any]:
     outlines, circles = extract_closed_outlines_and_circles(temp_bundle, hidden_pred=_is_hidden_entity)
     visible = [e for e in modeling_entities if not _is_hidden_entity(e)]
     hidden = [e for e in modeling_entities if _is_hidden_entity(e)]
+    ordered_profile_edges = _ordered_profile_edges_from_outlines(outlines)
+    if not ordered_profile_edges:
+        ordered_profile_edges = _ordered_profile_edges_from_endpoint_graph(visible, float(pv.width), float(pv.height))
     return {
         "name": name,
         "plane": pv.plane,
@@ -1443,15 +2434,282 @@ def _projected_view_summary(name: str, pv: Any) -> Dict[str, Any]:
         "modeling_entity_count": len(modeling_entities),
         "excluded_auxiliary_entity_count": len(pv.entities) - len(modeling_entities),
         "visible_closed_outlines": [_outline_summary(o) for o in outlines[:_MAX_OUTLINES_PER_VIEW]],
+        "ordered_profile_edges": ordered_profile_edges,
         "regular_polygon_hints": _regular_polygon_hints(outlines),
         "extrusion_profile_hints": _extrusion_profile_hints(outlines, pv.plane, float(pv.width)),
         "approximated_curves": _dedupe_curve_summaries(
             _approximated_curve_summaries(outlines) + _approximated_line_circle_summaries(modeling_entities)
         ),
         "visible_circles": [_circle_summary(c) for c in circles],
+        "key_profile_entities": _key_profile_entity_summaries(visible, 96),
         "key_visible_entities": _key_entity_summaries(visible, _MAX_VISIBLE_ENTITIES_PER_VIEW),
         "key_hidden_entities": _key_entity_summaries(hidden, _MAX_HIDDEN_ENTITIES_PER_VIEW),
+        "hidden_line_groups": _hidden_line_groups(hidden),
     }
+
+
+def _ordered_profile_edges_from_outlines(outlines: List[Any]) -> List[Dict[str, Any]]:
+    if not outlines:
+        return []
+    raw_edges = outlines[0].to_dict().get("edges", [])
+    return _round_json([_profile_edge_summary(edge) for edge in raw_edges])
+
+
+def _ordered_profile_edges_from_endpoint_graph(entities: List[DxfEntity], width: float, height: float) -> List[Dict[str, Any]]:
+    """Trace the largest closed LINE/ARC profile from endpoint connectivity.
+
+    This is view-agnostic and works for TOP/FRONT/LEFT projected 2D geometry.
+    It keeps ARC entities as true ordered edges instead of falling back to a
+    radial angle sort that only works for gear-like TOP views.
+    """
+    edges: List[Dict[str, Any]] = []
+    for entity in entities:
+        if entity.kind == "ARC" and entity.center is not None and entity.radius is not None:
+            edge = _arc_profile_edge(entity)
+            if edge is not None:
+                edges.append(edge)
+        elif entity.kind == "LINE" and len(entity.points) >= 2:
+            edge = _line_profile_edge(entity.points[0], entity.points[1])
+            if edge is not None:
+                edges.append(edge)
+        elif entity.kind in {"LWPOLYLINE", "POLYLINE"} and len(entity.points) >= 2:
+            limit = len(entity.points) if entity.extra.get("closed") else len(entity.points) - 1
+            for idx in range(limit):
+                edge = _line_profile_edge(entity.points[idx], entity.points[(idx + 1) % len(entity.points)])
+                if edge is not None:
+                    edges.append(edge)
+    if not edges or not any(edge.get("kind") == "ARC" for edge in edges):
+        return []
+    scale = max(width, height, 1.0)
+    tol = max(scale * 1e-5, 1e-4)
+    loops = _trace_closed_edge_loops(edges, tol)
+    if not loops:
+        return []
+    loop = max(loops, key=_profile_loop_area)
+    if len(loop) < 3 or not any(edge.get("kind") == "ARC" for edge in loop):
+        return []
+    return _round_json([_profile_edge_summary(edge) for edge in loop])
+
+
+def _trace_closed_edge_loops(edges: List[Dict[str, Any]], tol: float) -> List[List[Dict[str, Any]]]:
+    remaining = _prune_profile_dangling_edges(edges, tol)
+    loops: List[List[Dict[str, Any]]] = []
+    used: set[int] = set()
+    for idx, edge in enumerate(remaining):
+        if idx in used:
+            continue
+        loop, loop_indices = _trace_one_closed_edge_loop(remaining, idx, tol)
+        if loop and len(loop) >= 3:
+            loops.append(loop)
+            used.update(loop_indices)
+    return loops
+
+
+def _trace_one_closed_edge_loop(edges: List[Dict[str, Any]], start_idx: int, tol: float) -> Tuple[List[Dict[str, Any]], set[int]]:
+    first = edges[start_idx]
+    loop = [first]
+    used = {start_idx}
+    start_pt = first.get("p0") or []
+    end_pt = first.get("p1") or []
+    while len(start_pt) == 2 and len(end_pt) == 2 and not _profile_points_close(end_pt, start_pt, tol):
+        candidates = []
+        for idx, edge in enumerate(edges):
+            if idx in used:
+                continue
+            p0 = edge.get("p0") or []
+            p1 = edge.get("p1") or []
+            if _profile_points_close(p0, end_pt, tol):
+                candidates.append((0.0, idx, edge))
+            elif _profile_points_close(p1, end_pt, tol):
+                candidates.append((0.0, idx, _reverse_profile_edge(edge)))
+        if not candidates:
+            return [], set()
+        _score, next_idx, next_edge = min(candidates, key=lambda item: item[0])
+        loop.append(next_edge)
+        used.add(next_idx)
+        end_pt = next_edge.get("p1") or []
+        if len(used) > len(edges):
+            return [], set()
+    if len(start_pt) == 2 and len(end_pt) == 2 and _profile_points_close(end_pt, start_pt, tol):
+        return loop, used
+    return [], set()
+
+
+def _prune_profile_dangling_edges(edges: List[Dict[str, Any]], tol: float) -> List[Dict[str, Any]]:
+    remaining = list(edges)
+    changed = True
+    while changed:
+        degree: Dict[Tuple[int, int], int] = {}
+        for edge in remaining:
+            for key in ("p0", "p1"):
+                point = edge.get(key) or []
+                if len(point) != 2:
+                    continue
+                node = _profile_point_key(point, tol)
+                degree[node] = degree.get(node, 0) + 1
+        kept = []
+        for edge in remaining:
+            p0 = edge.get("p0") or []
+            p1 = edge.get("p1") or []
+            if len(p0) != 2 or len(p1) != 2:
+                continue
+            if degree.get(_profile_point_key(p0, tol), 0) >= 2 and degree.get(_profile_point_key(p1, tol), 0) >= 2:
+                kept.append(edge)
+        changed = len(kept) != len(remaining)
+        remaining = kept
+    return remaining
+
+
+def _reverse_profile_edge(edge: Dict[str, Any]) -> Dict[str, Any]:
+    if edge.get("kind") == "ARC":
+        item = {
+            "kind": "ARC",
+            "center": edge.get("center"),
+            "radius": edge.get("radius"),
+            "start_angle": edge.get("end_angle"),
+            "end_angle": edge.get("start_angle"),
+            "clockwise": not bool(edge.get("clockwise")),
+            "p0": edge.get("p1"),
+            "p1": edge.get("p0"),
+        }
+        if not item["clockwise"]:
+            item.pop("clockwise", None)
+        return item
+    return {"kind": "LINE", "p0": edge.get("p1"), "p1": edge.get("p0")}
+
+
+def _profile_points_close(a: Any, b: Any, tol: float) -> bool:
+    return len(a or []) == 2 and len(b or []) == 2 and abs(float(a[0]) - float(b[0])) <= tol and abs(float(a[1]) - float(b[1])) <= tol
+
+
+def _profile_point_key(point: Any, tol: float) -> Tuple[int, int]:
+    return (round(float(point[0]) / tol), round(float(point[1]) / tol))
+
+
+def _profile_loop_area(loop: List[Dict[str, Any]]) -> float:
+    points = [edge.get("p0") for edge in loop if len(edge.get("p0") or []) == 2]
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for idx, point in enumerate(points):
+        nxt = points[(idx + 1) % len(points)]
+        area += float(point[0]) * float(nxt[1]) - float(nxt[0]) * float(point[1])
+    return abs(area) * 0.5
+
+
+def _arc_profile_edge(entity: DxfEntity) -> Optional[Dict[str, Any]]:
+    if entity.center is None or entity.radius is None:
+        return None
+    cx, cy = float(entity.center[0]), float(entity.center[1])
+    radius = float(entity.radius)
+    if radius <= 0.0:
+        return None
+    start = float(entity.start_angle or 0.0)
+    end = float(entity.end_angle or 0.0)
+    start_rad = math.radians(start)
+    end_rad = math.radians(end)
+    return {
+        "kind": "ARC",
+        "center": [cx, cy],
+        "radius": radius,
+        "start_angle": start,
+        "end_angle": end,
+        "p0": [cx + radius * math.cos(start_rad), cy + radius * math.sin(start_rad)],
+        "p1": [cx + radius * math.cos(end_rad), cy + radius * math.sin(end_rad)],
+    }
+
+
+def _line_profile_edge(p0: Any, p1: Any) -> Optional[Dict[str, Any]]:
+    if len(p0 or []) != 2 or len(p1 or []) != 2:
+        return None
+    x0, y0 = float(p0[0]), float(p0[1])
+    x1, y1 = float(p1[0]), float(p1[1])
+    if math.hypot(x1 - x0, y1 - y0) <= 1e-9:
+        return None
+    return {"kind": "LINE", "p0": [x0, y0], "p1": [x1, y1]}
+
+
+def _profile_edge_summary(edge: Dict[str, Any]) -> Dict[str, Any]:
+    item = {
+        "kind": edge.get("kind"),
+        "p0": edge.get("p0"),
+        "p1": edge.get("p1"),
+    }
+    if edge.get("kind") == "ARC":
+        item["center"] = edge.get("center")
+        item["radius"] = edge.get("radius")
+        item["start_angle"] = edge.get("start_angle")
+        item["end_angle"] = edge.get("end_angle")
+        if edge.get("clockwise"):
+            item["clockwise"] = True
+    return item
+
+
+def _key_profile_entity_summaries(entities: List[DxfEntity], limit: int) -> List[Dict[str, Any]]:
+    profile_kinds = {"LINE", "ARC", "LWPOLYLINE", "POLYLINE"}
+    selected = [entity for entity in entities if entity.kind in profile_kinds]
+    ranked = sorted(selected, key=_entity_angle_rank)
+    return [_entity_summary(entity, idx) for idx, entity in enumerate(ranked[:limit])]
+
+
+def _entity_angle_rank(entity: DxfEntity) -> float:
+    b = entity.bbox()
+    if not b:
+        return 0.0
+    cx = (b[0] + b[2]) * 0.5
+    cy = (b[1] + b[3]) * 0.5
+    return math.atan2(cy, cx)
+
+
+def _hidden_line_groups(entities: List[DxfEntity]) -> Dict[str, List[Dict[str, Any]]]:
+    horizontal: Dict[float, List[Tuple[float, float]]] = {}
+    vertical: Dict[float, List[Tuple[float, float]]] = {}
+    for entity in entities:
+        if entity.kind != "LINE" or len(entity.points) < 2:
+            continue
+        p0, p1 = entity.points[0], entity.points[1]
+        x0, y0 = float(p0[0]), float(p0[1])
+        x1, y1 = float(p1[0]), float(p1[1])
+        if abs(y0 - y1) <= 1e-6:
+            y = _round_num((y0 + y1) * 0.5)
+            horizontal.setdefault(y, []).append((min(x0, x1), max(x0, x1)))
+        elif abs(x0 - x1) <= 1e-6:
+            x = _round_num((x0 + x1) * 0.5)
+            vertical.setdefault(x, []).append((min(y0, y1), max(y0, y1)))
+    return {
+        "horizontal": _line_group_summary(horizontal),
+        "vertical": _line_group_summary(vertical),
+    }
+
+
+def _line_group_summary(groups: Dict[float, List[Tuple[float, float]]]) -> List[Dict[str, Any]]:
+    result = []
+    for coord in sorted(groups):
+        spans = groups[coord]
+        if not spans:
+            continue
+        merged = _merge_spans(spans)
+        result.append({
+            "coord": _round_num(coord),
+            "spans": [[_round_num(a), _round_num(b)] for a, b in merged],
+            "max_span": _round_num(max((b - a) for a, b in merged)),
+            "count": len(spans),
+        })
+    return result
+
+
+def _merge_spans(spans: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if not spans:
+        return []
+    spans = sorted(spans)
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + 1e-6:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _point_to_world_hint(plane: str, width: float) -> str:
@@ -1516,7 +2774,11 @@ def _annotation_summary(entity: DxfEntity) -> Dict[str, Any]:
 
 
 def _outline_summary(outline: Any) -> Dict[str, Any]:
-    edges = outline.to_dict().get("edges", [])[:_MAX_EDGES_PER_OUTLINE]
+    raw_edges = outline.to_dict().get("edges", [])
+    if len(raw_edges) <= _MAX_FULL_EDGES_PER_OUTLINE:
+        edges = raw_edges
+    else:
+        edges = raw_edges[:_MAX_EDGES_PER_OUTLINE]
     sample_points = _sample_outline_points(outline, 24) if len(outline.edges) > _MAX_EDGES_PER_OUTLINE else []
     profile_points = _sample_outline_points(outline, _MAX_PROFILE_SAMPLE_POINTS) if len(outline.edges) >= 80 else []
     return {
@@ -1524,6 +2786,7 @@ def _outline_summary(outline: Any) -> Dict[str, Any]:
         "width": _round_num(outline.width),
         "height": _round_num(outline.height),
         "edge_count": len(outline.edges),
+        "edges_complete": len(raw_edges) <= _MAX_FULL_EDGES_PER_OUTLINE,
         "edges": _round_json(edges),
         "sample_points_2d": _round_json(sample_points),
         "profile_points_2d": _round_json(profile_points),
@@ -1547,6 +2810,9 @@ def _sample_outline_points(outline: Any, limit: int) -> List[List[float]]:
         used.add(point_index)
         point = points[point_index]
         sampled.append([float(point[0]), float(point[1])])
+    bbox = outline.bbox
+    if len(bbox) == 4:
+        sampled = _ensure_profile_points_cover_bbox(sampled, list(bbox), points)
     return sampled
 
 

@@ -1,24 +1,47 @@
 ## 总览
 
+当前默认运行路线是 **Auto LLM 直接建模路线**：解析 DXF、分类三视图并生成紧凑的
+`auto_context.json`，然后由 LLM 直接编写并执行 FreeCAD Python 脚本。
+
+只有显式加 `--direct` 时，才进入确定性特征路线并生成/使用
+`features_draft.json` 与 `features.json`。
+
 ```
 .dxf 文件
   │
-  ▼ 阶段 1   direct/code/dxf_loader          → entities.json
-  ▼ 阶段 2   direct/code/view_classifier     → views_algorithm.json
-  ▼ 阶段 2.5 direct/code/llm_planner.review_views → views_semantic.json  ← 启用 LLM 时执行
-  │           ↓ _apply_view_review（删除辅助线、重命名视图）
-  ▼ 阶段 3   direct/code/projection_mapper
-             + direct/code/feature_inference  → features_draft.json
-  ▼ 阶段 4   direct/code/llm_planner.refine_features → features.json      ← 启用 LLM 时执行
-  ▼ 阶段 5   direct/code/freecad_builder     → .FCStd
-  ▼ 阶段 6   direct/code/exporters           → .step / .obj / .png / _overview.png
-                                    model.json / generated_model.py / run.log
+  ▼ 阶段 1   dxf_loader                      → entities.json
+  ▼ 阶段 2   view_classifier                 → views_algorithm.json / views.json
+  ▼ 阶段 3   projection_mapper               → 归一化 projected views
+  │
+  ├─ 默认 Auto 路线
+  │    ▼ llm/code/llm_code_planner.build_auto_context → auto_context.json
+  │    ▼ LLM 生成 FreeCAD Python                         → generated_model.py
+  │    ▼ 执行脚本 + 尺寸契约校验                          → .FCStd / dimension_validation.json
+  │    ▼ direct/code/exporters                            → .step / .obj / .png / model.json / run.log
+  │
+  └─ --direct 路线
+       ▼ direct/code/llm_planner.review_views             → views_semantic.json  ← 启用 LLM 时执行
+       ▼ direct/code/feature_inference                    → features_draft.json
+       ▼ direct/code/llm_planner.refine_features          → features.json        ← 启用 LLM 时执行
+       ▼ direct/code/freecad_builder                      → .FCStd
+       ▼ direct/code/exporters                            → .step / .obj / .png / model.json / generated_model.py / run.log
 ```
 
-`--auto` 路线复用阶段 1-3 的解析、分类和投影，但不生成 `Feature` 后交给
-`freecad_builder` 解释；它会把紧凑的 `auto_context.json` 交给
+默认 Auto 路线复用阶段 1-3 的解析、分类和投影，但**不生成 `Feature`，也不生成
+`features.json`**；它会把紧凑的 `auto_context.json` 交给
 `llm/code/llm_code_planner.py`，由 LLM 直接生成 `generated_model.py`，执行后再复用
 `direct/code/exporters.py` 导出 STEP / OBJ / PNG / model.json。
+
+加 `--direct` 时使用确定性特征路线：先生成 `features_draft.json/features.json`，再交给
+`direct/code/freecad_builder.py` 建模。
+
+注意：默认 Auto 路线强依赖 LLM。若默认路线下使用 `--no-llm` 或
+`DXF_3D_DISABLE_LLM=1` 禁用 LLM，程序**不会自动切换为 `--direct`**；Auto 路线会因为
+无法生成 FreeCAD 脚本而失败。若要完全不使用 LLM 跑确定性算法，应显式使用：
+
+```bash
+./run.sh -d --direct --no-llm dxf_files/xxx.dxf
+```
 
 每次运行在 `outputs/` 下创建一个独立子目录：
 
@@ -33,10 +56,16 @@ outputs/<YYYYMMDD>_<HHMMSS>_<文件名>/
 根入口 `run.py` 只转发到 `direct/code/run.py` 的 `main()`；实际初始化由
 `direct/code/run.py` 完成：
 
-1. 读取 `config.json`，实例化 `LLMPlanner`。  
-   若 `openai_api_key` 为空或文件不存在，LLM 标记为 `disabled`，流水线退化为纯算法模式。
-2. 从命令行参数或 `dxf_files/` 目录收集待处理 DXF 列表。
-3. 为每个 DXF 文件创建带时间戳的输出目录并初始化日志文件（`run.log`）。
+1. 解析命令行参数，确定运行路线：
+  - 默认：Auto LLM 直接建模路线，实例化 `LLMClient`。
+  - `--direct`：确定性特征路线，实例化 `LLMPlanner`。
+  - `--auto`：隐藏兼容参数，等价于默认 Auto 路线。
+2. 读取 `config.json`。若 API key 为空、配置文件不存在、`--no-llm` 或
+  `DXF_3D_DISABLE_LLM=1` 生效，LLM 标记为 `disabled`。
+  - 默认 Auto 路线下，LLM disabled 不会自动降级为 direct；后续脚本生成阶段会失败。
+  - `--direct` 路线下，LLM disabled 表示跳过视图复核和特征精修，直接使用算法结果。
+3. 从命令行参数或 `dxf_files/` 目录收集待处理 DXF 列表。
+4. 为每个 DXF 文件创建带时间戳的输出目录并初始化日志文件（`run.log`）。
 
 ---
 
@@ -123,7 +152,47 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 
 ---
 
-## 阶段 2.5 — 视图语义复核（`direct/code/llm_planner.py`，可选）
+## 默认 Auto 路线 — LLM 直接生成 FreeCAD 脚本
+
+默认命令：
+
+```bash
+./run.sh -d dxf_files/xxx.dxf
+```
+
+该路线在阶段 1-3 后进入 `llm/code/llm_code_planner.py`：
+
+1. `build_auto_context()` 从 `views`、`projected_views`、闭合轮廓、近似圆、隐藏线、孔线索和
+  `prompts/part_knowledge.md` 构造 `auto_context.json`。
+2. `generate_freecad_script()` 使用 `llm/prompts/freecad_script_generator.md` 请求 LLM 输出完整
+  FreeCAD Python 脚本。
+3. `validate_generated_script()` 对脚本做安全和结构校验，拒绝危险调用和常见错误 FreeCAD API。
+4. 脚本写入 `generated_model.py` 后由 `runpy.run_path()` 执行，生成 `<base>.FCStd`。
+5. `validate_fcstd_dimensions()` 使用 `dimension_constraints` 校验 `Result.Shape.BoundBox` 的
+  X/Y/Z 尺寸。
+6. 尺寸不合格时，先尝试 `normalize_fcstd_dimensions()` 自动归一化；仍失败时请求 LLM 重写脚本。
+7. 成功后调用导出器生成 STEP / OBJ / PNG / `model.json`。
+
+Auto 路线产物重点：
+
+| 文件 | 说明 |
+|------|------|
+| `auto_context.json` | 送给 LLM 的紧凑三视图/投影/零件语义上下文 |
+| `generated_model.py` | LLM 生成并实际执行的 FreeCAD 脚本 |
+| `dimension_validation.json` | Auto 路线尺寸契约校验结果 |
+| `llm_raw_response*.txt` | LLM 原始响应或重试响应（用于调试） |
+
+Auto 路线不产生 `features_draft.json` / `features.json`。这些文件只属于 `--direct` 路线。
+
+---
+
+## `--direct` 阶段 2.5 — 视图语义复核（`direct/code/llm_planner.py`，可选）
+
+以下阶段只在显式加 `--direct` 时执行：
+
+```bash
+./run.sh -d --direct dxf_files/xxx.dxf
+```
 
 **输入：** 每个视图实体的语义摘要（kind / linetype / bbox，不发送完整坐标）
 
@@ -144,7 +213,7 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 
 ---
 
-## 阶段 3 — 投影与特征推断
+## `--direct` 阶段 3 — 投影与特征推断
 
 ### 3a — 坐标投影（`direct/code/projection_mapper.py`）
 
@@ -225,7 +294,7 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 
 ---
 
-## 阶段 4 — LLM 特征精化（`direct/code/llm_planner.py`，可选）
+## `--direct` 阶段 4 — LLM 特征精化（`direct/code/llm_planner.py`，可选）
 
 **输入：** `view_bboxes` + `features_draft`
 
@@ -249,13 +318,14 @@ cluster.center.x > mx  且  cluster.center.y ≥ my   →  left（右上）
 
 ---
 
-## 阶段 5 — FreeCAD 建模（`direct/code/freecad_builder.py`）
+## `--direct` 阶段 5 — FreeCAD 建模（`direct/code/freecad_builder.py`）
 
 > 需要在 `freecadcmd` 环境下运行，普通 `python3` 无法导入 `FreeCAD / Part / Mesh`。
 
 ### 构建逻辑
 
-按 `features.json` 顺序依次处理：
+按 `features.json` 顺序依次处理。再次强调：`features.json` 只在 `--direct` 路线产生并被消费，
+默认 Auto 路线不使用该文件。
 
 | kind | FreeCAD 操作 |
 |------|-------------|
@@ -315,10 +385,14 @@ Status      : OK
 
 | 情形 | 行为 |
 |------|------|
-| LLM 不可用（无 key / 网络失败） | 跳过 LLM 阶段，全用算法结果 |
-| LLM 返回非 JSON | 回退草案，写 log |
-| LLM 违反安全校验 | 回退草案，写 log |
-| 布尔 cut 失败（孔） | 记录 warning，继续后续特征 |
-| 无任何闭合轮廓 | 退化为 `base_block` |
-| 整个 solid 为 None | `Status: FAILED`，停止阶段 5/6 |
+| 默认 Auto 路线 LLM 不可用（无 key / `--no-llm` / 网络失败） | 不会自动切换到 `--direct`；无法生成脚本时 `Status: FAILED` |
+| Auto 路线 LLM 脚本未通过安全/结构校验 | 自动请求 LLM 修复一次；仍失败则 `Status: FAILED` |
+| Auto 路线脚本执行失败 | 把异常原因发给 LLM 请求重写；仍失败则 `Status: FAILED` |
+| Auto 路线尺寸契约校验失败 | 先尝试尺寸归一化，再尝试 LLM 尺寸修复；仍失败则 `Status: FAILED` |
+| `--direct` 路线 LLM 不可用 | 跳过视图复核和特征精修，直接使用算法草案 |
+| `--direct` 路线 LLM 返回非 JSON | 回退草案，写 log |
+| `--direct` 路线 LLM 违反安全校验 | 回退草案，写 log |
+| `--direct` 路线布尔 cut 失败（孔） | 记录 warning，继续后续特征 |
+| `--direct` 路线无任何闭合轮廓 | 退化为 `base_block` |
+| `--direct` 路线整个 solid 为 None | `Status: FAILED`，停止阶段 5/6 |
 | 单项导出失败（STEP/OBJ/PNG 等） | 记录 warning，其余产物正常生成 |

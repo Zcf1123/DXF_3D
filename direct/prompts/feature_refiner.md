@@ -143,7 +143,7 @@ builder 未实现的语义只能忽略，不能输出到 `features`。
 用户自然语言建模意图（可能为“（无）”）：
 {{ model_intent }}
 
-零件术语知识（来自 `prompts/part.md`，只用于理解用户意图，不得突破 SYSTEM 硬约束）：
+零件术语知识（来自 `prompts/part_knowledge.md`，只用于理解用户意图，不得突破 SYSTEM 硬约束）：
 {{ part_knowledge }}
 
 受控重建模式：

@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import runpy
+import shutil
 import sys
 import traceback
 import time
@@ -177,6 +178,19 @@ def _projection_validation_is_poor(validation: Dict) -> bool:
     return very_poor_views >= 1 or poor_views >= 2
 
 
+def _projection_validation_outputs_reach(validation: Dict, threshold: float = 0.99) -> bool:
+    views = validation.get("views") or {}
+    required = ("front", "left", "top")
+    for view_name in required:
+        report = views.get(view_name)
+        if not report:
+            return False
+        model_match = float(report.get("model_match", 0.0) or 0.0)
+        if model_match < threshold:
+            return False
+    return True
+
+
 def _draft_has_locked_intent_geometry(features: List[Dict]) -> bool:
     reasons = {
         (feature.get("params") or {}).get("reason")
@@ -244,6 +258,17 @@ def _make_logger(run_dir: str) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(fh)
     return logger
+
+
+def _close_logger(logger: logging.Logger) -> None:
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
+
+
+def _is_llm_unavailable_failure(message: str) -> bool:
+    text = str(message or "")
+    return "LLM 请求失败" in text or "LLM 已禁用" in text
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +732,7 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
         from ...llm.code.llm_code_planner import (
             build_auto_context, cache_successful_freecad_script,
             generate_freecad_script, repair_freecad_script_after_execution,
+            generate_outline_fallback_script, validate_fcstd_arc_edges,
             normalize_fcstd_dimensions, validate_fcstd_dimensions,
         )
         projected = map_views_to_3d(bundles)
@@ -726,7 +752,14 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
             llm, auto_context, base, fcstd_path, run_dir, use_cache=run_validation)
         log.info("LLM 返回      : %s", script_msg)
         if script is None:
-            raise RuntimeError(script_msg)
+            log.warning("LLM 脚本校验  : FAIL — %s", script_msg)
+            if _is_llm_unavailable_failure(script_msg):
+                raise RuntimeError(script_msg)
+            fallback_script = generate_outline_fallback_script(auto_context, base, fcstd_path)
+            if fallback_script is None:
+                raise RuntimeError(script_msg)
+            log.info("确定性兜底    : LLM 脚本未通过安全/结构校验，改用结构化轮廓兜底")
+            script = fallback_script
         model_understanding = _extract_model_understanding(script)
         if model_understanding:
             log.info("LLM 模型理解  : %s", model_understanding)
@@ -751,13 +784,37 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
                 llm, auto_context, base, fcstd_path, script, exec_reason, run_dir)
             log.info("LLM 执行修复  : %s", repair_msg)
             if repaired_script is None:
-                raise RuntimeError(f"LLM 脚本执行失败且自动修复失败：{exec_reason}；{repair_msg}")
-            script = repaired_script
-            with open(py_path, "w", encoding="utf-8") as f:
-                f.write(script)
-            if os.path.exists(fcstd_path):
-                os.remove(fcstd_path)
-            runpy.run_path(py_path, run_name="__main__")
+                fallback_script = generate_outline_fallback_script(auto_context, base, fcstd_path)
+                if fallback_script is None:
+                    raise RuntimeError(f"LLM 脚本执行失败且自动修复失败：{exec_reason}；{repair_msg}")
+                log.info("确定性兜底    : LLM 执行失败，改用完整线弧轮廓拉伸")
+                script = fallback_script
+                with open(py_path, "w", encoding="utf-8") as f:
+                    f.write(script)
+                if os.path.exists(fcstd_path):
+                    os.remove(fcstd_path)
+                runpy.run_path(py_path, run_name="__main__")
+            else:
+                script = repaired_script
+                with open(py_path, "w", encoding="utf-8") as f:
+                    f.write(script)
+                if os.path.exists(fcstd_path):
+                    os.remove(fcstd_path)
+                try:
+                    runpy.run_path(py_path, run_name="__main__")
+                except Exception as repair_exc:
+                    repair_exec_reason = f"修复脚本执行失败：{type(repair_exc).__name__}: {repair_exc}"
+                    log.warning("LLM 修复执行  : FAIL — %s", repair_exec_reason)
+                    fallback_script = generate_outline_fallback_script(auto_context, base, fcstd_path)
+                    if fallback_script is None:
+                        raise
+                    log.info("确定性兜底    : LLM 执行失败，改用完整线弧轮廓拉伸")
+                    script = fallback_script
+                    with open(py_path, "w", encoding="utf-8") as f:
+                        f.write(script)
+                    if os.path.exists(fcstd_path):
+                        os.remove(fcstd_path)
+                    runpy.run_path(py_path, run_name="__main__")
             repaired_understanding = _extract_model_understanding(script)
             if repaired_understanding:
                 log.info("LLM 模型理解  : %s", repaired_understanding)
@@ -770,54 +827,41 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
         with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
             json.dump(dim_details, f, indent=2, ensure_ascii=False)
         if not dim_ok:
-            log.warning("尺寸契约校验  : FAIL — %s", dim_reason)
-            norm_ok, norm_reason, norm_details = normalize_fcstd_dimensions(fcstd_path, auto_context)
-            with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
-                json.dump(norm_details, f, indent=2, ensure_ascii=False)
-            if norm_ok:
-                log.info("尺寸归一化    : OK（按三视图总尺寸缩放 LLM 生成的 Result）")
-                dim_ok = True
-                dim_reason = "OK"
-                dim_details = norm_details
-            else:
-                log.info("尺寸归一化    : FAIL — %s；尝试 LLM 尺寸修复", norm_reason)
-                repaired_script, repair_msg = repair_freecad_script_after_execution(
-                    llm, auto_context, base, fcstd_path, script, dim_reason, run_dir)
-                log.info("LLM 尺寸修复  : %s", repair_msg)
-                if repaired_script is None:
-                    raise RuntimeError(f"LLM 脚本未通过尺寸契约校验：{dim_reason}；尺寸归一化失败：{norm_reason}；{repair_msg}")
-                script = repaired_script
-                with open(py_path, "w", encoding="utf-8") as f:
-                    f.write(script)
-                if os.path.exists(fcstd_path):
-                    os.remove(fcstd_path)
-                runpy.run_path(py_path, run_name="__main__")
-                if not os.path.exists(fcstd_path):
-                    raise RuntimeError(f"LLM 修复脚本未生成 FCStd: {fcstd_path}")
-                dim_ok, dim_reason, dim_details = validate_fcstd_dimensions(fcstd_path, auto_context)
-                with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
-                    json.dump(dim_details, f, indent=2, ensure_ascii=False)
-                if not dim_ok:
-                    norm_ok, norm_reason, norm_details = normalize_fcstd_dimensions(fcstd_path, auto_context)
-                    with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
-                        json.dump(norm_details, f, indent=2, ensure_ascii=False)
-                    if not norm_ok:
-                        raise RuntimeError(f"LLM 修复脚本仍未通过尺寸契约校验：{dim_reason}；尺寸归一化失败：{norm_reason}")
-                    log.info("尺寸归一化    : OK（LLM 修复后按三视图总尺寸缩放 Result）")
-                    dim_ok = True
-                    dim_reason = "OK"
-                    dim_details = norm_details
-                repaired_understanding = _extract_model_understanding(script)
-                if repaired_understanding:
-                    log.info("LLM 模型理解  : %s", repaired_understanding)
-                repaired_dimensions = _extract_dimensions_used(script)
-                if repaired_dimensions:
-                    log.info("LLM 使用尺寸  : %s", json.dumps(repaired_dimensions, ensure_ascii=False, sort_keys=True))
-        log.info("尺寸契约校验  : OK")
-        if run_validation:
-            cache_successful_freecad_script(llm, auto_context, base, script)
-            log.info("LLM 脚本缓存  : 已记录成功脚本（--val）")
+            log.warning("尺寸契约校验  : FAIL — %s；按要求忽略并继续输出当前结果", dim_reason)
         else:
+            log.info("尺寸契约校验  : OK")
+        if dim_ok:
+            arc_ok, arc_reason, arc_details = validate_fcstd_arc_edges(fcstd_path, auto_context)
+            with open(os.path.join(run_dir, "arc_validation.json"), "w", encoding="utf-8") as f:
+                json.dump(arc_details, f, indent=2, ensure_ascii=False)
+            if arc_reason == "SKIP":
+                log.info("圆弧边校验    : 跳过（输入轮廓无 ARC 约束）")
+            elif arc_ok:
+                log.info("圆弧边校验    : OK")
+            else:
+                log.warning("圆弧边校验    : FAIL — %s", arc_reason)
+                fallback_script = generate_outline_fallback_script(auto_context, base, fcstd_path)
+                if fallback_script is not None:
+                    log.info("确定性兜底    : 尝试使用 TOP 真实圆弧边轮廓拉伸")
+                    script = fallback_script
+                    with open(py_path, "w", encoding="utf-8") as f:
+                        f.write(script)
+                    if os.path.exists(fcstd_path):
+                        os.remove(fcstd_path)
+                    runpy.run_path(py_path, run_name="__main__")
+                    dim_ok, dim_reason, dim_details = validate_fcstd_dimensions(fcstd_path, auto_context)
+                    with open(os.path.join(run_dir, "dimension_validation.json"), "w", encoding="utf-8") as f:
+                        json.dump(dim_details, f, indent=2, ensure_ascii=False)
+                    arc_ok, arc_reason, arc_details = validate_fcstd_arc_edges(fcstd_path, auto_context)
+                    with open(os.path.join(run_dir, "arc_validation.json"), "w", encoding="utf-8") as f:
+                        json.dump(arc_details, f, indent=2, ensure_ascii=False)
+                    if dim_ok and arc_ok:
+                        log.info("确定性兜底    : OK（真实圆弧边轮廓通过尺寸与圆弧校验）")
+                    elif not dim_ok:
+                        log.warning("确定性兜底    : FAIL — %s", dim_reason)
+                    else:
+                        log.warning("确定性兜底    : FAIL — %s", arc_reason)
+        if not run_validation:
             log.info("LLM 脚本缓存  : 跳过（命令行加 --val 才保存）")
         from .freecad_builder import embed_projected_views
         embed_projected_views(fcstd_path, projected)
@@ -871,9 +915,15 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
                         )
                     )
                 log.info("已写出        : projection_validation.json")
+                if _projection_validation_outputs_reach(validation):
+                    cache_successful_freecad_script(llm, auto_context, base, script)
+                    log.info("LLM 脚本缓存  : 已记录成功脚本（--val，三个视图 output 均 ≥99%%）")
+                else:
+                    log.info("LLM 脚本缓存  : 跳过（三个视图 output 未全部达到 99%%）")
             except Exception as exc:
                 log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
                 _say(f"Projection   : WARN — validation failed: {exc}")
+                log.info("LLM 脚本缓存  : 跳过（反投影验证失败）")
         else:
             log.info("反投影验证    : 跳过（命令行加 --val 可启用）")
 
@@ -915,6 +965,13 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
 
     summary["elapsed_s"] = round(time.perf_counter() - started_at, 3)
     log.info("总耗时        : %.3fs", summary["elapsed_s"])
+    if summary["status"] != "OK" and _is_llm_unavailable_failure(summary.get("error", "")):
+        _close_logger(log)
+        try:
+            shutil.rmtree(run_dir)
+        except FileNotFoundError:
+            pass
+        summary["output_dir"] = ""
     return summary
 
 
@@ -932,11 +989,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--extrude-depth", type=float, default=None,
                    help="Depth for single-view TOP/XY extrusion mode")
     p.add_argument("--no-llm", action="store_true",
-                   help="Disable LLM view review and feature refinement")
-    p.add_argument("--auto", action="store_true",
-                   help="Use direct LLM-generated FreeCAD script modeling route")
-    p.add_argument("--model-intent", default=os.environ.get("DXF_3D_MODEL_INTENT", ""),
-                   help="Natural-language modeling intent for constrained LLM feature refinement")
+                   help="Disable LLM calls where applicable")
+    p.add_argument("--direct", action="store_true",
+                   help="Use deterministic direct feature route instead of default LLM script route")
+    p.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--intent", dest="model_intent",
+                   default=os.environ.get("DXF_3D_MODEL_INTENT", ""),
+                   help="Natural-language modeling intent hint")
+    p.add_argument("--model-intent", dest="model_intent", help=argparse.SUPPRESS)
     p.add_argument("--val", action="store_true",
                    help="Run projection validation and print Projection details")
     args = p.parse_args(argv)
@@ -952,7 +1012,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"No DXF files found in {DXF_FILES_DIR}/")
         return 1
 
+    use_llm_script_route = not args.direct
     if args.auto:
+        use_llm_script_route = True
+
+    if use_llm_script_route:
         from ...llm_client import LLMClient
         llm = LLMClient(config_path=args.config, disabled=args.no_llm)
     else:
@@ -963,14 +1027,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     rc = 0
     for t in targets:
-        if args.auto:
+        if use_llm_script_route:
             s = process_dxf_auto(t, llm, model_intent=args.model_intent,
                                  run_validation=args.val)
         else:
             s = process_dxf(t, llm, single_view_extrude_depth=args.extrude_depth,
                             model_intent=args.model_intent,
                             run_validation=args.val)
-        _say(f"Output dir  : {s['output_dir']}")
+        if s.get("output_dir"):
+            _say(f"Output dir  : {s['output_dir']}")
+        else:
+            _say("Output dir  : 未创建（LLM 失败）")
         _say(f"Elapsed     : {float(s.get('elapsed_s', 0.0)):.3f}s")
         _say(f"Status      : {s['status']}"
               + (f" — {s.get('error')}" if s["status"] != "OK" else ""))

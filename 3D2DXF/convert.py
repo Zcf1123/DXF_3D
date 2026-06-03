@@ -320,7 +320,7 @@ def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
     TechDraw.projectEx 返回的投影边均在 Z=0 平面：
             - 前视图（front，从 -Y 看向 +Y）: result.x=-worldZ, result.y=worldX → ax=1, ay=0, sy=-1
       - 沿 +Z 投影（top）  : result.x=worldX, result.y=worldY  → ax=0, ay=1
-            - 左视图（left，从 -X 看向 +X） : result.x=-worldZ, result.y=-worldY → ax=1, ay=0, sy=-1
+            - 左视图（left，从 -X 看向 +X） : result.x=-worldZ, result.y=worldY → ax=1, ay=0, sy=-1
     """
     import FreeCAD
     import TechDraw
@@ -412,6 +412,11 @@ def normalize(ents):
     return shift_ents(ents, -x0, -y0), x1 - x0, y1 - y0
 
 
+def normalize_to_bounds(ents, xmin, ymin, width, height):
+    """按模型坐标包围盒归零，保证三视图共享同一对齐基准。"""
+    return shift_ents(ents, -xmin, -ymin), width, height
+
+
 # ── 加载 3D 文件 ──────────────────────────────────────────────────────────────
 
 def load_shape(path):
@@ -464,8 +469,8 @@ def convert(input_path, output_path):
     #             ax=1→DXF_x=worldX, ay=0 + sy=-1→DXF_y=worldZ
     #   俯视图 +Z: result.x=worldX(宽), result.y=worldY(深)
     #             ax=0→DXF_x=worldX, ay=1→DXF_y=worldY，保持 FreeCAD 顶视图方向
-    #   左视图 -X→+X: result.x=-worldZ(高), result.y=-worldY(深)
-    #             ax=1→DXF_x=-worldY, ay=0 + sy=-1→DXF_y=worldZ
+    #   左视图 -X→+X: result.x=-worldZ(高), result.y=worldY(深)
+    #             ax=1→DXF_x=worldY, ay=0 + sy=-1→DXF_y=worldZ
 
     print("  投影正视图 (front, 从 -Y 看向 +Y) ...")
     front = project_view(shape, (0, -1, 0), ax=1, ay=0, sx=1.0, sy=-1.0,
@@ -479,10 +484,12 @@ def convert(input_path, output_path):
     left = project_view(shape, (-1, 0, 0), ax=1, ay=0, sx=1.0, sy=-1.0,
                         lvis="LEFT", lhid="LEFT_HID")
 
-    # 各视图归零到左下角原点
-    front, fw, fh = normalize(front)
-    top,   tw, th = normalize(top)
-    left,  lw, lh = normalize(left)
+    # 各视图按模型包围盒归零，而不是按投影实体 bbox 归零。
+    # 这样即使某个视图的最外侧边被消隐/圆弧 bbox 扩张，也不会破坏三视图对齐：
+    #   front/top 共享 worldX 横向基准；front/left 共享 worldZ 纵向基准。
+    front, fw, fh = normalize_to_bounds(front, bb.XMin,  bb.ZMin, W, H)
+    top,   tw, th = normalize_to_bounds(top,   bb.XMin,  bb.YMin, W, D)
+    left,  lw, lh = normalize_to_bounds(left,  bb.YMin,  bb.ZMin, D, H)
 
     # 视图间距：视图最大尺寸的 20%，至少 1 单位
     max_dim = max(fw, fh, tw, th, lw, lh, 1e-6)
