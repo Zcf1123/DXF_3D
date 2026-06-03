@@ -3,12 +3,18 @@ set -u -o pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 INPUT_DIR="${DXF_3D_BATCH_INPUT_DIR:-${ROOT}/dxf_files/test}"
-OUTPUT_SUBDIR="${DXF_3D_BATCH_OUTPUT_SUBDIR:-dxf_test}"
+OUTPUT_BASE_SUBDIR="${DXF_3D_BATCH_OUTPUT_SUBDIR:-test}"
+OUTPUT_SUBDIR="${OUTPUT_BASE_SUBDIR}"
 OUTPUT_DIR="${ROOT}/outputs/${OUTPUT_SUBDIR}"
 SUMMARY_FILE="${OUTPUT_DIR}/summary.txt"
 
-mkdir -p "${OUTPUT_DIR}"
-printf 'part\tstatus\tllm_model\tmodel_accuracy\telapsed_s\tllm_understanding\tfcstd\toutput_dir\n' > "${SUMMARY_FILE}"
+suffix=0
+while [[ -e "${OUTPUT_DIR}" ]]; do
+    suffix=$((suffix + 1))
+    OUTPUT_SUBDIR="${OUTPUT_BASE_SUBDIR}${suffix}"
+    OUTPUT_DIR="${ROOT}/outputs/${OUTPUT_SUBDIR}"
+    SUMMARY_FILE="${OUTPUT_DIR}/summary.txt"
+done
 
 shopt -s nullglob
 dxf_files=("${INPUT_DIR}"/*.dxf "${INPUT_DIR}"/*.DXF)
@@ -19,22 +25,86 @@ if (( ${#dxf_files[@]} == 0 )); then
     exit 1
 fi
 
+args=()
+model_profile=""
+config_path="${ROOT}/config.json"
+while (( $# > 0 )); do
+    case "$1" in
+        --gpt|--qwen|--openai)
+            model_profile="${1#--}"
+            args+=("$1")
+            ;;
+        --val|--no-llm)
+            args+=("$1")
+            ;;
+        --intent|--model-intent|--config)
+            if (( $# < 2 )); then
+                printf 'Missing value for %s\n' "$1" >&2
+                exit 1
+            fi
+            if [[ "$1" == "--config" ]]; then
+                if [[ "$2" = /* ]]; then
+                    config_path="$2"
+                else
+                    config_path="${ROOT}/$2"
+                fi
+            fi
+            args+=("$1" "$2")
+            shift
+            ;;
+        -*)
+            printf 'Unknown option: %s\n' "$1" >&2
+            exit 1
+            ;;
+        *)
+            args+=("$1")
+            ;;
+    esac
+    shift
+done
+
+if [[ ! -x "${ROOT}/run.sh" ]]; then
+    printf 'run.sh not found or not executable: %s\n' "${ROOT}/run.sh" >&2
+    exit 1
+fi
+
+if [[ ! -f "${config_path}" ]]; then
+    printf 'Config file not found: %s\n' "${config_path}" >&2
+    exit 1
+fi
+
+if [[ -d "${ROOT}/outputs" && ! -w "${ROOT}/outputs" ]]; then
+    printf 'Output root is not writable: %s\n' "${ROOT}/outputs" >&2
+    exit 1
+fi
+if [[ ! -d "${ROOT}/outputs" && ! -w "${ROOT}" ]]; then
+    printf 'Workspace root is not writable, cannot create outputs: %s\n' "${ROOT}" >&2
+    exit 1
+fi
+
+CONTAINER_CLI="${DXF_3D_CONTAINER_CLI:-docker}"
+IMAGE="${DXF_3D_IMAGE:-dxf-3d}"
+if ! command -v "${CONTAINER_CLI}" >/dev/null 2>&1; then
+    printf 'Container CLI not found: %s\n' "${CONTAINER_CLI}" >&2
+    exit 1
+fi
+if ! "${CONTAINER_CLI}" info >/dev/null 2>&1; then
+    printf 'Container engine is not available: %s\n' "${CONTAINER_CLI}" >&2
+    exit 1
+fi
+if ! "${CONTAINER_CLI}" image inspect "${IMAGE}" >/dev/null 2>&1; then
+    printf 'Docker image not found: %s\n' "${IMAGE}" >&2
+    exit 1
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+if [[ ! -s "${SUMMARY_FILE}" ]]; then
+    printf 'part\tstatus\tllm_model\tmodel_accuracy\telapsed_s\tllm_understanding\tfcstd\toutput_dir\n' >> "${SUMMARY_FILE}"
+fi
+
 overall_rc=0
 total=${#dxf_files[@]}
 index=0
-args=()
-model_profile=""
-for arg in "$@"; do
-    case "${arg}" in
-        --gpt|--qwen|--openai)
-            model_profile="${arg#--}"
-            args+=("${arg}")
-            ;;
-        *)
-            args+=("${arg}")
-            ;;
-    esac
-done
 has_val=0
 for arg in "${args[@]}"; do
     if [[ "${arg}" == "--val" ]]; then

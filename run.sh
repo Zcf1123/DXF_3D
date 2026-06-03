@@ -5,14 +5,10 @@
 #     ./run.sh                         # 处理 ./dxf_files/ 下所有 DXF
 #     ./run.sh path/to/file.dxf [...]  # 处理指定 DXF
 #     ./run.sh --gpt path/to/file.dxf  # 临时切换到 config.json 中的 gpt profile
-#     ./run.sh --extrude-depth 20 path/to/top_view.dxf
-#                                      # 单一俯视图按给定长度直接拉伸
 #     ./run.sh --no-llm path/to/file.dxf
 #                                      # 跳过 LLM 复核，优先提升速度
 #     ./run.sh --intent "先拉伸圆柱，再切孔" path/to/file.dxf
 #                                      # 给 LLM 一段建模意图弱提示
-#     ./run.sh --direct path/to/file.dxf
-#                                      # 使用确定性 direct 特征路线
 #     ./run.sh -d [file ...]           # 开发模式：挂载本地源码，无需重建镜像；默认 LLM 模式
 #
 # 镜像名可以用环境变量 DXF_3D_IMAGE 覆盖（默认 dxf-3d）。
@@ -40,16 +36,13 @@ show_help() {
     --qwen       模型切换模式：使用 config.json 中的 qwen profile（默认）
     --gpt        模型切换模式：使用 config.json 中的 gpt profile
     --openai     模型切换模式：使用 config.json 中的 openai profile
-                             模型选项可与 --val / --direct / --intent 等流水线选项同时使用
+                             模型选项可与 --val / --intent 等流水线选项同时使用
 
 运行选项:
     -d                       开发模式：挂载本地源码，改代码后无需重建镜像
-    --direct                 使用确定性 direct 特征路线
-    --auto                   使用默认 LLM 直接脚本路线
     --no-llm                 禁用 LLM 调用
     --val                    启用反投影验证
     --intent "文本"          给 LLM 建模意图弱提示
-    --extrude-depth 数值     单一俯视图沿 Z 方向拉伸长度（配合 --direct）
     --config 路径            指定配置文件，默认 config.json
     -h, --help, -help        显示本帮助
 EOF

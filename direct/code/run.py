@@ -238,10 +238,8 @@ def _make_run_dir(base: str, prefix: str = "") -> str:
 
 def _auto_output_prefix(llm) -> str:
     label = str(getattr(llm, "model", "") or "auto").strip().lower()
-    match = re.match(r"[a-z]+", label)
-    if match:
-        return match.group(0)
-    return "auto"
+    prefix = re.sub(r"[^0-9a-zA-Z._-]+", "-", label).strip("._-")
+    return prefix or "auto"
 
 
 def _make_logger(run_dir: str) -> logging.Logger:
@@ -281,6 +279,15 @@ def process_dxf(dxf_path: str, llm,
                 run_validation: bool = False) -> Dict[str, Any]:
     started_at = time.perf_counter()
     base = os.path.splitext(os.path.basename(dxf_path))[0]
+    if not os.path.exists(dxf_path):
+        return {
+            "input": dxf_path,
+            "output_dir": "",
+            "llm": llm.model if llm.enabled else f"disabled ({llm.disabled_reason})",
+            "status": "FAILED",
+            "error": f"FileNotFoundError: {dxf_path}",
+            "elapsed_s": round(time.perf_counter() - started_at, 3),
+        }
     run_dir = _make_run_dir(base)
     log = _make_logger(run_dir)
     summary: Dict[str, Any] = {
@@ -664,6 +671,16 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
     started_at = time.perf_counter()
     source_base = os.path.splitext(os.path.basename(dxf_path))[0]
     base = source_base
+    if not os.path.exists(dxf_path):
+        return {
+            "input": dxf_path,
+            "output_dir": "",
+            "llm": llm.model if llm.enabled else f"disabled ({llm.disabled_reason})",
+            "status": "FAILED",
+            "error": f"FileNotFoundError: {dxf_path}",
+            "elapsed_s": round(time.perf_counter() - started_at, 3),
+            "mode": "auto",
+        }
     run_dir = _make_run_dir(source_base, prefix=_auto_output_prefix(llm))
     log = _make_logger(run_dir)
     summary: Dict[str, Any] = {
@@ -986,13 +1003,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="DXF file(s). Defaults to all *.dxf in DXF_3D/dxf_files/")
     p.add_argument("--config", default="config.json",
                    help="Path to config.json (default: ./config.json)")
-    p.add_argument("--extrude-depth", type=float, default=None,
-                   help="Depth for single-view TOP/XY extrusion mode")
     p.add_argument("--no-llm", action="store_true",
                    help="Disable LLM calls where applicable")
-    p.add_argument("--direct", action="store_true",
-                   help="Use deterministic direct feature route instead of default LLM script route")
-    p.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--intent", dest="model_intent",
                    default=os.environ.get("DXF_3D_MODEL_INTENT", ""),
                    help="Natural-language modeling intent hint")
@@ -1012,32 +1024,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"No DXF files found in {DXF_FILES_DIR}/")
         return 1
 
-    use_llm_script_route = not args.direct
-    if args.auto:
-        use_llm_script_route = True
-
-    if use_llm_script_route:
-        from ...llm_client import LLMClient
-        llm = LLMClient(config_path=args.config, disabled=args.no_llm)
-    else:
-        from .llm_planner import LLMPlanner
-        llm = LLMPlanner(config_path=args.config, disabled=args.no_llm)
+    from ...llm_client import LLMClient
+    llm = LLMClient(config_path=args.config, disabled=args.no_llm)
     llm_label = llm.model if llm.enabled else f"disabled ({llm.disabled_reason})"
     _say(f"LLM         : {llm_label}")
 
     rc = 0
     for t in targets:
-        if use_llm_script_route:
-            s = process_dxf_auto(t, llm, model_intent=args.model_intent,
-                                 run_validation=args.val)
-        else:
-            s = process_dxf(t, llm, single_view_extrude_depth=args.extrude_depth,
-                            model_intent=args.model_intent,
-                            run_validation=args.val)
+        s = process_dxf_auto(t, llm, model_intent=args.model_intent,
+                             run_validation=args.val)
         if s.get("output_dir"):
             _say(f"Output dir  : {s['output_dir']}")
         else:
-            _say("Output dir  : 未创建（LLM 失败）")
+            _say("Output dir  : 未创建（失败前未产生输出）")
         _say(f"Elapsed     : {float(s.get('elapsed_s', 0.0)):.3f}s")
         _say(f"Status      : {s['status']}"
               + (f" — {s.get('error')}" if s["status"] != "OK" else ""))

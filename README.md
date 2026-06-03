@@ -4,10 +4,10 @@
 **自包含**：本目录内含 `Dockerfile` / `run.sh` / `requirements.txt` / `config.json`，
 可以**整个目录拷贝到任意主机独立部署**，不依赖仓库其它任何文件。
 
-代码按建模路线分区：`llm/` 是默认的“三视图 JSON/图片摘要 -> LLM 写 FreeCAD 脚本”路线，
-`direct/` 是可通过 `--direct` 启用的确定性特征路线，`prompts/` 存放两条路线共用的
-工程图约定和零件语义。根目录保留启动入口、部署文件、输入输出目录、文档，以及
-两条路线共用的 DXF 解析、视图分类、投影和几何摘要模块。
+当前默认且唯一对外开放的建模路线是 `llm/`：“三视图 JSON/图片摘要 -> LLM 写 FreeCAD 脚本”。
+`direct/` 目录仍保留为内部历史/共用实现位置，提供部分导出和 FreeCAD 辅助逻辑，
+但命令行不再提供 `--direct` 确定性特征路线。`prompts/` 存放工程图约定和零件语义。
+根目录保留启动入口、部署文件、输入输出目录、文档，以及 DXF 解析、视图分类、投影和几何摘要模块。
 
 ---
 
@@ -29,42 +29,17 @@
 ./run.sh -d --qwen dxf_files/00991575.dxf
 ./run.sh -d --openai dxf_files/00991575.dxf
 
-# 使用 direct 确定性特征路线
-./run.sh -d --direct dxf_files/Drawing1.dxf
-
-# direct 单一俯视图：按给定长度沿 Z 方向直接拉伸
-./run.sh -d --direct --extrude-depth 20 dxf_files/top_view_only.dxf
-
 # 给 LLM 建模意图弱提示，辅助处理歧义或视图漏画
 ./run.sh -d --intent "先拉伸圆柱；侧面矩形孔贯穿切除；上端圆孔盲切" dxf_files/part.dxf
 
 # 启用反投影验证：生成 projection_validation.json，并在终端打印 Projection 摘要
 ./run.sh -d --val dxf_files/Drawing1.dxf
-
-# direct 路线也可以启用反投影验证
-./run.sh -d --direct --val dxf_files/Drawing1.dxf
 ```
 
 镜像名可用环境变量 `DXF_3D_IMAGE` 覆盖（默认 `dxf-3d`）。本文所有示例默认使用
 `-d` 开发挂载模式，让容器挂载当前源码目录，避免每次改代码后重建镜像。
 默认模型 profile 由 `config.json` 的 `active` 字段决定；当前默认是 `qwen`。
 命令行参数 `--gpt` / `--qwen` / `--openai` 只对本次运行生效，不会修改 `config.json`。
-
-### 单一俯视图拉伸
-
-如果 DXF 中只包含一个俯视图轮廓，可以在命令行提供拉伸长度：
-
-```bash
-./run.sh -d --direct --extrude-depth 20 dxf_files/top_view_only.dxf
-```
-
-该模式只在识别到单一几何视图时触发，会把该视图固定按 TOP/XY 平面处理并沿 Z
-方向拉伸；标准 FRONT/TOP/LEFT 三视图输入仍走原有建模逻辑。闭合线框、多段线、
-弧线轮廓会作为外轮廓，内部圆会作为贯穿孔，内部闭合线/弧轮廓会作为异形贯穿孔；
-只有一个圆时会拉伸为圆柱。输出仍会导出模型三视图 PNG，并在 `.FCStd` 中补充
-由 3D 模型生成的 FRONT/LEFT 投影视图线框。
-
----
 
 ## 二、部署到另一台主机
 
@@ -148,12 +123,12 @@ Status      : OK
 其余阶段日志（实体统计、视图归类、特征草案、LLM 返回、产物清单等）全部以中文
 写入 `<output_dir>/run.log`。
 
-如果只想走确定性算法、跳过 LLM 复核以缩短复杂图纸的运行时间，可以使用：
+如果只想跳过 LLM 调用，可以使用：
 
 ```bash
-./run.sh -d --direct --no-llm dxf_files/Drawing1.dxf
+./run.sh -d --no-llm dxf_files/Drawing1.dxf
 # 或
-DXF_3D_DISABLE_LLM=1 ./run.sh -d --direct dxf_files/Drawing1.dxf
+DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
 ```
 
 如果复杂零件靠三视图隐藏线仍容易歧义，可以给默认 LLM 路线一段建模意图弱提示。
@@ -202,12 +177,9 @@ DXF_3D_DISABLE_LLM=1 ./run.sh -d --direct dxf_files/Drawing1.dxf
    - TOP 视图中的圆 → 孔轴 = Z
    - FRONT 视图中的圆 → 孔轴 = Y
    - LEFT 视图中的圆 → 孔轴 = X
-5. direct 路线中，当 `--intent` 明确说明是“组合/多个物体/连接/相接”时，会尝试从多个
-   闭合轮廓推断多个 `additive_component` 拉伸主体，并在 FreeCAD 中 fuse，适合
-   圆柱、棱柱、小圆柱等简单正实体组合。
-6. 对多边形棱柱类零件，FRONT/LEFT 中真实 ARC + TOP 中相切大圆可识别为
+5. 对多边形棱柱类零件，FRONT/LEFT 中真实 ARC + TOP 中相切大圆可识别为
    上下外轮廓圆弧端面倒角（`edge_chamfer.profile="arc_revolve"`）。
-7. 坐标单位默认按毫米处理，**不做单位识别 / 缩放**。
+6. 坐标单位默认按毫米处理，**不做单位识别 / 缩放**。
 
 ### 3. 图层（推荐，可选）
 
@@ -240,7 +212,6 @@ DXF_3D_DISABLE_LLM=1 ./run.sh -d --direct dxf_files/Drawing1.dxf
 ## 五、产物（每次运行一个独立输出目录）
 
 默认 LLM 路线输出到 `outputs/<model>_<YYYYMMDD>_<HHMMSS>_<source_base>/`。
-direct 路线输出到 `outputs/<YYYYMMDD>_<HHMMSS>_<base>/`。
 
 | 文件                       | 说明 |
 | -------------------------- | ---- |
@@ -253,11 +224,7 @@ direct 路线输出到 `outputs/<YYYYMMDD>_<HHMMSS>_<base>/`。
 | `<base>_overview.png`      | 3D 等轴侧快速总览 PNG；用于粗略预览，复杂切除件的准确性以 `.FCStd` / `.step` / `<base>_model_views.png` 为准 |
 | `entities.json`            | DXF 解析后的实体 + 元数据 |
 | `views_algorithm.json`     | 纯算法阶段的原始视图归类结果 |
-| `views_semantic_input.json` | direct 路线：提交给 LLM 视图语义复核的结构化输入摘要 |
-| `views_semantic.json`      | direct 路线：LLM 对视图命名、保留/删除实体的复核结果 |
 | `views.json`               | 最终使用的视图归类结果；启用 LLM 且校验通过时为语义复核后的结果，否则为算法结果 |
-| `features_draft.json`      | direct 路线：LLM 介入**前**的特征草案 |
-| `features.json`            | direct 路线：LLM 介入**后**的最终特征（未启用 LLM 时与草案相同） |
 | `auto_context.json`        | 默认 LLM 路线：送入 LLM 的紧凑三视图/投影几何上下文 |
 | `projection_validation.json` | 仅加 `--val` 时生成；反投影验证报告：模型三视图与输入三视图的覆盖率、匹配率、bbox 差异和未覆盖线段 |
 | `model.json`               | FreeCAD 文档对象信息 |
@@ -273,33 +240,21 @@ direct 路线输出到 `outputs/<YYYYMMDD>_<HHMMSS>_<base>/`。
 
 ## 六、流水线
 
-```
-dxf_loader → view_classifier → projection_mapper
-   → direct/code/feature_inference ↘ direct/code/llm_planner（可选）
-   → direct/code/freecad_builder → direct/code/exporters
-
-默认 LLM 路线:
+```text
 dxf_loader → view_classifier → projection_mapper
    → llm/code/llm_code_planner → generated_model.py → direct/code/exporters
-
---direct:
-dxf_loader → view_classifier → projection_mapper
-   → direct/code/feature_inference ↘ direct/code/llm_planner（可选）
-   → direct/code/freecad_builder → direct/code/exporters
 ```
 
 | 模块 | 职责 |
 | --- | --- |
 | `run.py` | 根入口 wrapper，供 `run.sh` / Docker 的 `DXF_3D.run.main` 调用 |
-| `direct/code/run.py` | CLI 编排器；默认执行 LLM 直接脚本路线，加 `--direct` 时执行确定性特征路线 |
+| `direct/code/run.py` | CLI 编排器；当前只对外执行默认 LLM 直接脚本路线 |
 | `dxf_loader.py` | 纯 Python DXF 解析，输出 `DxfEntity` 列表 + 元数据 |
 | `view_classifier.py` | 按象限把实体分到 FRONT/TOP/LEFT 三个 `ViewBundle` |
 | `projection_mapper.py` | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
 | `geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
-| `direct/code/feature_inference.py` | 推断拉伸轮廓、球体、同轴阶梯圆柱、圆孔/盲孔、异形贯穿孔、矩形/闭合轮廓切除和可确定的边倒角，输出 `Feature` 列表 |
-| `direct/code/llm_planner.py` | 读 `config.json` 调用 OpenAI 兼容 API，复核视图语义和特征草案 |
-| `direct/code/freecad_builder.py` | 按特征列表用 FreeCAD `Part` 建模并保存 `.FCStd` |
-| `direct/code/exporters.py` | STEP / OBJ / PNG / 总览 PNG / model.json / 可复现 Python |
+| `direct/code/freecad_builder.py` | 内部 FreeCAD 辅助逻辑；默认路线使用其中的投影视图嵌入函数 |
+| `direct/code/exporters.py` | 默认路线复用的 STEP / OBJ / PNG / 总览 PNG / model.json 导出器 |
 | `llm/code/llm_code_planner.py` | 默认 LLM 路线：生成紧凑 auto_context，让 LLM 写 FreeCAD 脚本，并做静态校验、重试和修复 |
 
 ---
@@ -330,23 +285,15 @@ dxf_loader → view_classifier → projection_mapper
 
 `active` 是默认使用的模型 profile；运行时可用 `--gpt` / `--qwen` / `--openai` 临时覆盖。
 
-LLM 任何失败（缺 key、网络中断、JSON 解析错误、校验不通过）都不会中断流水线，
-会自动回退到纯算法路径，原因写入 `run.log`。
+LLM 任何失败（缺 key、网络中断、JSON 解析错误、校验不通过）都会写入 `run.log`；
+默认路线会尝试校验、重试，必要时使用 `auto_context` 生成保守兜底脚本。
 
-LLM 当前分两步介入：
+LLM 当前介入方式：
 
-1. `direct/prompts/drawing_view_reviewer.md`：复核 FRONT / TOP / LEFT 视图命名，保守删除明显
-   辅助线、标注线或跨视图线。
-2. `direct/prompts/feature_refiner.md`：复核 `features_draft.json`。默认不能重写主体轮廓、孔、
-   edges 或尺寸；未提供建模意图时，主要允许新增有 TOP 多边形 + 侧视 ARC 等证据
-   支撑的 `edge_chamfer`。direct 路线提供 `--intent` 后，可在代码校验允许的范围内精修
-   `hole` / `profile_cut` 等受支持特征，例如把明确描述的矩形孔改为贯穿切除或盲切。
-3. `llm/prompts/freecad_script_generator.md`：默认 LLM 路线专用，要求 LLM 直接输出
+1. `llm/prompts/freecad_script_generator.md`：默认 LLM 路线专用，要求 LLM 直接输出
    可运行的 FreeCAD Python；程序会拒绝危险调用和常见 FreeCAD API 幻觉。
 
-route-specific prompt 放在各自目录；公共知识放在 [prompts/](prompts/)。
-direct prompt 文件遵循 [direct/prompts/PROMPT_SPEC.md](direct/prompts/PROMPT_SPEC.md)
-的二级标题分块约定。
+路线专用 prompt 放在 `llm/prompts/`；公共知识放在 [prompts/](prompts/)。
 
 ---
 
@@ -367,8 +314,8 @@ DXF_3D/
 ├── dxf_files/                <—— 把要处理的 .dxf 放在这里
 ├── outputs/                  <—— 每次运行生成 <YYYYMMDD>_<HHMMSS>_<base>/
 ├── direct/
-│   ├── code/                 当前确定性特征路线代码
-│   └── prompts/              direct 路线专用提示词
+│   ├── code/                 内部历史/共用实现位置（当前仅复用部分 FreeCAD 和导出逻辑）
+│   └── prompts/              历史提示词（命令行不再启用 direct 路线）
 ├── llm/
 │   ├── code/                 原始目标路线：LLM 生成 FreeCAD 脚本
 │   └── prompts/              llm 路线专用提示词
@@ -384,7 +331,7 @@ DXF_3D/
 
 - 不引入外部 DXF 库；`dxf_loader.py` 是纯 Python 解析器。
 - FreeCAD 相关导入保持在函数内部或生成脚本内，普通 Python 环境应能 import 业务模块。
-- LLM 失败不得中断稳定路线；direct 路线回退算法草案，auto 路线会校验、重试，必要时用 `auto_context` 生成保守兜底脚本。
+- LLM 失败原因必须写入日志；默认路线会校验、重试，必要时用 `auto_context` 生成保守兜底脚本。
 - 不要删除 `*D\d+` 匿名块过滤；DIMENSION 的箭头、引线、文字块会污染视图聚类和轮廓提取。
 - 不打印、不提交 `config.json` 中的明文 key。
 - 不改三视图固定布局：FRONT 左上、TOP 左下、LEFT 右上。
