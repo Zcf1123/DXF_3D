@@ -30,7 +30,7 @@ show_help() {
     ./run.sh -d --gpt dxf_files/00991575.dxf     模型切换模式：本次使用 gpt profile
     ./run.sh -d --qwen dxf_files/00991575.dxf    模型切换模式：本次使用 qwen profile
     ./run.sh -d --gpt --val dxf_files/00991575.dxf
-                                                                                             使用 gpt，同时启用反投影验证
+                                                                                             使用 gpt，同时启用投影验证
 
 模型选项:
     --qwen       模型切换模式：使用 config.json 中的 qwen profile（默认）
@@ -41,7 +41,7 @@ show_help() {
 运行选项:
     -d                       开发模式：挂载本地源码，改代码后无需重建镜像
     --no-llm                 禁用 LLM 调用
-    --val                    启用反投影验证
+    --val                    启用投影验证
     --intent "文本"          给 LLM 建模意图弱提示
     --config 路径            指定配置文件，默认 config.json
     -h, --help, -help        显示本帮助

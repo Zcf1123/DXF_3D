@@ -168,27 +168,42 @@ def _projection_validation_is_poor(validation: Dict) -> bool:
     poor_views = 0
     very_poor_views = 0
     for report in views.values():
-        input_coverage = float(report.get("input_coverage", 0.0) or 0.0)
-        model_match = float(report.get("model_match", 0.0) or 0.0)
-        extra = float(report.get("model_extra_ratio", 0.0) or 0.0)
-        if input_coverage < 0.35 or model_match < 0.35 or extra > 0.65:
+        coverage = float(report.get("coverage", 0.0) or 0.0)
+        match = float(report.get("match", 0.0) or 0.0)
+        extra = float(report.get("extra", 0.0) or 0.0)
+        if coverage < 0.35 or match < 0.35 or extra > 0.65:
             poor_views += 1
-        if input_coverage < 0.15 or model_match < 0.15 or extra > 0.85:
+        if coverage < 0.15 or match < 0.15 or extra > 0.85:
             very_poor_views += 1
     return very_poor_views >= 1 or poor_views >= 2
 
 
-def _projection_validation_outputs_reach(validation: Dict, threshold: float = 0.99) -> bool:
+def _projection_validation_cache_reach(
+    validation: Dict,
+    coverage_threshold: float = 0.95,
+    match_threshold: float = 0.99,
+) -> bool:
     views = validation.get("views") or {}
     required = ("front", "left", "top")
     for view_name in required:
         report = views.get(view_name)
         if not report:
             return False
-        model_match = float(report.get("model_match", 0.0) or 0.0)
-        if model_match < threshold:
+        coverage = float(report.get("coverage", 0.0) or 0.0)
+        match = float(report.get("match", 0.0) or 0.0)
+        if coverage < coverage_threshold or match < match_threshold:
             return False
     return True
+
+
+def _validation_report_values(report: Dict) -> Dict[str, float]:
+    coverage = float(report.get("coverage", 0.0) or 0.0)
+    return {
+        "coverage": coverage * 100.0,
+        "missing": float(report.get("missing", 1.0 - coverage) or 0.0) * 100.0,
+        "match": float(report.get("match", 0.0) or 0.0) * 100.0,
+        "extra": float(report.get("extra", 0.0) or 0.0) * 100.0,
+    }
 
 
 def _draft_has_locked_intent_geometry(features: List[Dict]) -> bool:
@@ -526,37 +541,37 @@ def process_dxf(dxf_path: str, llm,
             try:
                 validation = validate_projection_against_views(
                     fcstd_path, projected, features, validation_path)
-                log.info("反投影验证    : %s", validation.get("status"))
+                log.info("投影验证    : %s", validation.get("status"))
                 _say(f"Projection   : {validation.get('status')}")
                 view_display = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}
                 for view_name in ("front", "left", "top"):
                     report = validation.get("views", {}).get(view_name)
                     if not report:
                         continue
+                    values = _validation_report_values(report)
                     log.info(
-                        "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
+                        "  · %s: status=%s coverage=%.1f%% missing=%.1f%% match=%.1f%% extra=%.1f%% bbox_error=%s",
                         view_display.get(view_name, view_name.upper()),
                         report.get("status"),
-                        float(report.get("input_coverage", 0.0)) * 100.0,
-                        float(report.get("model_match", 0.0)) * 100.0,
-                        float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                        values["coverage"],
+                        values["missing"],
+                        values["match"],
+                        values["extra"],
                         report.get("bbox_error"),
                     )
                     _say(
-                        "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
+                        "  {name:<5} {status:<4} coverage={coverage:5.1f}% missing={missing:5.1f}% match={match:5.1f}% extra={extra:5.1f}%".format(
                             name=view_display.get(view_name, view_name.upper()),
                             status=str(report.get("status", "")),
-                            input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
-                            model_match=float(report.get("model_match", 0.0)) * 100.0,
-                            extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                            **values,
                         )
                     )
                 log.info("已写出        : projection_validation.json")
                 if (llm.enabled and not allow_rebuild and
                         _projection_validation_is_poor(validation)):
-                    log.info("反投影较差    : 自动启用受控重建模式并二次精修")
+                    log.info("投影较差    : 自动启用受控重建模式并二次精修")
                     retry_intent = (model_intent + "\n" if model_intent else "") + \
-                        "反投影验证很差，允许重选主体外轮廓和基础特征；优先保持真实视图尺寸、厚度、孔位。"
+                        "投影验证很差，允许重选主体外轮廓和基础特征；优先保持真实视图尺寸、厚度、孔位。"
                     rebuilt, retry_msg = llm.refine_features(
                         view_bboxes, final_dicts, feature_view_summary,
                         retry_intent, allow_rebuild=True)
@@ -579,37 +594,37 @@ def process_dxf(dxf_path: str, llm,
                             summary["fcstd"] = fcstd_path
                             validation = validate_projection_against_views(
                                 fcstd_path, projected, features, validation_path)
-                            log.info("二次反投影验证: %s", validation.get("status"))
+                            log.info("二次投影验证: %s", validation.get("status"))
                             _say(f"Projection   : {validation.get('status')} (auto rebuild)")
                             for view_name in ("front", "left", "top"):
                                 report = validation.get("views", {}).get(view_name)
                                 if not report:
                                     continue
+                                values = _validation_report_values(report)
                                 log.info(
-                                    "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
+                                    "  · %s: status=%s coverage=%.1f%% missing=%.1f%% match=%.1f%% extra=%.1f%% bbox_error=%s",
                                     view_display.get(view_name, view_name.upper()),
                                     report.get("status"),
-                                    float(report.get("input_coverage", 0.0)) * 100.0,
-                                    float(report.get("model_match", 0.0)) * 100.0,
-                                    float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                                    values["coverage"],
+                                    values["missing"],
+                                    values["match"],
+                                    values["extra"],
                                     report.get("bbox_error"),
                                 )
                                 _say(
-                                    "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
+                                    "  {name:<5} {status:<4} coverage={coverage:5.1f}% missing={missing:5.1f}% match={match:5.1f}% extra={extra:5.1f}%".format(
                                         name=view_display.get(view_name, view_name.upper()),
                                         status=str(report.get("status", "")),
-                                        input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
-                                        model_match=float(report.get("model_match", 0.0)) * 100.0,
-                                        extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                                        **values,
                                     )
                                 )
                     else:
                         log.info("二次重建未生效，保留首次建模结果")
             except Exception as exc:
-                log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
+                log.warning("投影验证失败: %s\n%s", exc, traceback.format_exc())
                 _say(f"Projection   : WARN — validation failed: {exc}")
         else:
-            log.info("反投影验证    : 跳过（命令行加 --val 可启用）")
+            log.info("投影验证    : 跳过（命令行加 --val 可启用）")
 
         for name, fn in (
             ("STEP",            lambda: export_step(fcstd_path, step_path)),
@@ -906,43 +921,43 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
             try:
                 validation = validate_projection_against_views(
                     fcstd_path, projected, None, validation_path)
-                log.info("反投影验证    : %s", validation.get("status"))
+                log.info("投影验证    : %s", validation.get("status"))
                 _say(f"Projection   : {validation.get('status')}")
                 view_display = {"front": "FRONT", "left": "LEFT", "right": "LEFT", "top": "TOP"}
                 for view_name in ("front", "left", "top"):
                     report = validation.get("views", {}).get(view_name)
                     if not report:
                         continue
+                    values = _validation_report_values(report)
                     log.info(
-                        "  · %s: status=%s input_coverage=%.1f%% model_match=%.1f%% extra=%.1f%% bbox_error=%s",
+                        "  · %s: status=%s coverage=%.1f%% missing=%.1f%% match=%.1f%% extra=%.1f%% bbox_error=%s",
                         view_display.get(view_name, view_name.upper()),
                         report.get("status"),
-                        float(report.get("input_coverage", 0.0)) * 100.0,
-                        float(report.get("model_match", 0.0)) * 100.0,
-                        float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                        values["coverage"],
+                        values["missing"],
+                        values["match"],
+                        values["extra"],
                         report.get("bbox_error"),
                     )
                     _say(
-                        "  {name:<5} {status:<4} input={input_cov:5.1f}% model={model_match:5.1f}% extra={extra:5.1f}%".format(
+                        "  {name:<5} {status:<4} coverage={coverage:5.1f}% missing={missing:5.1f}% match={match:5.1f}% extra={extra:5.1f}%".format(
                             name=view_display.get(view_name, view_name.upper()),
                             status=str(report.get("status", "")),
-                            input_cov=float(report.get("input_coverage", 0.0)) * 100.0,
-                            model_match=float(report.get("model_match", 0.0)) * 100.0,
-                            extra=float(report.get("model_extra_ratio", 0.0)) * 100.0,
+                            **values,
                         )
                     )
                 log.info("已写出        : projection_validation.json")
-                if _projection_validation_outputs_reach(validation):
+                if _projection_validation_cache_reach(validation):
                     cache_successful_freecad_script(llm, auto_context, base, script)
-                    log.info("LLM 脚本缓存  : 已记录成功脚本（--val，三个视图 output 均 ≥99%%）")
+                    log.info("LLM 脚本缓存  : 已记录成功脚本（--val，三个视图 coverage 均 ≥95%% 且 match 均 ≥99%%）")
                 else:
-                    log.info("LLM 脚本缓存  : 跳过（三个视图 output 未全部达到 99%%）")
+                    log.info("LLM 脚本缓存  : 跳过（三个视图 coverage 未全部达到 95%% 或 match 未全部达到 99%%）")
             except Exception as exc:
-                log.warning("反投影验证失败: %s\n%s", exc, traceback.format_exc())
+                log.warning("投影验证失败: %s\n%s", exc, traceback.format_exc())
                 _say(f"Projection   : WARN — validation failed: {exc}")
-                log.info("LLM 脚本缓存  : 跳过（反投影验证失败）")
+                log.info("LLM 脚本缓存  : 跳过（投影验证失败）")
         else:
-            log.info("反投影验证    : 跳过（命令行加 --val 可启用）")
+            log.info("投影验证    : 跳过（命令行加 --val 可启用）")
 
         for name, fn in (
             ("STEP",            lambda: export_step(fcstd_path, step_path)),

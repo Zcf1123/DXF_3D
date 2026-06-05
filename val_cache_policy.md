@@ -2,7 +2,7 @@
 
 ## 1. 功能目标
 
-`--val` 模式下，系统会在生成 3D 模型后执行反投影验证：
+`--val` 模式下，系统会在生成 3D 模型后执行投影验证：
 
 1. 将最终 `.FCStd` 中的 `Result` 实体重新投影为 `FRONT` / `LEFT` / `TOP` 三个二维视图。
 2. 将模型投影结果与输入 DXF 三视图逐项比对。
@@ -108,7 +108,7 @@ llm_cache_key.txt
 2. 程序执行脚本，生成 `.FCStd`。
 3. 执行尺寸契约校验，确保模型整体 `width_x` / `depth_y` / `height_z` 符合三视图尺寸约束。
 4. 如输入轮廓含 ARC，执行圆弧边校验，确保模型保留真实圆弧边。
-5. 执行反投影验证，生成：
+5. 执行投影验证，生成：
 
    ```text
    projection_validation.json
@@ -137,9 +137,9 @@ LLM 脚本缓存  : 已记录成功脚本（--val，三个视图 output 均 ≥9
 
 ---
 
-## 6. 反投影验证的计算方式
+## 6. 投影验证的计算方式
 
-反投影验证以视图为单位分别计算：
+投影验证以视图为单位分别计算：
 
 ```text
 FRONT
@@ -207,14 +207,14 @@ model_samples = sample(model_segments, tolerance)
 
 ## 7. 准确率指标
 
-### 7.1 `input_coverage`
+### 7.1 `coverage`
 
-`input_coverage` 表示输入图纸中有多少内容被模型投影覆盖。
+`coverage` 表示输入图纸中有多少内容被模型投影覆盖。
 
 计算方式：
 
 ```text
-input_coverage = matched(input_samples, model_segments, tolerance) / len(input_samples)
+coverage = matched(input_samples, model_segments, tolerance) / len(input_samples)
 ```
 
 含义：
@@ -229,16 +229,26 @@ input_coverage = matched(input_samples, model_segments, tolerance) / len(input_s
 是否漏建
 ```
 
-如果 `input_coverage` 低，说明输入图纸中有一部分结构没有出现在模型投影中。
+如果 `coverage` 低，说明输入图纸中有一部分结构没有出现在模型投影中。
 
-### 7.2 `model_match`
+### 7.2 `missing`
 
-`model_match` 表示模型输出中有多少内容能被输入图纸解释。
+`missing` 表示输入图纸中未被模型覆盖的漏画比例。
 
 计算方式：
 
 ```text
-model_match = matched(model_samples, input_segments, tolerance) / len(model_samples)
+missing = 1.0 - coverage
+```
+
+### 7.3 `match`
+
+`match` 表示模型输出中有多少内容能被输入图纸解释。
+
+计算方式：
+
+```text
+match = matched(model_samples, input_segments, tolerance) / len(model_samples)
 ```
 
 含义：
@@ -253,21 +263,21 @@ model_match = matched(model_samples, input_segments, tolerance) / len(model_samp
 是否多建
 ```
 
-如果 `model_match` 低，说明模型中存在输入图纸没有体现的额外结构。
+如果 `match` 低，说明模型中存在输入图纸没有体现的额外结构。
 
-### 7.3 `model_extra_ratio`
+### 7.4 `extra`
 
-`model_extra_ratio` 是模型多余比例：
+`extra` 是模型多余比例：
 
 ```text
-model_extra_ratio = 1.0 - model_match
+extra = 1.0 - match
 ```
 
 例如：
 
 ```text
-model_match = 0.96
-model_extra_ratio = 0.04
+match = 0.96
+extra = 0.04
 ```
 
 表示模型投影中约 4% 的内容无法被输入图纸解释。
@@ -276,37 +286,36 @@ model_extra_ratio = 0.04
 
 ## 8. 缓存保存准确率门槛
 
-当前缓存保存采用模型输出匹配率门槛。
+当前缓存保存同时采用输入覆盖率和模型输出匹配率门槛。
 
 每个视图都必须满足：
 
 ```text
-model_match >= 0.99
+coverage >= 0.95
+match >= 0.99
 ```
 
-也就是：模型投影出来的线，至少 99% 都能在输入图纸中找到对应线段。
+也就是：输入图纸线段至少 95% 被模型覆盖，且模型投影出来的线至少 99% 都能在输入图纸中找到对应线段。
 
 缓存保存条件为：
 
 ```text
-FRONT model_match >= 0.99
-LEFT  model_match >= 0.99
-TOP   model_match >= 0.99
+FRONT coverage >= 0.95 且 match >= 0.99
+LEFT  coverage >= 0.95 且 match >= 0.99
+TOP   coverage >= 0.95 且 match >= 0.99
 ```
 
-只有三个视图的 `model_match` 全部达到 99%，才会保存缓存文件。
-
-`input_coverage` 仍会写入验证报告，用于观察输入图纸被模型覆盖的比例，但不参与缓存保存判断。
+只有三个视图的 `coverage` 全部达到 95%，且 `match` 全部达到 99%，才会保存缓存文件。
 
 示例：
 
 ```text
-FRONT input_coverage=59.1% model_match=100.0%
-LEFT  input_coverage=59.1% model_match=100.0%
-TOP   input_coverage=100.0% model_match=100.0%
+FRONT coverage=59.1% missing=40.9% match=100.0% extra=0.0%
+LEFT  coverage=59.1% missing=40.9% match=100.0% extra=0.0%
+TOP   coverage=100.0% missing=0.0% match=100.0% extra=0.0%
 ```
 
-这种情况下，三个视图的 `model_match` 都达到 99%，因此允许保存缓存。
+这种情况下，虽然三个视图的 `match` 都达到 99%，但 FRONT / LEFT 的 `coverage` 未达到 95%，因此不会保存缓存。
 
 ---
 
@@ -326,9 +335,10 @@ projection_validation.json
 | `views.front` | FRONT 视图验证结果 |
 | `views.left` | LEFT 视图验证结果 |
 | `views.top` | TOP 视图验证结果 |
-| `input_coverage` | 输入覆盖率 |
-| `model_match` | 模型匹配率 |
-| `model_extra_ratio` | 模型多余比例 |
+| `coverage` | 输入覆盖率 |
+| `missing` | 输入漏画率 |
+| `match` | 模型匹配率 |
+| `extra` | 模型多余比例 |
 | `bbox_error` | 输入与模型投影 bbox 差异 |
 | `unmatched_input_segments` | 未被模型覆盖的输入线段 |
 
@@ -342,7 +352,7 @@ projection_validation.json
 2. 读取缓存时，必须由相同模型、相同提示词、相同几何上下文生成相同 cache key。
 3. 缓存命中后，会重定向输出路径，保证脚本写入当前运行目录。
 4. 缓存脚本复用前仍会执行静态校验。
-5. 缓存写入前必须完成反投影验证。
-6. 三个视图的 `model_match` 都达到 99% 时，才保存缓存。
+5. 缓存写入前必须完成投影验证。
+6. 三个视图的 `coverage` 都达到 95% 且 `match` 都达到 99% 时，才保存缓存。
 
 该策略保证缓存只记录高可信的 LLM 建模脚本，避免后续运行复用低质量结果。

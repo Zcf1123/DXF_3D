@@ -781,9 +781,10 @@ def _compare_segment_sets(input_segments, model_segments, scale: float) -> Dict[
         "model_segments": len(model_segments),
         "input_samples": len(input_samples),
         "model_samples": len(model_samples),
-        "input_coverage": round(input_covered, 4),
-        "model_match": round(model_matched, 4),
-        "model_extra_ratio": round(1.0 - model_matched, 4),
+        "coverage": round(input_covered, 4),
+        "missing": round(1.0 - input_covered, 4),
+        "match": round(model_matched, 4),
+        "extra": round(1.0 - model_matched, 4),
         "bbox_error": bbox_error,
         "unmatched_input_segments": _unmatched_segments(input_segments, model_segments, tolerance),
     }

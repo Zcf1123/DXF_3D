@@ -147,6 +147,12 @@ def _model_understanding_hints(projected_views: Dict[str, Dict[str, Any]]) -> Li
     top_polygon_prism_hint = _polygon_prism_from_top_outline_hint(projected_views)
     if top_polygon_prism_hint is not None:
         hints.append(top_polygon_prism_hint)
+    stacked_hex_bore_hint = _stacked_cylinder_hex_top_bore_hint(projected_views)
+    if stacked_hex_bore_hint is not None:
+        hints.append(stacked_hex_bore_hint)
+    top_line_arc_plate_hint = _top_line_arc_plate_with_center_bore_hint(projected_views)
+    if top_line_arc_plate_hint is not None:
+        hints.append(top_line_arc_plate_hint)
     simple_top_cylinder_hint = _simple_z_cylinder_from_top_circle_hint(projected_views)
     if simple_top_cylinder_hint is not None:
         hints.append(simple_top_cylinder_hint)
@@ -169,6 +175,173 @@ def _model_understanding_hints(projected_views: Dict[str, Dict[str, Any]]) -> Li
     if gear_hint is not None:
         hints.append(gear_hint)
     return hints
+
+
+def _top_line_arc_plate_with_center_bore_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    top_width = _view_extent(top, "width", 0.0)
+    top_height = _view_extent(top, "height", 0.0)
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if top_width <= 0.0 or top_height <= 0.0 or height_z <= 0.0:
+        return None
+
+    edges = top.get("ordered_profile_edges") or []
+    if not edges:
+        for outline in top.get("visible_closed_outlines") or []:
+            candidate_edges = outline.get("edges") or []
+            if outline.get("edges_complete") is True and candidate_edges:
+                edges = candidate_edges
+                break
+    if len(edges) < 6 or not any(edge.get("kind") == "ARC" for edge in edges):
+        return None
+
+    bbox = _points_bbox_2d([
+        point
+        for edge in edges
+        for point in (edge.get("p0"), edge.get("p1"))
+        if len(point or []) == 2
+    ])
+    if bbox[2] - bbox[0] < top_width * 0.85 or bbox[3] - bbox[1] < top_height * 0.85:
+        return None
+
+    circles = [circle for circle in top.get("visible_circles") or [] if not circle.get("hidden")]
+    if not circles:
+        circles = [curve for curve in top.get("approximated_curves") or [] if curve.get("kind") == "approximated_circle"]
+    if not circles:
+        return None
+    center = [top_width * 0.5, top_height * 0.5]
+    centered = []
+    for circle in circles:
+        c = circle.get("center") or []
+        radius = float(circle.get("radius") or 0.0)
+        if len(c) != 2 or radius <= 0.0:
+            continue
+        if abs(float(c[0]) - center[0]) <= max(top_width, top_height) * 0.08 and abs(float(c[1]) - center[1]) <= max(top_width, top_height) * 0.08:
+            centered.append(circle)
+    if not centered:
+        return None
+    bore = max(centered, key=lambda item: float(item.get("radius") or 0.0))
+    bore_center = bore.get("center") or []
+    bore_radius = float(bore.get("radius") or 0.0)
+    if len(bore_center) != 2 or bore_radius <= 0.0:
+        return None
+
+    return {
+        "kind": "top_line_arc_plate_with_center_bore",
+        "confidence": "high",
+        "understanding": "异形薄板：TOP 完整 LINE/ARC 外轮廓沿 Z 拉伸，中心圆为 Z 轴贯穿孔。",
+        "source_view": "top",
+        "construction": {
+            "profile_plane": "XY",
+            "ordered_profile_edges": _round_json(edges),
+            "height_z": _round_num(height_z),
+            "bore": {
+                "axis": "Z",
+                "center_xy": [_round_num(float(bore_center[0])), _round_num(float(bore_center[1]))],
+                "radius": _round_num(bore_radius),
+            },
+            "operation": "Build the exact TOP XY outer wire from ordered_profile_edges preserving LINE and ARC edges, extrude along Z by height_z, then cut the centered Z-axis bore. Do not approximate the outer profile by a cylinder or recompute a smaller outline from radius hints.",
+        },
+        "evidence": [
+            "top.ordered_profile_edges contains a full closed LINE/ARC outline spanning the TOP bbox",
+            "top has a centered circle used as the through bore",
+            "front/left provide the plate thickness height_z",
+        ],
+    }
+
+
+def _stacked_cylinder_hex_top_bore_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    top = projected_views.get("top") or {}
+    front = projected_views.get("front") or {}
+    left = projected_views.get("left") or {}
+    width_x = _view_extent(front, "width", _view_extent(top, "width", 0.0))
+    depth_y = _view_extent(left, "width", _view_extent(top, "height", 0.0))
+    height_z = _view_extent(front, "height", _view_extent(left, "height", 0.0))
+    if width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0:
+        return None
+
+    top_circles = [circle for circle in top.get("visible_circles") or [] if not circle.get("hidden")]
+    if not top_circles:
+        return None
+    outer_circle = max(top_circles, key=lambda item: float(item.get("radius") or 0.0))
+    outer_center = outer_circle.get("center") or []
+    outer_radius = float(outer_circle.get("radius") or 0.0)
+    if len(outer_center) != 2 or outer_radius <= 0.0:
+        return None
+
+    inner_candidates = []
+    for circle in top.get("visible_circles") or []:
+        radius = float(circle.get("radius") or 0.0)
+        center = circle.get("center") or []
+        if len(center) != 2 or radius <= 0.0 or radius >= outer_radius * 0.9:
+            continue
+        if abs(float(center[0]) - float(outer_center[0])) <= outer_radius * 0.08 and abs(float(center[1]) - float(outer_center[1])) <= outer_radius * 0.08:
+            inner_candidates.append(circle)
+    if not inner_candidates:
+        return None
+    bore_circle = max(inner_candidates, key=lambda item: float(item.get("radius") or 0.0))
+    bore_radius = float(bore_circle.get("radius") or 0.0)
+
+    hex_hint = None
+    for item in top.get("regular_polygon_hints") or []:
+        if item.get("kind") == "regular_hexagon_bbox" and len(item.get("recommended_vertices_2d") or []) >= 6:
+            center = item.get("center") or []
+            if len(center) == 2 and abs(float(center[0]) - float(outer_center[0])) <= outer_radius * 0.1 and abs(float(center[1]) - float(outer_center[1])) <= outer_radius * 0.1:
+                hex_hint = item
+                break
+    if hex_hint is None:
+        return None
+
+    stem_widths: List[float] = []
+    top_bands: List[Dict[str, float]] = []
+    for view in (front, left):
+        for entity in view.get("key_profile_entities") or []:
+            if entity.get("kind") != "LINE":
+                continue
+            bbox = entity.get("bbox") or []
+            if len(bbox) != 4:
+                continue
+            x0, y0, x1, y1 = [float(v) for v in bbox]
+            if abs(x1 - x0) <= 1e-6 and (y1 - y0) >= height_z * 0.45:
+                stem_widths.append(x0)
+            if abs(y1 - y0) <= 1e-6 and y0 >= height_z * 0.75 and (x1 - x0) >= max(width_x, depth_y) * 0.7:
+                top_bands.append({"z": y0, "span": x1 - x0})
+
+    if len(stem_widths) < 2 or not top_bands:
+        return None
+    stem_width = max(stem_widths) - min(stem_widths)
+    if stem_width <= 0.0 or stem_width >= outer_radius * 2.0 * 0.9:
+        return None
+    split_z = min(item["z"] for item in top_bands)
+    if split_z <= 0.0 or split_z >= height_z:
+        return None
+
+    return {
+        "kind": "stacked_cylinder_hex_top_bore",
+        "confidence": "high",
+        "understanding": "同轴组合件：下部长圆柱杆、顶部短圆柱/圆盘和顶部六棱柱凸台，共用中心 Z 轴孔。",
+        "source_view": "top+front+left",
+        "construction": {
+            "axis": "Z",
+            "center_xy": [_round_num(float(outer_center[0])), _round_num(float(outer_center[1]))],
+            "stem_radius": _round_num(stem_width * 0.5),
+            "outer_radius": _round_num(outer_radius),
+            "bore_radius": _round_num(bore_radius),
+            "stem_z0": 0.0,
+            "stem_z1": _round_num(split_z),
+            "top_z0": _round_num(split_z),
+            "top_z1": _round_num(height_z),
+            "hex_vertices_2d": _round_json(hex_hint.get("recommended_vertices_2d") or []),
+            "operation": "Create a lower Z-axis cylinder using stem_radius from z0 to stem_z1, create a short top Z-axis cylinder using outer_radius from top_z0 to top_z1, create a hex prism from hex_vertices_2d over [top_z0, top_z1], fuse them, then cut the central Z-axis bore using bore_radius. Do not simplify this compound part into one cylinder.",
+        },
+        "evidence": [
+            "top has an outer centered circle, a smaller centered bore circle, and an internal regular hexagon",
+            "front/left contain long narrow vertical stem sides and a short full-width top band",
+            "these cross-view features indicate stacked coaxial components rather than a simple cylinder",
+        ],
+    }
 
 
 def _polygon_prism_from_top_outline_hint(projected_views: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -240,6 +413,28 @@ def _simple_z_cylinder_from_top_circle_hint(projected_views: Dict[str, Dict[str,
     top_height = _view_extent(top, "height", 0.0)
     if width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0 or top_width <= 0.0 or top_height <= 0.0:
         return None
+
+    has_internal_hex = any(
+        item.get("kind") == "regular_hexagon_bbox"
+        for item in top.get("regular_polygon_hints") or []
+    )
+    top_circles_all = top.get("visible_circles") or []
+    visible_top_circles = [circle for circle in top_circles_all if not circle.get("hidden")]
+    if has_internal_hex and visible_top_circles:
+        outer = max(visible_top_circles, key=lambda item: float(item.get("radius") or 0.0))
+        outer_center = outer.get("center") or []
+        outer_radius = float(outer.get("radius") or 0.0)
+        has_center_bore = False
+        for circle in top_circles_all:
+            center = circle.get("center") or []
+            radius = float(circle.get("radius") or 0.0)
+            if len(center) != 2 or len(outer_center) != 2 or radius <= 0.0 or radius >= outer_radius * 0.9:
+                continue
+            if abs(float(center[0]) - float(outer_center[0])) <= outer_radius * 0.08 and abs(float(center[1]) - float(outer_center[1])) <= outer_radius * 0.08:
+                has_center_bore = True
+                break
+        if has_center_bore:
+            return None
 
     front_outlines = front.get("visible_closed_outlines") or []
     left_outlines = left.get("visible_closed_outlines") or []
@@ -1279,6 +1474,12 @@ def generate_freecad_script(
     if not getattr(llm, "enabled", False):
         return None, f"LLM 已禁用：{getattr(llm, 'disabled_reason', None)}"
 
+    for hint in context.get("model_understanding_hints") or []:
+        if hint.get("kind") == "top_line_arc_plate_with_center_bore":
+            script = generate_outline_fallback_script(context, base_name, fcstd_path)
+            if script is not None:
+                return script, "结构化 TOP 线弧轮廓脚本生成完成（跳过 LLM 重算圆弧）"
+
     try:
         prompt = load_prompt("freecad_script_generator")
     except Exception as exc:
@@ -1288,7 +1489,7 @@ def generate_freecad_script(
         cache_key = _script_cache_key(llm, prompt, context, base_name)
         cached = _read_cached_script(cache_key, base_name, fcstd_path)
         if cached is not None:
-            ok, reason = validate_generated_script(cached)
+            ok, reason = validate_generated_script(cached, context)
             if ok:
                 _write_debug_text(debug_dir, "llm_cache_key.txt", cache_key)
                 return cached, f"复用 LLM 成功脚本缓存（{llm.model}）"
@@ -1316,10 +1517,10 @@ def generate_freecad_script(
 
     _write_debug_text(debug_dir, "llm_raw_response.txt", content)
     script = _sanitize_generated_script(strip_code_fence(content))
-    ok, reason = validate_generated_script(script)
+    ok, reason = validate_generated_script(script, context)
     if not ok:
         repaired, repair_msg = _repair_generated_script(
-            llm, messages, content, reason, debug_dir)
+            llm, messages, content, reason, debug_dir, context)
         if repaired is None:
             return None, f"LLM 脚本未通过安全/结构校验：{reason}；{repair_msg}"
         return repaired, repair_msg
@@ -1380,7 +1581,7 @@ def repair_freecad_script_after_execution(
 
     _write_debug_text(debug_dir, "llm_raw_response_dimension_retry.txt", content)
     script = _sanitize_generated_script(strip_code_fence(content))
-    ok, repair_reason = validate_generated_script(script)
+    ok, repair_reason = validate_generated_script(script, context)
     if not ok:
         return None, f"尺寸校验后自动修复仍未通过脚本校验：{repair_reason}"
     return script, f"LLM 直接建模脚本生成完成（{llm.model}，尺寸校验后自动修复一次）"
@@ -1645,7 +1846,11 @@ def generate_outline_fallback_script(
         front = projected.get("front") or {}
         front_edges = front.get("ordered_profile_edges") or []
         front_circles = front.get("visible_circles") or []
-        if any(edge.get("kind") == "ARC" for edge in front_edges) and front_circles:
+        has_y_hole = any(hole.get("axis") == "Y" for hole in context.get("hole_hints") or [])
+        if has_y_hole and _has_complete_view_profile(front):
+            view_name = "front"
+            view = front
+        elif any(edge.get("kind") == "ARC" for edge in front_edges) and front_circles:
             view_name = "front"
             view = front
 
@@ -1868,6 +2073,16 @@ def _discretize_outline_edges(edges: List[Dict[str, Any]]) -> List[List[float]]:
     return points
 
 
+def _has_complete_view_profile(view: Dict[str, Any]) -> bool:
+    edges = view.get("ordered_profile_edges") or []
+    if len(edges) >= 3:
+        return True
+    for outline in view.get("visible_closed_outlines") or []:
+        if outline.get("edges_complete") is True and len(outline.get("edges") or []) >= 3:
+            return True
+    return False
+
+
 def _outline_points_from_model_hint(context: Dict[str, Any]) -> List[List[float]]:
     for hint in context.get("model_understanding_hints") or []:
         if hint.get("kind") not in {"toothed_disk_from_open_top_profile", "toothed_disk_from_top_profile"}:
@@ -1924,6 +2139,7 @@ def _repair_generated_script(
     bad_content: str,
     reason: str,
     debug_dir: Optional[str],
+    context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], str]:
     repair_messages = list(original_messages)
     repair_messages.append({"role": "assistant", "content": bad_content[:6000]})
@@ -1959,7 +2175,7 @@ def _repair_generated_script(
 
     _write_debug_text(debug_dir, "llm_raw_response_retry.txt", content)
     script = _sanitize_generated_script(strip_code_fence(content))
-    ok, repair_reason = validate_generated_script(script)
+    ok, repair_reason = validate_generated_script(script, context)
     if not ok:
         return None, f"自动重试仍未通过：{repair_reason}"
     return script, f"LLM 直接建模脚本生成完成（{llm.model}，自动修复一次）"
@@ -2169,7 +2385,7 @@ class _alarm_timeout:
         raise TimeoutError(f"LLM request exceeded {self.seconds} seconds")
 
 
-def validate_generated_script(script: str) -> Tuple[bool, str]:
+def validate_generated_script(script: str, context: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     if not script.strip():
         return False, "empty script"
     for token in _BANNED_TEXT:
@@ -2185,7 +2401,7 @@ def validate_generated_script(script: str) -> Tuple[bool, str]:
         return False, "arc-revolve chamfer envelope must clip the hex body with common(), not fuse() with the body"
     if _has_untranslated_rz_profile(script):
         return False, "R-Z profile points must be translated to App.Vector(center_x + r, center_y, z) before revolve"
-    if _regular_hex_prism_script_has_extra_features(script):
+    if _regular_hex_prism_script_has_extra_features(script, context):
         return False, "regular hex prism scripts must not add holes, fillets, chamfers, or revolved envelopes without explicit circle/arc hints"
     if _has_naive_arc_midpoint(script):
         return False, "ARC midpoint angle must handle start/end crossing 360 degrees; if end_angle < start_angle, add 2*pi before averaging"
@@ -2269,16 +2485,21 @@ def _has_untranslated_rz_profile(script: str) -> bool:
     return bool(re.search(r"_safe_arc\(\s*App\.Vector\(\s*(?:8\.66|9\.33|10\.0)\s*,\s*0\.0", script))
 
 
-def _regular_hex_prism_script_has_extra_features(script: str) -> bool:
+def _regular_hex_prism_script_has_extra_features(script: str, context: Optional[Dict[str, Any]] = None) -> bool:
     understanding_match = re.search(r'(?m)^\s*MODEL_UNDERSTANDING\s*=\s*(["\'])(.*?)\1', script)
     if not understanding_match:
         return False
     understanding = understanding_match.group(2)
-    if "六棱柱" not in understanding and "六角柱" not in understanding:
+    if "六棱柱" not in understanding and "六角柱" not in understanding and "六角" not in understanding:
         return False
-    if "圆柱" in understanding or "组合" in understanding:
+    if any(word in understanding for word in ("组合", "凸台", "套筒", "连接件", "多主体")):
         return False
-    banned = ("makeFillet", "makeChamfer", ".revolve(", "Part.makeCylinder", ".cut(")
+    explicit_holes = bool((context or {}).get("hole_hints") or [])
+    has_hole_semantics = any(word in understanding for word in ("孔", "通孔", "内孔", "中心孔"))
+    if explicit_holes and has_hole_semantics:
+        banned = ("makeFillet", "makeChamfer", ".revolve(")
+    else:
+        banned = ("makeFillet", "makeChamfer", ".revolve(", "Part.makeCylinder", ".cut(")
     return any(token in script for token in banned)
 
 

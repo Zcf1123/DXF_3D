@@ -16,7 +16,7 @@
 把要处理的 `.dxf` 放到 `DXF_3D/dxf_files/`，然后：
 
 ```bash
-# 跑 dxf_files/ 下所有 DXF（默认 LLM 直接建模路线；开发挂载模式，推荐当前使用方式）
+# 跑 dxf_files/ 下所有 DXF
 ./run.sh -d
 
 # 或指定文件（路径可在 DXF_3D 内或宿主机任意位置）
@@ -32,7 +32,7 @@
 # 给 LLM 建模意图弱提示，辅助处理歧义或视图漏画
 ./run.sh -d --intent "先拉伸圆柱；侧面矩形孔贯穿切除；上端圆孔盲切" dxf_files/part.dxf
 
-# 启用反投影验证：生成 projection_validation.json，并在终端打印 Projection 摘要
+# 启用投影验证：生成 projection_validation.json，并在终端打印 Projection 摘要
 ./run.sh -d --val dxf_files/Drawing1.dxf
 ```
 
@@ -106,19 +106,20 @@ cd /path/to/DXF_3D
 ```
 LLM         : qwen3.5-35b-a3b
 Projection   : WARN
-   FRONT WARN input= 82.1% model=100.0% extra=  0.0%
-   LEFT  WARN input= 75.6% model=100.0% extra=  0.0%
-   TOP   OK   input=100.0% model= 99.6% extra=  0.4%
+   FRONT WARN coverage= 82.1% missing= 17.9% match=100.0% extra=  0.0%
+   LEFT  WARN coverage= 75.6% missing= 24.4% match=100.0% extra=  0.0%
+   TOP   OK   coverage=100.0% missing=  0.0% match= 99.6% extra=  0.4%
 Output dir  : DXF_3D/outputs/20260507_095610_Drawing1
 Status      : OK
 ```
 
-默认不运行反投影验证，因此普通命令不会打印 `Projection`，也不会写出
+默认不运行投影验证，因此普通命令不会打印 `Projection`，也不会写出
 `projection_validation.json`。需要验证时在命令行加 `--val`。
 
-`Projection` 是反投影验证摘要：把最终 3D 模型重新投影回 FRONT/LEFT/TOP，
-再与输入三视图比对。`input` 表示输入视图被模型覆盖的比例，`model` 表示模型
-投影能被输入视图解释的比例，`extra` 表示模型投影中的多余线比例。`OK/WARN`
+`Projection` 是投影验证摘要：把最终 3D 模型重新投影回 FRONT/LEFT/TOP，
+再与输入三视图比对。`coverage` 表示输入视图被模型覆盖的比例，`missing` 表示
+输入视图未被模型覆盖的漏画比例（`1 - coverage`），`match` 表示模型投影能被
+输入视图解释的比例，`extra` 表示模型投影中的多余线比例。`OK/WARN`
 只作为几何投影对比参考；具体建模结果仍应结合 `.FCStd`、`.step` 和模型三视图 PNG 查看。
 其余阶段日志（实体统计、视图归类、特征草案、LLM 返回、产物清单等）全部以中文
 写入 `<output_dir>/run.log`。
@@ -226,7 +227,7 @@ DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
 | `views_algorithm.json`     | 纯算法阶段的原始视图归类结果 |
 | `views.json`               | 最终使用的视图归类结果；启用 LLM 且校验通过时为语义复核后的结果，否则为算法结果 |
 | `auto_context.json`        | 默认 LLM 路线：送入 LLM 的紧凑三视图/投影几何上下文 |
-| `projection_validation.json` | 仅加 `--val` 时生成；反投影验证报告：模型三视图与输入三视图的覆盖率、匹配率、bbox 差异和未覆盖线段 |
+| `projection_validation.json` | 仅加 `--val` 时生成；投影验证报告：模型三视图与输入三视图的覆盖率、匹配率、bbox 差异和未覆盖线段 |
 | `model.json`               | FreeCAD 文档对象信息 |
 | `generated_model.py`       | 独立可重跑脚本：`freecadcmd generated_model.py` |
 | `run.log`                  | 详细中文日志（每一阶段、警告、栈追踪） |

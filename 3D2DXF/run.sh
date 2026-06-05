@@ -5,6 +5,7 @@
 #   ./run.sh                         # 转换 ./3d/ 下所有 STEP/STP 文件
 #   ./run.sh path/to/step_folder     # 转换指定目录下所有 STEP/STP 文件
 #   ./run.sh path/to/model.step      # 转换指定文件（可多个）
+#   ./run.sh --hid path/to/model.step # 输出隐藏线
 #   ./run.sh -d [files_or_dirs...]   # 开发模式：挂载本地源码，无需重建镜像
 #
 # 依赖: dxf-3d Docker 镜像（与上级项目共用，镜像名可用 DXF_3D_IMAGE 覆盖）
@@ -28,6 +29,10 @@ if [[ $# -eq 0 ]]; then
 else
     PY_FILES="["
     for f in "$@"; do
+        if [[ "$f" == "--hid" ]]; then
+            PY_FILES+="'--hid',"
+            continue
+        fi
         abs="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
         if [[ "$abs" == "$HERE"/* ]]; then
             rel="${abs#$HERE/}"

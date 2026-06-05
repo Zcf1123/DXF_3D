@@ -55,15 +55,15 @@ class DXFWriter:
         # LTYPE 表：使用固定 R12 线型长度。
         # FreeCAD 的 DXF 导入器对极小的自定义线型 pattern 容错较差，
         # 因此不要按模型尺寸缩放这里的 40/49 数值。
-        rows += ["0", "TABLE", "2", "LTYPE", "70", "3"]
+        uses_hidden = any(e.get("lt") == "HIDDEN" or "HID" in e.get("layer", "") for e in self._ents)
+        ltype_count = 2 if uses_hidden else 1
+        rows += ["0", "TABLE", "2", "LTYPE", "70", str(ltype_count)]
         rows += ["0", "LTYPE", "2", "CONTINUOUS", "70", "0",
                  "3", "Solid line", "72", "65", "73", "0", "40", "0.0"]
-        rows += ["0", "LTYPE", "2", "HIDDEN", "70", "0",
-             "3", "__ __ __ __ __", "72", "65", "73", "2", "40", "9.0",
-             "49", "6.0", "49", "-3.0"]
-        rows += ["0", "LTYPE", "2", "CENTER", "70", "0",
-             "3", "___ _ ___ _ ___", "72", "65", "73", "4", "40", "21.0",
-             "49", "12.0", "49", "-3.0", "49", "3.0", "49", "-3.0"]
+        if uses_hidden:
+            rows += ["0", "LTYPE", "2", "HIDDEN", "70", "0",
+                 "3", "__ __ __ __ __", "72", "65", "73", "2", "40", "9.0",
+                 "49", "6.0", "49", "-3.0"]
         rows += ["0", "ENDTAB"]
 
         # LAYER 表
@@ -311,7 +311,7 @@ def _remove_covered_lines(ents, tol=1e-6):
 
 
 def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
-                 lvis="0", lhid="HIDDEN"):
+                 lvis="0", lhid="HIDDEN", include_hidden=False):
     """
     沿 direction 方向投影形体，返回实体字典列表（包含可见线和隐藏线）。
     result[0..4]:  可见边 (hard/smooth/sewn/outline/iso)
@@ -346,6 +346,9 @@ def project_view(shape, direction, ax, ay, sx=1.0, sy=1.0,
         except Exception:
             pass
     visible_ents = _remove_covered_lines(visible_ents)
+
+    if not include_hidden:
+        return visible_ents
 
     visible_keys = {key for key in (_line_key(e) for e in visible_ents) if key is not None}
     hidden_ents = []
@@ -451,7 +454,7 @@ def load_shape(path):
 
 # ── 主转换函数 ────────────────────────────────────────────────────────────────
 
-def convert(input_path, output_path):
+def convert(input_path, output_path, include_hidden=False):
     """将单个 3D 文件转换为 DXF 三视图。"""
     print(f"加载: {input_path}")
     shape = load_shape(input_path)
@@ -474,15 +477,15 @@ def convert(input_path, output_path):
 
     print("  投影正视图 (front, 从 -Y 看向 +Y) ...")
     front = project_view(shape, (0, -1, 0), ax=1, ay=0, sx=1.0, sy=-1.0,
-                         lvis="FRONT", lhid="FRONT_HID")
+                                                 lvis="FRONT", lhid="FRONT_HID", include_hidden=include_hidden)
 
     print("  投影俯视图 (top, 从 +Z 看向原点) ...")
     top = project_view(shape, (0, 0, 1), ax=0, ay=1, sx=1.0, sy=1.0,
-                       lvis="TOP", lhid="TOP_HID")
+                                             lvis="TOP", lhid="TOP_HID", include_hidden=include_hidden)
 
     print("  投影左视图 (left, 从 -X 看向 +X) ...")
     left = project_view(shape, (-1, 0, 0), ax=1, ay=0, sx=1.0, sy=-1.0,
-                        lvis="LEFT", lhid="LEFT_HID")
+                                                lvis="LEFT", lhid="LEFT_HID", include_hidden=include_hidden)
 
     # 各视图按模型包围盒归零，而不是按投影实体 bbox 归零。
     # 这样即使某个视图的最外侧边被消隐/圆弧 bbox 扩张，也不会破坏三视图对齐：
@@ -549,6 +552,13 @@ def main(files=None):
     output_dir = os.path.join(script_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
 
+    include_hidden = False
+    if files is not None:
+        include_hidden = "--hid" in files
+        files = [f for f in files if f != "--hid"]
+        if not files:
+            files = None
+
     if files is None:
         files = expand_input_files([input_dir])
         if not files:
@@ -565,7 +575,7 @@ def main(files=None):
         base = os.path.splitext(os.path.basename(fp))[0]
         out  = os.path.join(output_dir, base + ".dxf")
         try:
-            convert(fp, out)
+            convert(fp, out, include_hidden=include_hidden)
         except Exception as e:
             print(f"[3D2DXF] ERROR {fp}: {e}")
             import traceback
@@ -576,6 +586,6 @@ def main(files=None):
 
 
 if __name__ == "__main__":
-    # 过滤掉 freecadcmd 注入的参数（以 -- 开头）
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # 过滤掉 freecadcmd 注入的参数；保留本脚本支持的 --hid。
+    args = [a for a in sys.argv[1:] if a == "--hid" or not a.startswith("--")]
     sys.exit(main(args if args else None))

@@ -99,7 +99,7 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 if [[ ! -s "${SUMMARY_FILE}" ]]; then
-    printf 'part\tstatus\tllm_model\tmodel_accuracy\telapsed_s\tllm_understanding\tfcstd\toutput_dir\n' >> "${SUMMARY_FILE}"
+    printf 'part\tstatus\tllm_model\tmodel_accuracy\tcoverage\tmissing\tmatch\textra\telapsed_s\tllm_understanding\tfcstd\toutput_dir\n' >> "${SUMMARY_FILE}"
 fi
 
 overall_rc=0
@@ -175,21 +175,131 @@ for dxf in "${dxf_files[@]}"; do
     fi
 
     llm_understanding="-"
+    coverage="-"
+    missing="-"
+    match="-"
+    extra="-"
     run_log="${local_output_dir}/run.log"
     if [[ -f "${run_log}" ]]; then
         llm_understanding="$(sed -n 's/^.*LLM 模型理解[[:space:]]*:[[:space:]]*//p; s/^.*LLM 理解[[:space:]]*:[[:space:]]*//p' "${run_log}" | tail -n 1)"
         if [[ -z "${llm_understanding}" ]]; then
             llm_understanding="-"
         fi
+
+        coverage="$(awk '
+            function field_value(key, line, re, value) {
+                re = key "=[[:space:]]*[0-9.]+%"
+                if (match(line, re)) {
+                    value = substr(line, RSTART, RLENGTH)
+                    sub("^" key "=[[:space:]]*", "", value)
+                    return value
+                }
+                return ""
+            }
+            /·[[:space:]]*(FRONT|LEFT|TOP|RIGHT):/ {
+                view = ""
+                if (match($0, /(FRONT|LEFT|TOP|RIGHT):/)) {
+                    view = substr($0, RSTART, RLENGTH - 1)
+                }
+                value = field_value("coverage", $0)
+                if (view != "" && value != "") {
+                    items[++n] = view "=" value
+                }
+            }
+            END {
+                for (i = 1; i <= n; i++) {
+                    printf "%s%s", (i == 1 ? "" : ", "), items[i]
+                }
+            }' "${run_log}")"
+        missing="$(awk '
+            function field_value(key, line, re, value) {
+                re = key "=[[:space:]]*[0-9.]+%"
+                if (match(line, re)) {
+                    value = substr(line, RSTART, RLENGTH)
+                    sub("^" key "=[[:space:]]*", "", value)
+                    return value
+                }
+                return ""
+            }
+            /·[[:space:]]*(FRONT|LEFT|TOP|RIGHT):/ {
+                view = ""
+                if (match($0, /(FRONT|LEFT|TOP|RIGHT):/)) {
+                    view = substr($0, RSTART, RLENGTH - 1)
+                }
+                value = field_value("missing", $0)
+                if (view != "" && value != "") {
+                    items[++n] = view "=" value
+                }
+            }
+            END {
+                for (i = 1; i <= n; i++) {
+                    printf "%s%s", (i == 1 ? "" : ", "), items[i]
+                }
+            }' "${run_log}")"
+        match="$(awk '
+            function field_value(key, line, re, value) {
+                re = key "=[[:space:]]*[0-9.]+%"
+                if (match(line, re)) {
+                    value = substr(line, RSTART, RLENGTH)
+                    sub("^" key "=[[:space:]]*", "", value)
+                    return value
+                }
+                return ""
+            }
+            /·[[:space:]]*(FRONT|LEFT|TOP|RIGHT):/ {
+                view = ""
+                if (match($0, /(FRONT|LEFT|TOP|RIGHT):/)) {
+                    view = substr($0, RSTART, RLENGTH - 1)
+                }
+                value = field_value("match", $0)
+                if (view != "" && value != "") {
+                    items[++n] = view "=" value
+                }
+            }
+            END {
+                for (i = 1; i <= n; i++) {
+                    printf "%s%s", (i == 1 ? "" : ", "), items[i]
+                }
+            }' "${run_log}")"
+        extra="$(awk '
+            function field_value(key, line, re, value) {
+                re = key "=[[:space:]]*[0-9.]+%"
+                if (match(line, re)) {
+                    value = substr(line, RSTART, RLENGTH)
+                    sub("^" key "=[[:space:]]*", "", value)
+                    return value
+                }
+                return ""
+            }
+            /·[[:space:]]*(FRONT|LEFT|TOP|RIGHT):/ {
+                view = ""
+                if (match($0, /(FRONT|LEFT|TOP|RIGHT):/)) {
+                    view = substr($0, RSTART, RLENGTH - 1)
+                }
+                value = field_value("extra", $0)
+                if (view != "" && value != "") {
+                    items[++n] = view "=" value
+                }
+            }
+            END {
+                for (i = 1; i <= n; i++) {
+                    printf "%s%s", (i == 1 ? "" : ", "), items[i]
+                }
+            }' "${run_log}")"
+        if [[ -z "${coverage}" ]]; then coverage="-"; fi
+        if [[ -z "${missing}" ]]; then missing="-"; fi
+        if [[ -z "${match}" ]]; then match="-"; fi
+        if [[ -z "${extra}" ]]; then extra="-"; fi
+        if [[ "${model_accuracy}" == "-" && "${match}" != "-" ]]; then
+            model_accuracy="${match}"
+        fi
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${part}" "${status}" "${llm_model}" "${model_accuracy}" "${elapsed}" "${llm_understanding}" "${fcstd_dst}" "${output_dir}" >> "${SUMMARY_FILE}"
-    printf '  %s  llm:%s  model:%s  %ss  %s\n' "${status}" "${llm_model}" "${model_accuracy}" "${elapsed}" "${fcstd_dst}" >&2
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${part}" "${status}" "${llm_model}" "${model_accuracy}" "${coverage}" "${missing}" "${match}" "${extra}" "${elapsed}" "${llm_understanding}" "${fcstd_dst}" "${output_dir}" >> "${SUMMARY_FILE}"
 
     if (( rc != 0 )); then
         overall_rc=2
     fi
 done
 
-printf 'Summary: %s\n' "${SUMMARY_FILE}" >&2
 exit "${overall_rc}"
