@@ -1479,6 +1479,10 @@ def generate_freecad_script(
             script = generate_outline_fallback_script(context, base_name, fcstd_path)
             if script is not None:
                 return script, "结构化 TOP 线弧轮廓脚本生成完成（跳过 LLM 重算圆弧）"
+        if hint.get("kind") == "hex_nut_arc_revolve_chamfer":
+            script = generate_hex_nut_arc_revolve_script(context, base_name, fcstd_path, hint)
+            if script is not None:
+                return script, "结构化六角螺母圆弧倒角脚本生成完成（跳过 LLM 重算倒角）"
 
     try:
         prompt = load_prompt("freecad_script_generator")
@@ -1824,6 +1828,123 @@ def cache_successful_freecad_script(
         return
     key = _script_cache_key(llm, prompt, context, base_name)
     _write_cached_script(key, script)
+
+
+def generate_hex_nut_arc_revolve_script(
+    context: Dict[str, Any],
+    base_name: str,
+    fcstd_path: str,
+    hint: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Generate a deterministic script for a chamfered hex nut.
+
+    The DXF pattern has TOP hexagon + inner hole + boundary construction
+    circle, and FRONT/LEFT arc envelopes.  A plain prism passes bbox checks but
+    loses the end chamfers, so this route clips the hex prism with a revolved
+    R-Z arc envelope instead of relying on the LLM to reproduce that detail.
+    """
+    hint = hint or next(
+        (
+            item for item in context.get("model_understanding_hints") or []
+            if item.get("kind") == "hex_nut_arc_revolve_chamfer"
+        ),
+        None,
+    )
+    if hint is None:
+        return None
+
+    dims = ((context.get("dimension_constraints") or {}).get("overall_size") or {})
+    width_x = float(dims.get("width_x") or 0.0)
+    depth_y = float(dims.get("depth_y") or 0.0)
+    height_z = float(dims.get("height_z") or 0.0)
+
+    base_profile = hint.get("base_profile") or {}
+    chamfer = hint.get("arc_revolve_chamfer") or {}
+    hole = hint.get("through_hole") or {}
+    vertices = base_profile.get("vertices_2d") or []
+    center = base_profile.get("center") or hole.get("center") or []
+    hole_center = hole.get("center") or center
+    hole_radius = float(hole.get("radius") or 0.0)
+    top_radius = float(chamfer.get("top_radius") or 0.0)
+    outer_radius = float(chamfer.get("outer_radius") or base_profile.get("outer_radius") or 0.0)
+    distance = float(chamfer.get("distance") or 0.0)
+    if (
+        len(vertices) < 6 or len(center) != 2 or len(hole_center) != 2
+        or width_x <= 0.0 or depth_y <= 0.0 or height_z <= 0.0
+        or hole_radius <= 0.0 or top_radius <= 0.0 or outer_radius <= top_radius
+        or distance <= 0.0 or distance >= height_z * 0.5
+    ):
+        return None
+
+    vertices_literal = repr(_round_json(vertices))
+    center_literal = repr(_round_json(center))
+    hole_center_literal = repr(_round_json(hole_center))
+    return f'''import FreeCAD as App
+import Part
+import math
+
+BASE_NAME = {base_name!r}
+FCSTD_PATH = {fcstd_path!r}
+MODEL_UNDERSTANDING = '六角螺母：TOP 六边形为主体、中心圆为通孔、大同心圆为端面圆弧倒角参考；FRONT/LEFT 圆弧包络用旋转包络裁剪主体形成倒角'
+DIMENSIONS_USED = {{"width_x": {width_x!r}, "depth_y": {depth_y!r}, "height_z": {height_z!r}, "hex_vertices_2d": {vertices_literal}, "hole": {{"center": {hole_center_literal}, "radius": {hole_radius!r}}}, "arc_revolve_chamfer": {{"distance": {distance!r}, "top_radius": {top_radius!r}, "outer_radius": {outer_radius!r}}}}}
+
+doc = App.newDocument(BASE_NAME)
+center = {center_literal}
+hole_center = {hole_center_literal}
+vertices_2d = {vertices_literal}
+height_z = {height_z!r}
+hole_radius = {hole_radius!r}
+top_radius = {top_radius!r}
+outer_radius = {outer_radius!r}
+distance = {distance!r}
+
+points = [App.Vector(float(x), float(y), 0.0) for x, y in vertices_2d]
+if points[0].distanceToPoint(points[-1]) > 1e-9:
+    points.append(points[0])
+hex_wire = Part.makePolygon(points)
+hex_body = Part.Face(hex_wire).extrude(App.Vector(0.0, 0.0, height_z))
+
+margin = max(height_z, outer_radius, 1.0) * 0.05
+cutter = Part.makeCylinder(
+    hole_radius,
+    height_z + 2.0 * margin,
+    App.Vector(float(hole_center[0]), float(hole_center[1]), -margin),
+    App.Vector(0.0, 0.0, 1.0),
+)
+body = hex_body.cut(cutter)
+
+cx = float(center[0])
+cy = float(center[1])
+z0 = 0.0
+z1 = distance
+z2 = height_z - distance
+z3 = height_z
+
+def rv(radius, z):
+    return App.Vector(float(radius), 0.0, float(z))
+
+bottom_mid = rv((top_radius + outer_radius) * 0.5, distance * 0.35)
+top_mid = rv((top_radius + outer_radius) * 0.5, height_z - distance * 0.35)
+edges = [
+    Part.LineSegment(rv(0.0, z0), rv(top_radius, z0)).toShape(),
+    Part.Arc(rv(top_radius, z0), bottom_mid, rv(outer_radius, z1)).toShape(),
+    Part.LineSegment(rv(outer_radius, z1), rv(outer_radius, z2)).toShape(),
+    Part.Arc(rv(outer_radius, z2), top_mid, rv(top_radius, z3)).toShape(),
+    Part.LineSegment(rv(top_radius, z3), rv(0.0, z3)).toShape(),
+    Part.LineSegment(rv(0.0, z3), rv(0.0, z0)).toShape(),
+]
+env_face = Part.Face(Part.Wire(edges))
+envelope = env_face.revolve(App.Vector(0.0, 0.0, 0.0), App.Vector(0.0, 0.0, 1.0), 360.0)
+if not envelope.Solids and envelope.Shells:
+    envelope = Part.Solid(envelope.Shells[0])
+envelope.translate(App.Vector(cx, cy, 0.0))
+
+final_shape = body.common(envelope).common(hex_body).removeSplitter()
+result = doc.addObject('Part::Feature', 'Result')
+result.Shape = final_shape
+doc.recompute()
+doc.saveAs(FCSTD_PATH)
+'''
 
 
 def generate_outline_fallback_script(
