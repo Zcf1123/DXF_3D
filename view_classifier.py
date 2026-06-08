@@ -70,6 +70,11 @@ def classify_views(entities: List[DxfEntity]) -> List[ViewBundle]:
     if not geom:
         return []
 
+    layer_bundles = _classify_by_view_layers(geom)
+    if layer_bundles is not None:
+        _attach_annotations(layer_bundles, ann)
+        return layer_bundles
+
     clusters, spanning = _cluster_by_bbox(geom)
 
     # --- Fallback: centroid-based partitioning ----------------------------
@@ -109,7 +114,53 @@ def classify_views(entities: List[DxfEntity]) -> List[ViewBundle]:
     else:
         _assign_by_layout(bundles)
 
-    # Attach annotations to nearest cluster
+    _attach_annotations(bundles, ann)
+
+    return bundles
+
+
+def _classify_by_view_layers(geom: List[DxfEntity]) -> Optional[List[ViewBundle]]:
+    """Use explicit FRONT/TOP/LEFT layer names when present.
+
+    3D2DXF-generated files already carry view identity in layer names.  That
+    is more reliable than geometric proximity when FRONT and LEFT touch or
+    overlap on the sheet.
+    """
+    groups: Dict[str, List[DxfEntity]] = {"front": [], "top": [], "left": []}
+    named_count = 0
+    for e in geom:
+        view = _view_name_from_layer(e.layer)
+        if view is None:
+            continue
+        groups[view].append(e)
+        named_count += 1
+
+    present = [name for name, items in groups.items() if items]
+    if len(present) < 2 or named_count < max(1, int(len(geom) * 0.5)):
+        return None
+
+    bundles = []
+    for name in ("front", "left", "top"):
+        items = groups[name]
+        if items:
+            bundles.append(ViewBundle(name=name,
+                                      bbox=_cluster_bbox(items),
+                                      entities=items))
+    return bundles
+
+
+def _view_name_from_layer(layer: str) -> Optional[str]:
+    lname = (layer or "").upper()
+    if lname.startswith("FRONT"):
+        return "front"
+    if lname.startswith("TOP"):
+        return "top"
+    if lname.startswith("LEFT") or lname.startswith("RIGHT"):
+        return "left"
+    return None
+
+
+def _attach_annotations(bundles: List[ViewBundle], ann: List[DxfEntity]) -> None:
     for a in ann:
         b = a.bbox()
         if b is None:
@@ -118,8 +169,6 @@ def classify_views(entities: List[DxfEntity]) -> List[ViewBundle]:
         nearest = _nearest_bundle(bundles, (cx, cy))
         if nearest is not None:
             nearest.annotations.append(a)
-
-    return bundles
 
 
 # ---------------------------------------------------------------------------

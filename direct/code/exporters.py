@@ -207,9 +207,9 @@ def validate_projection_against_views(
     try:
         shape = _result_shape(doc)
         model_views = {
-            "front": _project_shape_edges(shape, "front"),
-            "left": _project_shape_edges(shape, "left"),
-            "top": _project_shape_edges(shape, "top"),
+            "front": _project_shape_edges(shape, "front", classify_hidden=True),
+            "left": _project_shape_edges(shape, "left", classify_hidden=True),
+            "top": _project_shape_edges(shape, "top", classify_hidden=True),
         }
     finally:
         App.closeDocument(doc.Name)
@@ -781,9 +781,9 @@ def _compare_segment_sets(input_segments, model_segments, scale: float) -> Dict[
         "model_segments": len(model_segments),
         "input_samples": len(input_samples),
         "model_samples": len(model_samples),
-        "coverage": round(input_covered, 4),
+        "input_coverage": round(input_covered, 4),
         "missing": round(1.0 - input_covered, 4),
-        "match": round(model_matched, 4),
+        "hit_ratio": round(model_matched, 4),
         "extra": round(1.0 - model_matched, 4),
         "bbox_error": bbox_error,
         "unmatched_input_segments": _unmatched_segments(input_segments, model_segments, tolerance),

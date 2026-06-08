@@ -168,20 +168,20 @@ def _projection_validation_is_poor(validation: Dict) -> bool:
     poor_views = 0
     very_poor_views = 0
     for report in views.values():
-        coverage = float(report.get("coverage", 0.0) or 0.0)
-        match = float(report.get("match", 0.0) or 0.0)
+        input_coverage = float(report.get("input_coverage", 0.0) or 0.0)
+        hit_ratio = float(report.get("hit_ratio", 0.0) or 0.0)
         extra = float(report.get("extra", 0.0) or 0.0)
-        if coverage < 0.35 or match < 0.35 or extra > 0.65:
+        if input_coverage < 0.35 or hit_ratio < 0.35 or extra > 0.65:
             poor_views += 1
-        if coverage < 0.15 or match < 0.15 or extra > 0.85:
+        if input_coverage < 0.15 or hit_ratio < 0.15 or extra > 0.85:
             very_poor_views += 1
     return very_poor_views >= 1 or poor_views >= 2
 
 
 def _projection_validation_cache_reach(
     validation: Dict,
-    coverage_threshold: float = 0.95,
-    match_threshold: float = 0.99,
+    input_coverage_threshold: float = 0.95,
+    hit_ratio_threshold: float = 0.99,
 ) -> bool:
     views = validation.get("views") or {}
     required = ("front", "left", "top")
@@ -189,19 +189,19 @@ def _projection_validation_cache_reach(
         report = views.get(view_name)
         if not report:
             return False
-        coverage = float(report.get("coverage", 0.0) or 0.0)
-        match = float(report.get("match", 0.0) or 0.0)
-        if coverage < coverage_threshold or match < match_threshold:
+        input_coverage = float(report.get("input_coverage", 0.0) or 0.0)
+        hit_ratio = float(report.get("hit_ratio", 0.0) or 0.0)
+        if input_coverage < input_coverage_threshold or hit_ratio < hit_ratio_threshold:
             return False
     return True
 
 
 def _validation_report_values(report: Dict) -> Dict[str, float]:
-    coverage = float(report.get("coverage", 0.0) or 0.0)
+    input_coverage = float(report.get("input_coverage", 0.0) or 0.0)
     return {
-        "coverage": coverage * 100.0,
-        "missing": float(report.get("missing", 1.0 - coverage) or 0.0) * 100.0,
-        "match": float(report.get("match", 0.0) or 0.0) * 100.0,
+        "input_coverage": input_coverage * 100.0,
+        "missing": float(report.get("missing", 1.0 - input_coverage) or 0.0) * 100.0,
+        "hit_ratio": float(report.get("hit_ratio", 0.0) or 0.0) * 100.0,
         "extra": float(report.get("extra", 0.0) or 0.0) * 100.0,
     }
 
@@ -550,17 +550,17 @@ def process_dxf(dxf_path: str, llm,
                         continue
                     values = _validation_report_values(report)
                     log.info(
-                        "  · %s: status=%s coverage=%.1f%% missing=%.1f%% match=%.1f%% extra=%.1f%% bbox_error=%s",
+                        "  · %s: status=%s input_coverage=%.1f%% missing=%.1f%% hit_ratio=%.1f%% extra=%.1f%% bbox_error=%s",
                         view_display.get(view_name, view_name.upper()),
                         report.get("status"),
-                        values["coverage"],
+                        values["input_coverage"],
                         values["missing"],
-                        values["match"],
+                        values["hit_ratio"],
                         values["extra"],
                         report.get("bbox_error"),
                     )
                     _say(
-                        "  {name:<5} {status:<4} coverage={coverage:5.1f}% missing={missing:5.1f}% match={match:5.1f}% extra={extra:5.1f}%".format(
+                        "  {name:<5} {status:<4} input_coverage={input_coverage:5.1f}% missing={missing:5.1f}% hit_ratio={hit_ratio:5.1f}% extra={extra:5.1f}%".format(
                             name=view_display.get(view_name, view_name.upper()),
                             status=str(report.get("status", "")),
                             **values,
@@ -602,17 +602,17 @@ def process_dxf(dxf_path: str, llm,
                                     continue
                                 values = _validation_report_values(report)
                                 log.info(
-                                    "  · %s: status=%s coverage=%.1f%% missing=%.1f%% match=%.1f%% extra=%.1f%% bbox_error=%s",
+                                    "  · %s: status=%s input_coverage=%.1f%% missing=%.1f%% hit_ratio=%.1f%% extra=%.1f%% bbox_error=%s",
                                     view_display.get(view_name, view_name.upper()),
                                     report.get("status"),
-                                    values["coverage"],
+                                    values["input_coverage"],
                                     values["missing"],
-                                    values["match"],
+                                    values["hit_ratio"],
                                     values["extra"],
                                     report.get("bbox_error"),
                                 )
                                 _say(
-                                    "  {name:<5} {status:<4} coverage={coverage:5.1f}% missing={missing:5.1f}% match={match:5.1f}% extra={extra:5.1f}%".format(
+                                    "  {name:<5} {status:<4} input_coverage={input_coverage:5.1f}% missing={missing:5.1f}% hit_ratio={hit_ratio:5.1f}% extra={extra:5.1f}%".format(
                                         name=view_display.get(view_name, view_name.upper()),
                                         status=str(report.get("status", "")),
                                         **values,
@@ -930,17 +930,17 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
                         continue
                     values = _validation_report_values(report)
                     log.info(
-                        "  · %s: status=%s coverage=%.1f%% missing=%.1f%% match=%.1f%% extra=%.1f%% bbox_error=%s",
+                        "  · %s: status=%s input_coverage=%.1f%% missing=%.1f%% hit_ratio=%.1f%% extra=%.1f%% bbox_error=%s",
                         view_display.get(view_name, view_name.upper()),
                         report.get("status"),
-                        values["coverage"],
+                        values["input_coverage"],
                         values["missing"],
-                        values["match"],
+                        values["hit_ratio"],
                         values["extra"],
                         report.get("bbox_error"),
                     )
                     _say(
-                        "  {name:<5} {status:<4} coverage={coverage:5.1f}% missing={missing:5.1f}% match={match:5.1f}% extra={extra:5.1f}%".format(
+                        "  {name:<5} {status:<4} input_coverage={input_coverage:5.1f}% missing={missing:5.1f}% hit_ratio={hit_ratio:5.1f}% extra={extra:5.1f}%".format(
                             name=view_display.get(view_name, view_name.upper()),
                             status=str(report.get("status", "")),
                             **values,
@@ -949,9 +949,9 @@ def process_dxf_auto(dxf_path: str, llm, model_intent: str = "",
                 log.info("已写出        : projection_validation.json")
                 if _projection_validation_cache_reach(validation):
                     cache_successful_freecad_script(llm, auto_context, base, script)
-                    log.info("LLM 脚本缓存  : 已记录成功脚本（--val，三个视图 coverage 均 ≥95%% 且 match 均 ≥99%%）")
+                    log.info("LLM 脚本缓存  : 已记录成功脚本（--val，三个视图 input_coverage 均 ≥95%% 且 hit_ratio 均 ≥99%%）")
                 else:
-                    log.info("LLM 脚本缓存  : 跳过（三个视图 coverage 未全部达到 95%% 或 match 未全部达到 99%%）")
+                    log.info("LLM 脚本缓存  : 跳过（三个视图 input_coverage 未全部达到 95%% 或 hit_ratio 未全部达到 99%%）")
             except Exception as exc:
                 log.warning("投影验证失败: %s\n%s", exc, traceback.format_exc())
                 _say(f"Projection   : WARN — validation failed: {exc}")

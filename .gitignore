@@ -4,6 +4,7 @@ outputs/
 3D2DXF/3d/
 3D2DXF/output/
 3D2DXF/step/
+dxf_class_coverage/dxf/
 
 # 配置文件
 config.json

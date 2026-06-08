@@ -106,9 +106,9 @@ cd /path/to/DXF_3D
 ```
 LLM         : qwen3.5-35b-a3b
 Projection   : WARN
-   FRONT WARN coverage= 82.1% missing= 17.9% match=100.0% extra=  0.0%
-   LEFT  WARN coverage= 75.6% missing= 24.4% match=100.0% extra=  0.0%
-   TOP   OK   coverage=100.0% missing=  0.0% match= 99.6% extra=  0.4%
+   FRONT WARN input_coverage= 82.1% missing= 17.9% hit_ratio=100.0% extra=  0.0%
+   LEFT  WARN input_coverage= 75.6% missing= 24.4% hit_ratio=100.0% extra=  0.0%
+   TOP   OK   input_coverage=100.0% missing=  0.0% hit_ratio= 99.6% extra=  0.4%
 Output dir  : DXF_3D/outputs/20260507_095610_Drawing1
 Status      : OK
 ```
@@ -117,8 +117,8 @@ Status      : OK
 `projection_validation.json`。需要验证时在命令行加 `--val`。
 
 `Projection` 是投影验证摘要：把最终 3D 模型重新投影回 FRONT/LEFT/TOP，
-再与输入三视图比对。`coverage` 表示输入视图被模型覆盖的比例，`missing` 表示
-输入视图未被模型覆盖的漏画比例（`1 - coverage`），`match` 表示模型投影能被
+再与输入三视图比对。`input_coverage` 表示输入视图被模型覆盖的比例，`missing` 表示
+输入视图未被模型覆盖的漏画比例（`1 - input_coverage`），`hit_ratio` 表示模型投影能被
 输入视图解释的比例，`extra` 表示模型投影中的多余线比例。`OK/WARN`
 只作为几何投影对比参考；具体建模结果仍应结合 `.FCStd`、`.step` 和模型三视图 PNG 查看。
 其余阶段日志（实体统计、视图归类、特征草案、LLM 返回、产物清单等）全部以中文

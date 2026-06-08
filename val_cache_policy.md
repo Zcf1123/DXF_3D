@@ -207,14 +207,14 @@ model_samples = sample(model_segments, tolerance)
 
 ## 7. 准确率指标
 
-### 7.1 `coverage`
+### 7.1 `input_coverage`
 
-`coverage` 表示输入图纸中有多少内容被模型投影覆盖。
+`input_coverage` 表示输入图纸中有多少内容被模型投影覆盖。
 
 计算方式：
 
 ```text
-coverage = matched(input_samples, model_segments, tolerance) / len(input_samples)
+input_coverage = matched(input_samples, model_segments, tolerance) / len(input_samples)
 ```
 
 含义：
@@ -229,7 +229,7 @@ coverage = matched(input_samples, model_segments, tolerance) / len(input_samples
 是否漏建
 ```
 
-如果 `coverage` 低，说明输入图纸中有一部分结构没有出现在模型投影中。
+如果 `input_coverage` 低，说明输入图纸中有一部分结构没有出现在模型投影中。
 
 ### 7.2 `missing`
 
@@ -238,17 +238,17 @@ coverage = matched(input_samples, model_segments, tolerance) / len(input_samples
 计算方式：
 
 ```text
-missing = 1.0 - coverage
+missing = 1.0 - input_coverage
 ```
 
-### 7.3 `match`
+### 7.3 `hit_ratio`
 
-`match` 表示模型输出中有多少内容能被输入图纸解释。
+`hit_ratio` 表示模型输出中有多少内容能被输入图纸解释。
 
 计算方式：
 
 ```text
-match = matched(model_samples, input_segments, tolerance) / len(model_samples)
+hit_ratio = matched(model_samples, input_segments, tolerance) / len(model_samples)
 ```
 
 含义：
@@ -263,20 +263,20 @@ match = matched(model_samples, input_segments, tolerance) / len(model_samples)
 是否多建
 ```
 
-如果 `match` 低，说明模型中存在输入图纸没有体现的额外结构。
+如果 `hit_ratio` 低，说明模型中存在输入图纸没有体现的额外结构。
 
 ### 7.4 `extra`
 
 `extra` 是模型多余比例：
 
 ```text
-extra = 1.0 - match
+extra = 1.0 - hit_ratio
 ```
 
 例如：
 
 ```text
-match = 0.96
+hit_ratio = 0.96
 extra = 0.04
 ```
 
@@ -291,8 +291,8 @@ extra = 0.04
 每个视图都必须满足：
 
 ```text
-coverage >= 0.95
-match >= 0.99
+input_coverage >= 0.95
+hit_ratio >= 0.99
 ```
 
 也就是：输入图纸线段至少 95% 被模型覆盖，且模型投影出来的线至少 99% 都能在输入图纸中找到对应线段。
@@ -300,22 +300,22 @@ match >= 0.99
 缓存保存条件为：
 
 ```text
-FRONT coverage >= 0.95 且 match >= 0.99
-LEFT  coverage >= 0.95 且 match >= 0.99
-TOP   coverage >= 0.95 且 match >= 0.99
+FRONT input_coverage >= 0.95 且 hit_ratio >= 0.99
+LEFT  input_coverage >= 0.95 且 hit_ratio >= 0.99
+TOP   input_coverage >= 0.95 且 hit_ratio >= 0.99
 ```
 
-只有三个视图的 `coverage` 全部达到 95%，且 `match` 全部达到 99%，才会保存缓存文件。
+只有三个视图的 `input_coverage` 全部达到 95%，且 `hit_ratio` 全部达到 99%，才会保存缓存文件。
 
 示例：
 
 ```text
-FRONT coverage=59.1% missing=40.9% match=100.0% extra=0.0%
-LEFT  coverage=59.1% missing=40.9% match=100.0% extra=0.0%
-TOP   coverage=100.0% missing=0.0% match=100.0% extra=0.0%
+FRONT input_coverage=59.1% missing=40.9% hit_ratio=100.0% extra=0.0%
+LEFT  input_coverage=59.1% missing=40.9% hit_ratio=100.0% extra=0.0%
+TOP   input_coverage=100.0% missing=0.0% hit_ratio=100.0% extra=0.0%
 ```
 
-这种情况下，虽然三个视图的 `match` 都达到 99%，但 FRONT / LEFT 的 `coverage` 未达到 95%，因此不会保存缓存。
+这种情况下，虽然三个视图的 `hit_ratio` 都达到 99%，但 FRONT / LEFT 的 `input_coverage` 未达到 95%，因此不会保存缓存。
 
 ---
 
@@ -335,9 +335,9 @@ projection_validation.json
 | `views.front` | FRONT 视图验证结果 |
 | `views.left` | LEFT 视图验证结果 |
 | `views.top` | TOP 视图验证结果 |
-| `coverage` | 输入覆盖率 |
+| `input_coverage` | 输入覆盖率 |
 | `missing` | 输入漏画率 |
-| `match` | 模型匹配率 |
+| `hit_ratio` | 模型命中率 |
 | `extra` | 模型多余比例 |
 | `bbox_error` | 输入与模型投影 bbox 差异 |
 | `unmatched_input_segments` | 未被模型覆盖的输入线段 |
@@ -353,6 +353,6 @@ projection_validation.json
 3. 缓存命中后，会重定向输出路径，保证脚本写入当前运行目录。
 4. 缓存脚本复用前仍会执行静态校验。
 5. 缓存写入前必须完成投影验证。
-6. 三个视图的 `coverage` 都达到 95% 且 `match` 都达到 99% 时，才保存缓存。
+6. 三个视图的 `input_coverage` 都达到 95% 且 `hit_ratio` 都达到 99% 时，才保存缓存。
 
 该策略保证缓存只记录高可信的 LLM 建模脚本，避免后续运行复用低质量结果。
