@@ -1,72 +1,435 @@
 # DXF_3D — DXF 三视图到 3D 重建
 
-把 `.dxf` 工程图（FRONT/TOP/LEFT 三视图）解析成 3D 模型。
-**自包含**：本目录内含 `Dockerfile` / `run.sh` / `requirements.txt` / `config.json`，
-可以**整个目录拷贝到任意主机独立部署**，不依赖仓库其它任何文件。
+本项目把符合固定布局的 `.dxf` 工程图三视图解析为 3D 模型。当前路线：
 
-当前默认且唯一对外开放的建模路线是 `llm/`：“三视图 JSON/图片摘要 -> LLM 写 FreeCAD 脚本”。
-`direct/` 目录仍保留为内部历史/共用实现位置，提供部分导出和 FreeCAD 辅助逻辑，
-但命令行不再提供 `--direct` 确定性特征路线。`prompts/` 存放工程图约定和零件语义。
-根目录保留启动入口、部署文件、输入输出目录、文档，以及 DXF 解析、视图分类、投影和几何摘要模块。
+```text
+DXF 三视图 → DXF 实体解析 → FRONT/TOP/LEFT 视图分类 → 2D/3D 投影摘要
+         → LLM 生成 FreeCAD Python 脚本 → 执行脚本 → 导出 FCStd/STEP/OBJ/PNG
+```
+
+项目可独立部署：目录内包含 `Dockerfile`、`run.sh`、`requirements.txt`、`config.json` 。拷贝 `DXF_3D/` 目录构建 Docker 镜像并配置 LLM 即可运行。
 
 ---
 
-## 一、快速开始（已构建镜像）
+## 1. 输入与输出
 
-把要处理的 `.dxf` 放到 `DXF_3D/dxf_files/`，然后：
+### 输入
 
-```bash
-# 跑 dxf_files/ 下所有 DXF
-./run.sh -d
+主要输入是 DXF 工程图文件：
 
-# 或指定文件（路径可在 DXF_3D 内或宿主机任意位置）
-./run.sh -d dxf_files/xxx.dxf
-./run.sh -d dxf_files/Drawing1.dxf
-./run.sh -d /path/to/some.dxf
+- 默认输入目录：`dxf_files/`
+- 支持命令行指定单个或多个 `.dxf`
+- 单位默认按毫米处理，不做单位识别或缩放
+- 图纸必须是固定三视图布局：`FRONT` 左上、`LEFT` 右上、`TOP` 左下
 
-# 默认使用 config.json 中 active 指定的 qwen；命令行可临时切换模型 profile
-./run.sh -d --gpt dxf_files/00991575.dxf
-./run.sh -d --qwen dxf_files/00991575.dxf
-./run.sh -d --openai dxf_files/00991575.dxf
+可选输入：
 
-# 给 LLM 建模意图弱提示，辅助处理歧义或视图漏画
-./run.sh -d --intent "先拉伸圆柱；侧面矩形孔贯穿切除；上端圆孔盲切" dxf_files/part.dxf
+| 输入 | 位置/方式 | 说明 |
+| --- | --- | --- |
+| LLM 配置 | `config.json` | OpenAI 兼容接口配置，含 `api_key`、`base_url`、`model`、`api_mode` |
+| 模型 profile | `--qwen` / `--gpt` / `--openai` | 临时切换 `config.json` 中的 profile |
+| 建模意图提示 | `--intent "..."` | 给 LLM 的弱提示，用于歧义消解，不能覆盖三视图证据 |
+| 投影验证开关 | `--val` | 额外生成模型投影与输入三视图的对比报告 |
+| 输出子目录 | `DXF_3D_OUTPUT_SUBDIR=name` | 把输出写入 `outputs/name/` 下，便于测试分组 |
 
-# 启用投影验证：生成 projection_validation.json，并在终端打印 Projection 摘要
-./run.sh -d --val dxf_files/Drawing1.dxf
+### 输出
+
+每处理一个 DXF，会在 `outputs/` 下生成一个独立目录：
+
+```text
+outputs/<model>_<YYYYMMDD>_<HHMMSS>_<source_base>/
 ```
 
-镜像名可用环境变量 `DXF_3D_IMAGE` 覆盖（默认 `dxf-3d`）。本文所有示例默认使用
-`-d` 开发挂载模式，让容器挂载当前源码目录，避免每次改代码后重建镜像。
-默认模型 profile 由 `config.json` 的 `active` 字段决定；当前默认是 `qwen`。
-命令行参数 `--gpt` / `--qwen` / `--openai` 只对本次运行生效，不会修改 `config.json`。
+常见输出文件：
 
-## 二、部署到另一台主机
+| 文件 | 说明 |
+| --- | --- |
+| `<base>.FCStd` | FreeCAD 原生工程文件，最终模型的主要检查对象 |
+| `<base>.step` | STEP 通用 CAD 交换格式 |
+| `<base>.obj` | OBJ 网格导出，便于轻量预览 |
+| `<base>.png` | 输入 DXF 三视图预览图 |
+| `<base>_views_normalized.png` | 坐标归一化后的输入三视图，便于排查视图映射 |
+| `<base>_model_views.png` | 最终 3D 模型重新投影得到的 FRONT/LEFT/TOP 三视图 |
+| `<base>_overview.png` | 3D 等轴侧快速预览图 |
+| `entities.json` | DXF 解析后的实体和元数据 |
+| `views_algorithm.json` | 纯算法视图分类结果 |
+| `views.json` | 最终使用的视图分类结果 |
+| `auto_context.json` | 发送给 LLM 的紧凑三视图/投影/几何上下文 |
+| `generated_model.py` | LLM 生成并实际执行的 FreeCAD Python 脚本 |
+| `dimension_validation.json` | 生成模型的包围盒尺寸契约校验结果 |
+| `arc_validation.json` | 圆弧边约束校验结果；输入无 ARC 约束时可能为跳过 |
+| `projection_validation.json` | 仅使用 `--val` 时生成；模型投影与输入视图的覆盖率/多余线报告 |
+| `model.json` | FreeCAD 文档对象摘要 |
+| `run.log` | 详细中文日志，包含各阶段、警告、异常栈和导出结果 |
 
-> 整个 `DXF_3D/` 目录已是自包含项目，按下列两种方式之一即可。
+---
 
-### 方案 A：源码 + 在目标主机构建镜像（推荐）
+## 2. 快速开始
 
-1. 把 `DXF_3D/` 目录拷到目标主机：
-   ```bash
-   tar czf dxf_3d.tar.gz DXF_3D/
-   scp dxf_3d.tar.gz user@host:/path/
-   ssh user@host "cd /path && tar xzf dxf_3d.tar.gz"
-   ```
-2. 在目标主机构建镜像：
-   ```bash
-   cd /path/DXF_3D
-   docker build -t dxf-3d .
-   ```
-3. 按需修改 `config.json`（OpenAI 兼容协议的 API key / base_url / model），
-   把 DXF 放进 `dxf_files/`，运行：
-   ```bash
-   ./run.sh -d
-   ```
+### 构建镜像
 
-### 方案 B：导出镜像离线传输
+```bash
+docker build -t dxf-3d .
+```
 
-源主机一次性构建 + 导出：
+镜像名默认是 `dxf-3d`，也可通过环境变量覆盖：
+
+```bash
+DXF_3D_IMAGE=my-dxf-3d ./run.sh -d dxf_files/nut.dxf
+```
+
+### 运行
+
+```bash
+# 处理 dxf_files/ 下所有 DXF
+./run.sh -d
+
+# 处理指定文件
+./run.sh -d dxf_files/nut.dxf
+
+# 处理多个文件
+./run.sh -d dxf_files/a.dxf dxf_files/b.dxf
+
+# 使用指定模型 profile
+./run.sh -d --qwen dxf_files/nut.dxf
+./run.sh -d --gpt dxf_files/nut.dxf
+./run.sh -d --openai dxf_files/nut.dxf
+
+# 加建模意图弱提示
+./run.sh -d --intent "先拉伸主体，再按三视图证据切除贯穿孔" dxf_files/nut.dxf
+
+# 启用投影验证
+./run.sh -d --val dxf_files/nut.dxf
+
+# 禁用 LLM；默认路线会尽量使用结构化兜底，但复杂零件成功率会下降
+./run.sh -d --no-llm dxf_files/nut.dxf
+```
+
+`-d` 表示开发挂载模式：把本地源码目录挂载进容器，改代码后无需重建镜像。日常开发和调试建议始终带 `-d`。
+
+### 批量测试运行：`run_contrast_batch.sh`
+
+`run_contrast_batch.sh` 用于批量处理一组 DXF，并汇总每个零件的 LLM 模型、投影验证指标、耗时、LLM 模型理解和 FCStd 路径。它内部会逐个调用 `run.sh -d`，并默认自动追加 `--val`，因此会生成投影验证结果。批处理终端只输出当前进度行，例如 `[1/27] dxf_files/test/00019717.dxf`，详细结果写入汇总文件。
+
+默认输入/输出：
+
+| 项 | 默认值 | 说明 |
+| --- | --- | --- |
+| 输入目录 | `dxf_files/test/` | 批量读取该目录下的 `*.dxf` / `*.DXF` |
+| 输出分组 | `outputs/test/` | 若已存在，则自动改为 `outputs/test1/`、`outputs/test2/` 等 |
+| JSON 汇总 | `outputs/<分组>/summary.json` | 结构化记录每个 DXF 的状态、指标、LLM 理解和产物路径 |
+| CSV 汇总 | `outputs/<分组>/summary.csv` | 便于表格导出，只包含 `name`、`llm_model`、`elapsed_s`、`input_coverage`、`hit_ratio` |
+| FCStd 汇总拷贝 | `outputs/<分组>/<part>.FCStd` | 若单次运行成功，会把对应 FCStd 复制到批量输出目录 |
+
+常用示例：
+
+```bash
+# 使用默认 dxf_files/test/ 作为输入，输出到 outputs/test*/
+./run_contrast_batch.sh
+
+# 指定输入目录和输出分组名
+DXF_3D_BATCH_INPUT_DIR=dxf_files/test \
+DXF_3D_BATCH_OUTPUT_SUBDIR=contrast \
+./run_contrast_batch.sh
+
+# 批量时切换模型 profile
+./run_contrast_batch.sh --qwen
+./run_contrast_batch.sh --gpt
+
+# 批量时附加建模意图弱提示
+./run_contrast_batch.sh --intent "按三视图证据优先保证孔槽贯穿关系"
+
+# 使用指定配置文件
+./run_contrast_batch.sh --config config.json
+```
+
+支持转发给 `run.sh` 的选项：`--qwen`、`--gpt`、`--openai`、`--val`、`--no-llm`、`--intent` / `--model-intent`、`--config`。
+
+运行前需要满足：`run.sh` 可执行、`config.json` 存在、Docker 可用、镜像 `dxf-3d` 已构建。镜像名可继续用 `DXF_3D_IMAGE` 覆盖；容器命令可用 `DXF_3D_CONTAINER_CLI` 覆盖。
+
+`summary.json` 的顶层结构为：
+
+```json
+{
+  "output_dir": "outputs/test",
+  "count": 1,
+  "results": [
+    {
+      "name": "00001926",
+      "status": "OK",
+      "llm_model": "qwen3.5-35b-a3b",
+      "elapsed_s": 12.345,
+      "input_coverage": {"front": "100.0%", "left": "100.0%", "top": "100.0%"},
+      "hit_ratio": {"front": "100.0%", "left": "100.0%", "top": "100.0%"},
+      "missing": {"front": "0.0%", "left": "0.0%", "top": "0.0%"},
+      "extra": {"front": "0.0%", "left": "0.0%", "top": "0.0%"},
+      "llm": {"understanding": "LLM 对模型结构的理解"},
+      "fcstd": "outputs/test/00001926.FCStd",
+      "run_dir": "/app/DXF_3D/outputs/test/..."
+    }
+  ]
+}
+```
+
+`summary.csv` 仅用于导出和对比，列固定为：
+
+```text
+name,llm_model,elapsed_s,input_coverage,hit_ratio
+```
+
+---
+
+## 3. 输入 DXF 约定
+
+### 三视图布局
+
+图纸布局固定为：
+
+```text
++------------------+------------------+
+| FRONT 主视图     | LEFT 左视图      |
+| 左上             | 右上             |
++------------------+------------------+
+| TOP 俯视图       | 空               |
+| 左下             |                  |
++------------------+------------------+
+```
+
+坐标映射：
+
+| 视图 | 位置 | 对应 3D 平面 | 草图坐标到世界坐标 |
+| --- | --- | --- | --- |
+| `front` | 左上 | XZ，`Y=0` | `x → X`，`y → Z` |
+| `top` | 左下 | XY，`Z=0` | `x → X`，`y → Y` |
+| `left` | 右上 | YZ，`X=0` | `x → Y`，`y → Z` |
+
+尺寸命名：
+
+- `W`：宽度，沿 X
+- `D`：深度，沿 Y
+- `H`：高度，沿 Z
+
+### 支持的实体
+
+用于建模的主要实体：
+
+- `LINE`
+- `ARC`
+- `CIRCLE`
+- `LWPOLYLINE`
+- `POLYLINE`
+
+会被解析但一般不作为外轮廓直接建模的实体：
+
+- `TEXT` / `MTEXT`
+- `DIMENSION`
+- `ELLIPSE`
+- `SPLINE`
+- `HATCH`
+- `SOLID`
+- `INSERT`
+
+### 图层建议
+
+| 图层 | 含义 | 处理方式 |
+| --- | --- | --- |
+| `OUTLINE` / `0` | 可见轮廓 | 用于建模 |
+| `HIDDEN` / `*_HID` | 隐藏线 | 作为孔、盲孔、内部切除证据，不直接作为实体外轮廓 |
+| `CENTER` | 中心线 | 忽略或弱化 |
+| `DIM` | 尺寸标注 | 解析为辅助信息，不作为轮廓 |
+
+推荐隐藏线命名：`FRONT_HID`、`LEFT_HID`、`TOP_HID`。
+
+### 主要限制
+
+- 不支持多于三视图、剖视图、局部放大图、辅助视图、断面视图。
+- 不保证复杂自由曲面、螺纹、沉孔、复杂圆角和阵列特征。
+- 外轮廓应尽量闭合；明显不闭合会影响上下文生成和建模质量。
+- 右下象限不参与建模。
+- `SPLINE`、`ELLIPSE`、`HATCH` 目前不作为主体外轮廓直接建模。
+
+---
+
+## 4. 终端输出与日志
+
+终端只显示核心摘要，例如：
+
+```text
+LLM         : qwen3.5-35b-a3b
+Projection   : WARN
+  FRONT WARN input_coverage= 82.1% missing= 17.9% hit_ratio=100.0% extra=  0.0%
+  LEFT  WARN input_coverage= 75.6% missing= 24.4% hit_ratio=100.0% extra=  0.0%
+  TOP   OK   input_coverage=100.0% missing=  0.0% hit_ratio= 99.6% extra=  0.4%
+Output dir  : /home/zcf/DXF_3D/outputs/qwen3.5-35b-a3b_20260609_102742_nut
+Status      : OK
+```
+
+`Projection` 只在使用 `--val` 时打印。含义：
+
+| 指标 | 含义 |
+| --- | --- |
+| `input_coverage` | 输入视图中有多少比例被模型投影覆盖 |
+| `missing` | 输入视图中未被模型覆盖的比例，约等于 `1 - input_coverage` |
+| `hit_ratio` | 模型投影中有多少比例能被输入视图解释 |
+| `extra` | 模型投影中多出来、输入视图没有证据的比例 |
+
+详细过程全部写入输出目录的 `run.log`。
+
+---
+
+## 5. 项目文件与目录职责
+
+### 根目录文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `README.md` | 项目使用说明、输入输出约定、目录说明 |
+| `PIPELINE.md` | 更细的阶段级流水线说明 |
+| `CLAUDE.md` | 编码行为约束和协作注意事项 |
+| `Dockerfile` | 构建 FreeCAD + Python 依赖 + 项目代码的运行镜像 |
+| `requirements.txt` | Python 依赖，目前主要是 `matplotlib` 和 `openai` |
+| `config.json` | LLM profile 配置；包含敏感 key，提交和分享前应脱敏 |
+| `run.sh` | Docker 启动脚本，负责挂载输入/输出/config 并调用容器内入口 |
+| `run.py` | Python 根入口，转发到 `direct/code/run.py` 的 `main()` |
+| `run_contrast_batch.sh` | 批量对比运行脚本，用于调试/实验输出分组 |
+| `dxf_loader.py` | 纯 Python DXF 解析器，解析实体、图层、bbox、单位等 |
+| `view_classifier.py` | 三视图分类器，把实体按布局分为 `front`、`top`、`left` |
+| `projection_mapper.py` | 把 2D 视图实体归一化并映射到 3D 平面 |
+| `geometry_estimator.py` | 轮廓闭环、尺寸估计、基础几何摘要工具 |
+| `llm_client.py` | OpenAI 兼容 LLM 客户端和 prompt 模板渲染工具 |
+| `sketch_recognizer_code.py` | 草图/轮廓识别相关实验或辅助代码 |
+| `val_cache_policy.md` | `--val` 成功脚本缓存策略说明 |
+
+### 运行时目录
+
+| 目录 | 作用 |
+| --- | --- |
+| `dxf_files/` | 默认输入目录，放待处理 `.dxf` 文件 |
+| `outputs/` | 默认输出目录，每次运行一个独立子目录 |
+
+### `llm/`
+
+默认路线相关代码和提示词。
+
+| 路径 | 作用 |
+| --- | --- |
+| `llm/README.md` | LLM 路线说明 |
+| `llm/code/llm_code_planner.py` | 构造 `auto_context.json`、请求 LLM 生成 FreeCAD 脚本、静态校验、执行失败修复、兜底脚本生成 |
+| `llm/code/hlr_exporters.py` | 导出模型隐藏线/三视图 PNG 的辅助逻辑 |
+| `llm/prompts/freecad_script_generator.md` | 生成 FreeCAD Python 脚本的主提示词 |
+| `llm/prompts/auto_modeling_strategy.md` | LLM 建模策略提示词 |
+
+### `direct/`
+
+历史确定性特征路线和当前仍复用的 FreeCAD/导出逻辑。当前命令行默认不暴露独立 direct 路线。
+
+| 路径 | 作用 |
+| --- | --- |
+| `direct/README.md` | direct 目录说明 |
+| `direct/code/run.py` | 当前实际 CLI 编排器：解析参数、创建输出目录、串联各阶段 |
+| `direct/code/exporters.py` | STEP、OBJ、PNG、overview、`model.json` 和投影验证导出器 |
+| `direct/code/freecad_builder.py` | FreeCAD 辅助逻辑；默认路线复用投影视图嵌入函数 |
+| `direct/code/feature_inference.py` | 历史确定性特征推断代码，当前默认路线不依赖其生成 `features.json` |
+| `direct/code/llm_planner.py` | 历史 direct 路线的视图复核/特征精修 LLM 辅助代码 |
+| `direct/prompts/` | 历史 direct 路线提示词 |
+
+### `prompts/`
+
+公共知识和约定。
+
+| 文件 | 作用 |
+| --- | --- |
+| `prompts/part_knowledge.md` | 常见机械零件族、孔槽、连接件等语义知识 |
+| `prompts/view_conventions.md` | 三视图布局、坐标映射和视图语义约定 |
+
+### 其他辅助目录
+
+| 目录 | 作用 |
+| --- | --- |
+| `3D2DXF/` | STEP 到 DXF 的辅助转换/样例目录，用于反向生成或准备测试图纸 |
+| `dxf_class_coverage/` | DXF 类别覆盖率统计和批量分析工具 |
+
+---
+
+## 6. 流水线阶段
+
+| 阶段 | 模块 | 输入 | 输出 |
+| --- | --- | --- | --- |
+| 0. 启动 | `run.sh`、`run.py`、`direct/code/run.py` | 命令行参数、环境变量、`config.json` | 目标 DXF 列表、输出目录、日志器、LLM 客户端 |
+| 1. DXF 解析 | `dxf_loader.py` | `.dxf` 文本 | `entities.json`、实体列表、元数据 |
+| 2. 视图分类 | `view_classifier.py` | 实体列表 | `views_algorithm.json`、`views.json` |
+| 3. 投影映射 | `projection_mapper.py` | `front/top/left` 视图 | 归一化 2D/3D 投影实体 |
+| 4. 上下文生成 | `llm/code/llm_code_planner.py` | 视图、投影、几何摘要、意图提示 | `auto_context.json` |
+| 5. LLM 脚本生成 | `llm/code/llm_code_planner.py` | `auto_context.json`、prompt | `generated_model.py` |
+| 6. FreeCAD 执行 | `generated_model.py` | LLM 生成脚本 | `<base>.FCStd`、尺寸/圆弧校验 JSON |
+| 7. 导出 | `direct/code/exporters.py`、`llm/code/hlr_exporters.py` | `.FCStd`、投影信息 | STEP、OBJ、PNG、`model.json`、可选投影验证 |
+
+---
+
+## 7. LLM 配置
+
+`config.json` 使用 profile 结构：
+
+```json
+{
+  "active": "qwen",
+  "profiles": {
+    "qwen": {
+      "api_key": "...",
+      "base_url": "http://example/v1",
+      "model": "qwen3.5-35b-a3b",
+      "api_mode": "chat"
+    },
+    "gpt": {
+      "api_key": "...",
+      "base_url": "https://example/v1",
+      "model": "gpt-5.5",
+      "api_mode": "responses"
+    }
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `active` | 默认使用的 profile 名称 |
+| `profiles.<name>.api_key` | API key，敏感信息 |
+| `profiles.<name>.base_url` | OpenAI 兼容接口地址 |
+| `profiles.<name>.model` | 模型名称 |
+| `profiles.<name>.api_mode` | `chat` 或 `responses` |
+
+运行时可用：
+
+- `--qwen`：使用 `qwen` profile
+- `--gpt`：使用 `gpt` profile
+- `--openai`：使用 `openai` profile
+- `DXF_3D_CONFIG_PROFILE=name`：通过环境变量指定 profile
+- `--no-llm` 或 `DXF_3D_DISABLE_LLM=1`：禁用 LLM 调用
+
+注意：`config.json` 包含密钥，分享项目或提交代码前必须脱敏。
+
+---
+
+## 8. 部署到另一台主机
+
+### 方案 A：拷贝源码并在目标主机构建镜像
+
+```bash
+tar czf dxf_3d.tar.gz DXF_3D/
+scp dxf_3d.tar.gz user@host:/path/
+ssh user@host "cd /path && tar xzf dxf_3d.tar.gz"
+
+ssh user@host
+cd /path/DXF_3D
+docker build -t dxf-3d .
+./run.sh -d dxf_files/nut.dxf
+```
+
+### 方案 B：离线导出镜像
+
+源主机：
 
 ```bash
 cd DXF_3D
@@ -74,270 +437,33 @@ docker build -t dxf-3d .
 docker save dxf-3d | gzip > dxf-3d.tar.gz
 ```
 
-把 `dxf-3d.tar.gz` 和整个 `DXF_3D/` 目录都拷到目标主机：
+目标主机：
 
 ```bash
-ssh user@host "docker load < dxf-3d.tar.gz"
-# 在目标主机
+docker load < dxf-3d.tar.gz
 cd /path/to/DXF_3D
-./run.sh -d
+./run.sh -d dxf_files/nut.dxf
 ```
 
-> 提示：`run.sh` 通过卷挂载 `dxf_files/`、`outputs/`、`config.json`，
-> 因此**改 DXF 或改 LLM 配置都不需要重建镜像**。
+---
 
-### 镜像内容（精简版）
+## 9. 开发与维护注意事项
 
-| 来源 | 内容 |
+- 不引入外部 DXF 解析库；`dxf_loader.py` 是当前公共解析器。
+- FreeCAD 相关导入应保持在函数内部或生成脚本内，避免普通 Python 环境 import 失败。
+- 不修改固定三视图布局：`FRONT` 左上、`TOP` 左下、`LEFT` 右上。
+- 不修改坐标映射：`FRONT → XZ`、`TOP → XY`、`LEFT → YZ`。
+- 不删除 `*D\d+` 匿名块过滤；这类块通常来自尺寸标注箭头/引线，会污染视图聚类。
+- 不提交明文 API key。
+- 输出对象名应保持兼容导出器：`Result`、`DXF_FRONT`、`DXF_TOP`、`DXF_LEFT`。
+- `dxf_files/` 和 `outputs/` 是运行时 I/O 目录，不要删除目录本身。
+
+常见排查入口：
+
+| 问题 | 优先检查 |
 | --- | --- |
-| Ubuntu 22.04 | 基础系统 |
-| `freecad`（PPA） | 提供 `freecadcmd` / `FreeCAD` / `Part` / `Mesh` / `MeshPart` |
-| `requirements.txt` | `matplotlib`、`openai` |
-| `COPY .` | DXF_3D 业务代码 |
-
-启动入口：`freecadcmd` 加载 `DXF_3D.run.main`。
-
----
-
-## 三、终端输出 / 日志
-
-终端只打印核心摘要：
-
-```
-LLM         : qwen3.5-35b-a3b
-Projection   : WARN
-   FRONT WARN input_coverage= 82.1% missing= 17.9% hit_ratio=100.0% extra=  0.0%
-   LEFT  WARN input_coverage= 75.6% missing= 24.4% hit_ratio=100.0% extra=  0.0%
-   TOP   OK   input_coverage=100.0% missing=  0.0% hit_ratio= 99.6% extra=  0.4%
-Output dir  : DXF_3D/outputs/20260507_095610_Drawing1
-Status      : OK
-```
-
-默认不运行投影验证，因此普通命令不会打印 `Projection`，也不会写出
-`projection_validation.json`。需要验证时在命令行加 `--val`。
-
-`Projection` 是投影验证摘要：把最终 3D 模型重新投影回 FRONT/LEFT/TOP，
-再与输入三视图比对。`input_coverage` 表示输入视图被模型覆盖的比例，`missing` 表示
-输入视图未被模型覆盖的漏画比例（`1 - input_coverage`），`hit_ratio` 表示模型投影能被
-输入视图解释的比例，`extra` 表示模型投影中的多余线比例。`OK/WARN`
-只作为几何投影对比参考；具体建模结果仍应结合 `.FCStd`、`.step` 和模型三视图 PNG 查看。
-其余阶段日志（实体统计、视图归类、特征草案、LLM 返回、产物清单等）全部以中文
-写入 `<output_dir>/run.log`。
-
-如果只想跳过 LLM 调用，可以使用：
-
-```bash
-./run.sh -d --no-llm dxf_files/Drawing1.dxf
-# 或
-DXF_3D_DISABLE_LLM=1 ./run.sh -d dxf_files/Drawing1.dxf
-```
-
-如果复杂零件靠三视图隐藏线仍容易歧义，可以给默认 LLM 路线一段建模意图弱提示。
-该提示只用于歧义消解和视图漏画容忍，不能覆盖三视图证据：
-
-```bash
-./run.sh -d --intent "先拉伸一个圆柱；侧面矩形孔贯穿切除；上底面圆孔切除但不贯穿；中间再做一个不贯穿矩形切除" dxf_files/00996032.dxf
-```
-
----
-
-## 四、输入约定（必须遵守）
-
-### 1. 视图布局（固定）
-
-```
-+------------------+------------------+
-|  FRONT (主视图)  |  LEFT  (左视图)  |
-|  左上            |  右上            |
-+------------------+------------------+
-|  TOP   (俯视图)  |   (空)           |
-|  左下            |                  |
-+------------------+------------------+
-```
-
-| 视图  | 位置 | 对应 3D 平面 | 草图坐标 → 世界坐标 |
-| ----- | ---- | ------------ | -------------------- |
-| FRONT | 左上 | XZ (Y=0)     | x → X，y → Z         |
-| TOP   | 左下 | XY (Z=0)     | x → X，y → Y         |
-| LEFT  | 右上 | YZ (X=0)     | x → Y，y → Z         |
-
-说明：代码内部主键已统一为 `left`，含义为左视图（从左向右看，沿 +X 方向投影）。
-旧产物中的 `right` 仅作为兼容别名读取，不再作为新输出语义。
-
-零件三维尺寸命名约定：宽 W (沿 X) / 深 D (沿 Y) / 高 H (沿 Z)。
-
-### 2. 几何规则
-
-1. 闭合轮廓只能由 `LINE` / `ARC` / `CIRCLE` / `LWPOLYLINE` 组成；
-   `SPLINE` / `ELLIPSE` / `HATCH` 一律忽略。
-2. 每个视图的外轮廓必须**首尾闭合**（容差 `1e-3`）。
-3. 当 TOP / FRONT / LEFT 三个视图都只有一个同半径 `CIRCLE`，且圆心满足
-   `(TOP.x == FRONT.x)`、`(TOP.y == LEFT.x)`、`(FRONT.y == LEFT.y)` 的三视图
-   坐标联动关系时，识别为 `sphere`，不作为通孔。
-4. 其它视图内部的 `CIRCLE` 自动作为通孔：
-   - TOP 视图中的圆 → 孔轴 = Z
-   - FRONT 视图中的圆 → 孔轴 = Y
-   - LEFT 视图中的圆 → 孔轴 = X
-5. 对多边形棱柱类零件，FRONT/LEFT 中真实 ARC + TOP 中相切大圆可识别为
-   上下外轮廓圆弧端面倒角（`edge_chamfer.profile="arc_revolve"`）。
-6. 坐标单位默认按毫米处理，**不做单位识别 / 缩放**。
-
-### 3. 图层（推荐，可选）
-
-| 图层名               | 含义     | 处理       |
-| -------------------- | -------- | ---------- |
-| `OUTLINE` / `0`      | 可见轮廓 | 用于建模   |
-| `HIDDEN` / `*_HID`   | 虚线     | 作为孔、盲孔、内部切除等隐藏结构证据，不直接作为实体轮廓 |
-| `CENTER`             | 中心线   | 忽略       |
-| `DIM`                | 标注     | 忽略       |
-
-如果不区分图层，则所有几何视为可见轮廓。
-
-`*_HID` 是推荐的隐藏线命名方式，例如 `FRONT_HID` / `LEFT_HID` / `TOP_HID`。
-隐藏线不会被当成外轮廓直接拉伸，但会参与跨视图验证，帮助区分通孔、盲孔和内部切除。
-
-### 4. 不支持的内容
-
-- 多于三视图、剖视图、局部放大图、辅助视图、断面视图。
-- 一般斜面/自由斜切仍不保证；当前仅支持从 FRONT/LEFT 外轮廓中明确出现的角部
-   直线削角推断三角楔切。
-- 螺纹、沉孔、阵列孔、自由曲面和复杂圆角。
-- 没有 TOP 多边形轮廓 + 侧视 ARC 证据的任意倒角/圆角。
-- 缺少明显视图布局的对称图。
-
-违反 §1（布局）或 §2（闭合轮廓）时，流水线会拒绝建模并把错误写入
-`run.log`。
-
----
-
-## 五、产物（每次运行一个独立输出目录）
-
-默认 LLM 路线输出到 `outputs/<model>_<YYYYMMDD>_<HHMMSS>_<source_base>/`。
-
-| 文件                       | 说明 |
-| -------------------------- | ---- |
-| `<base>.FCStd`             | FreeCAD 项目（最终模型） |
-| `<base>.step`              | STEP（`Part.export`） |
-| `<base>.obj`               | OBJ 网格（`MeshPart` 三角化） |
-| `<base>.png`               | DXF 三视图预览（matplotlib） |
-| `<base>_views_normalized.png` | 归一化后的输入三视图，坐标从 0 开始，便于排查视图映射 |
-| `<base>_model_views.png`   | 最终 3D 模型重新投影得到的 FRONT/LEFT/TOP 三视图 |
-| `<base>_overview.png`      | 3D 等轴侧快速总览 PNG；用于粗略预览，复杂切除件的准确性以 `.FCStd` / `.step` / `<base>_model_views.png` 为准 |
-| `entities.json`            | DXF 解析后的实体 + 元数据 |
-| `views_algorithm.json`     | 纯算法阶段的原始视图归类结果 |
-| `views.json`               | 最终使用的视图归类结果；启用 LLM 且校验通过时为语义复核后的结果，否则为算法结果 |
-| `auto_context.json`        | 默认 LLM 路线：送入 LLM 的紧凑三视图/投影几何上下文 |
-| `projection_validation.json` | 仅加 `--val` 时生成；投影验证报告：模型三视图与输入三视图的覆盖率、匹配率、bbox 差异和未覆盖线段 |
-| `model.json`               | FreeCAD 文档对象信息 |
-| `generated_model.py`       | 独立可重跑脚本：`freecadcmd generated_model.py` |
-| `run.log`                  | 详细中文日志（每一阶段、警告、栈追踪） |
-
-测试或调试时可设置 `DXF_3D_OUTPUT_SUBDIR=test`，输出会进入
-`outputs/test/<YYYYMMDD>_<HHMMSS>_<base>/` 或
-`outputs/test/<model>_<YYYYMMDD>_<HHMMSS>_<source_base>/`。未设置时保持默认行为，仍输出到
-`outputs/` 下对应目录。
-
----
-
-## 六、流水线
-
-```text
-dxf_loader → view_classifier → projection_mapper
-   → llm/code/llm_code_planner → generated_model.py → direct/code/exporters
-```
-
-| 模块 | 职责 |
-| --- | --- |
-| `run.py` | 根入口 wrapper，供 `run.sh` / Docker 的 `DXF_3D.run.main` 调用 |
-| `direct/code/run.py` | CLI 编排器；当前只对外执行默认 LLM 直接脚本路线 |
-| `dxf_loader.py` | 纯 Python DXF 解析，输出 `DxfEntity` 列表 + 元数据 |
-| `view_classifier.py` | 按象限把实体分到 FRONT/TOP/LEFT 三个 `ViewBundle` |
-| `projection_mapper.py` | 把每个视图的 2D 实体映射到 3D 平面坐标系 |
-| `geometry_estimator.py` | 闭环检测、轮廓提取、零件尺寸估计 |
-| `direct/code/freecad_builder.py` | 内部 FreeCAD 辅助逻辑；默认路线使用其中的投影视图嵌入函数 |
-| `direct/code/exporters.py` | 默认路线复用的 STEP / OBJ / PNG / 总览 PNG / model.json 导出器 |
-| `llm/code/llm_code_planner.py` | 默认 LLM 路线：生成紧凑 auto_context，让 LLM 写 FreeCAD 脚本，并做静态校验、重试和修复 |
-
----
-
-## 七、LLM 配置
-
-读取本目录下的 `config.json`（OpenAI 兼容协议）：
-
-```json
-{
-   "active": "qwen",
-   "profiles": {
-      "qwen": {
-         "api_key": "...",
-         "base_url": "...",
-         "model": "qwen3.5-35b-a3b",
-         "api_mode": "chat"
-      },
-      "gpt": {
-         "api_key": "...",
-         "base_url": "...",
-         "model": "gpt-5.5",
-         "api_mode": "responses"
-      }
-   }
-}
-```
-
-`active` 是默认使用的模型 profile；运行时可用 `--gpt` / `--qwen` / `--openai` 临时覆盖。
-
-LLM 任何失败（缺 key、网络中断、JSON 解析错误、校验不通过）都会写入 `run.log`；
-默认路线会尝试校验、重试，必要时使用 `auto_context` 生成保守兜底脚本。
-
-LLM 当前介入方式：
-
-1. `llm/prompts/freecad_script_generator.md`：默认 LLM 路线专用，要求 LLM 直接输出
-   可运行的 FreeCAD Python；程序会拒绝危险调用和常见 FreeCAD API 幻觉。
-
-路线专用 prompt 放在 `llm/prompts/`；公共知识放在 [prompts/](prompts/)。
-
----
-
-## 八、目录速览
-
-```
-DXF_3D/
-├── README.md                 本文档
-├── Dockerfile                独立部署镜像定义
-├── requirements.txt          Python 依赖
-├── config.json               LLM 配置（API key / base_url / model）
-├── run.sh                    Docker 启动脚本
-├── run.py                    根入口 wrapper，转发到 direct/code/run.py
-├── dxf_loader.py             公共 DXF 解析器
-├── view_classifier.py        公共三视图分类
-├── projection_mapper.py      公共三视图投影映射
-├── geometry_estimator.py     公共轮廓/尺寸估计
-├── dxf_files/                <—— 把要处理的 .dxf 放在这里
-├── outputs/                  <—— 每次运行生成 <YYYYMMDD>_<HHMMSS>_<base>/
-├── direct/
-│   ├── code/                 内部历史/共用实现位置（当前仅复用部分 FreeCAD 和导出逻辑）
-│   └── prompts/              历史提示词（命令行不再启用 direct 路线）
-├── llm/
-│   ├── code/                 原始目标路线：LLM 生成 FreeCAD 脚本
-│   └── prompts/              llm 路线专用提示词
-├── prompts/
-│   ├── part_knowledge.md     公共零件族知识库
-│   └── view_conventions.md   两条路线共用的视图约定
-└── PIPELINE.md               阶段级流水线说明
-```
-
----
-
-## 九、开发约定和禁区
-
-- 不引入外部 DXF 库；`dxf_loader.py` 是纯 Python 解析器。
-- FreeCAD 相关导入保持在函数内部或生成脚本内，普通 Python 环境应能 import 业务模块。
-- LLM 失败原因必须写入日志；默认路线会校验、重试，必要时用 `auto_context` 生成保守兜底脚本。
-- 不要删除 `*D\d+` 匿名块过滤；DIMENSION 的箭头、引线、文字块会污染视图聚类和轮廓提取。
-- 不打印、不提交 `config.json` 中的明文 key。
-- 不改三视图固定布局：FRONT 左上、TOP 左下、LEFT 右上。
-- 不改坐标映射：FRONT→XZ、TOP→XY、LEFT→YZ。
-- 不改 FreeCAD 输出对象名 `Result` / `DXF_FRONT` / `DXF_TOP` / `DXF_LEFT`，导出器按这些名字查找对象。
-- `dxf_files/` 和 `outputs/` 是运行时 I/O 目录，不删除目录本身。
-
-常见问题：带标注图纸形状异常时，先检查 `*D\d+` 匿名块过滤；普通 `python3` 无法导入 FreeCAD，需用 Docker 或 `freecadcmd`；输出只有草图没有实体时，通常是视图轮廓未闭合。
+| 视图分类错误 | `<output>/views_algorithm.json`、`<output>/<base>.png` |
+| 模型尺寸不对 | `<output>/auto_context.json`、`dimension_validation.json` |
+| 模型缺线/多线 | 使用 `--val` 后查看 `projection_validation.json` 和 `<base>_model_views.png` |
+| LLM 生成脚本失败 | `run.log`、`generated_model.py`、LLM 原始响应文件 |
+| 普通 Python 无法导入 FreeCAD | 使用 Docker 或 `freecadcmd` 运行 |

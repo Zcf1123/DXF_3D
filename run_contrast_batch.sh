@@ -6,14 +6,18 @@ INPUT_DIR="${DXF_3D_BATCH_INPUT_DIR:-${ROOT}/dxf_files/test}"
 OUTPUT_BASE_SUBDIR="${DXF_3D_BATCH_OUTPUT_SUBDIR:-test}"
 OUTPUT_SUBDIR="${OUTPUT_BASE_SUBDIR}"
 OUTPUT_DIR="${ROOT}/outputs/${OUTPUT_SUBDIR}"
-SUMMARY_FILE="${OUTPUT_DIR}/summary.txt"
+SUMMARY_JSON="${OUTPUT_DIR}/summary.json"
+SUMMARY_CSV="${OUTPUT_DIR}/summary.csv"
+SUMMARY_TMP="${OUTPUT_DIR}/.summary.results.jsonl"
 
 suffix=0
 while [[ -e "${OUTPUT_DIR}" ]]; do
     suffix=$((suffix + 1))
     OUTPUT_SUBDIR="${OUTPUT_BASE_SUBDIR}${suffix}"
     OUTPUT_DIR="${ROOT}/outputs/${OUTPUT_SUBDIR}"
-    SUMMARY_FILE="${OUTPUT_DIR}/summary.txt"
+    SUMMARY_JSON="${OUTPUT_DIR}/summary.json"
+    SUMMARY_CSV="${OUTPUT_DIR}/summary.csv"
+    SUMMARY_TMP="${OUTPUT_DIR}/.summary.results.jsonl"
 done
 
 shopt -s nullglob
@@ -96,11 +100,13 @@ if ! "${CONTAINER_CLI}" image inspect "${IMAGE}" >/dev/null 2>&1; then
     printf 'Docker image not found: %s\n' "${IMAGE}" >&2
     exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+    printf 'python3 not found\n' >&2
+    exit 1
+fi
 
 mkdir -p "${OUTPUT_DIR}"
-if [[ ! -s "${SUMMARY_FILE}" ]]; then
-    printf 'part\tstatus\tllm_model\tmodel_accuracy\tcoverage\tmissing\tmatch\textra\telapsed_s\tllm_understanding\tfcstd\toutput_dir\n' >> "${SUMMARY_FILE}"
-fi
+: > "${SUMMARY_TMP}"
 
 overall_rc=0
 total=${#dxf_files[@]}
@@ -156,28 +162,10 @@ for dxf in "${dxf_files[@]}"; do
         cp -f "${fcstd_src}" "${fcstd_dst}"
     fi
 
-    model_accuracy="$(printf '%s\n' "${output}" | awk '
-        /^[[:space:]]*(FRONT|LEFT|TOP|RIGHT)[[:space:]]/ {
-            name=$1
-            if (match($0, /model=[[:space:]]*[0-9.]+%/)) {
-                value=substr($0, RSTART, RLENGTH)
-                sub(/^model=[[:space:]]*/, "", value)
-                items[++n]=name "=" value
-            }
-        }
-        END {
-            for (i=1; i<=n; i++) {
-                printf "%s%s", (i == 1 ? "" : ", "), items[i]
-            }
-        }')"
-    if [[ -z "${model_accuracy}" ]]; then
-        model_accuracy="-"
-    fi
-
     llm_understanding="-"
-    coverage="-"
+    input_coverage="-"
     missing="-"
-    match="-"
+    hit_ratio="-"
     extra="-"
     run_log="${local_output_dir}/run.log"
     if [[ -f "${run_log}" ]]; then
@@ -186,7 +174,7 @@ for dxf in "${dxf_files[@]}"; do
             llm_understanding="-"
         fi
 
-        coverage="$(awk '
+        input_coverage="$(awk '
             function field_value(key, line, re, value) {
                 re = key "=[[:space:]]*[0-9.]+%"
                 if (match(line, re)) {
@@ -201,7 +189,7 @@ for dxf in "${dxf_files[@]}"; do
                 if (match($0, /(FRONT|LEFT|TOP|RIGHT):/)) {
                     view = substr($0, RSTART, RLENGTH - 1)
                 }
-                value = field_value("coverage", $0)
+                value = field_value("input_coverage", $0)
                 if (view != "" && value != "") {
                     items[++n] = view "=" value
                 }
@@ -236,7 +224,7 @@ for dxf in "${dxf_files[@]}"; do
                     printf "%s%s", (i == 1 ? "" : ", "), items[i]
                 }
             }' "${run_log}")"
-        match="$(awk '
+        hit_ratio="$(awk '
             function field_value(key, line, re, value) {
                 re = key "=[[:space:]]*[0-9.]+%"
                 if (match(line, re)) {
@@ -251,7 +239,7 @@ for dxf in "${dxf_files[@]}"; do
                 if (match($0, /(FRONT|LEFT|TOP|RIGHT):/)) {
                     view = substr($0, RSTART, RLENGTH - 1)
                 }
-                value = field_value("match", $0)
+                value = field_value("hit_ratio", $0)
                 if (view != "" && value != "") {
                     items[++n] = view "=" value
                 }
@@ -286,20 +274,131 @@ for dxf in "${dxf_files[@]}"; do
                     printf "%s%s", (i == 1 ? "" : ", "), items[i]
                 }
             }' "${run_log}")"
-        if [[ -z "${coverage}" ]]; then coverage="-"; fi
+        if [[ -z "${input_coverage}" ]]; then input_coverage="-"; fi
         if [[ -z "${missing}" ]]; then missing="-"; fi
-        if [[ -z "${match}" ]]; then match="-"; fi
+        if [[ -z "${hit_ratio}" ]]; then hit_ratio="-"; fi
         if [[ -z "${extra}" ]]; then extra="-"; fi
-        if [[ "${model_accuracy}" == "-" && "${match}" != "-" ]]; then
-            model_accuracy="${match}"
-        fi
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${part}" "${status}" "${llm_model}" "${model_accuracy}" "${coverage}" "${missing}" "${match}" "${extra}" "${elapsed}" "${llm_understanding}" "${fcstd_dst}" "${output_dir}" >> "${SUMMARY_FILE}"
+    SUMMARY_TMP="${SUMMARY_TMP}" \
+    PART="${part}" \
+    STATUS="${status}" \
+    LLM_MODEL="${llm_model}" \
+    ELAPSED="${elapsed}" \
+    INPUT_COVERAGE="${input_coverage}" \
+    HIT_RATIO="${hit_ratio}" \
+    MISSING="${missing}" \
+    EXTRA="${extra}" \
+    LLM_UNDERSTANDING="${llm_understanding}" \
+    FCSTD="${fcstd_dst}" \
+    RUN_DIR="${output_dir}" \
+    python3 - <<'PY'
+import json
+import os
+
+
+def parse_view_values(text):
+    result = {"front": None, "left": None, "top": None}
+    text = (text or "").strip()
+    if not text or text == "-":
+        return result
+    for item in text.split(","):
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip().lower()
+        if key == "right":
+            key = "left"
+        if key in result:
+            result[key] = value.strip()
+    return result
+
+
+def optional(value):
+    value = (value or "").strip()
+    return None if value in {"", "-"} else value
+
+
+entry = {
+    "name": os.environ["PART"],
+    "status": os.environ["STATUS"],
+    "llm_model": os.environ["LLM_MODEL"],
+    "elapsed_s": float(os.environ["ELAPSED"]),
+    "input_coverage": parse_view_values(os.environ["INPUT_COVERAGE"]),
+    "hit_ratio": parse_view_values(os.environ["HIT_RATIO"]),
+    "missing": parse_view_values(os.environ["MISSING"]),
+    "extra": parse_view_values(os.environ["EXTRA"]),
+    "llm": {
+        "understanding": optional(os.environ["LLM_UNDERSTANDING"]),
+    },
+    "fcstd": optional(os.environ["FCSTD"]),
+    "run_dir": optional(os.environ["RUN_DIR"]),
+}
+
+with open(os.environ["SUMMARY_TMP"], "a", encoding="utf-8") as f:
+    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+PY
 
     if (( rc != 0 )); then
         overall_rc=2
     fi
 done
+
+SUMMARY_TMP="${SUMMARY_TMP}" \
+SUMMARY_JSON="${SUMMARY_JSON}" \
+SUMMARY_CSV="${SUMMARY_CSV}" \
+OUTPUT_DIR="${OUTPUT_DIR}" \
+python3 - <<'PY'
+import csv
+import json
+import os
+
+tmp_path = os.environ["SUMMARY_TMP"]
+json_path = os.environ["SUMMARY_JSON"]
+csv_path = os.environ["SUMMARY_CSV"]
+output_dir = os.environ["OUTPUT_DIR"]
+
+results = []
+with open(tmp_path, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            results.append(json.loads(line))
+
+with open(json_path, "w", encoding="utf-8") as f:
+    json.dump({
+        "output_dir": output_dir,
+        "count": len(results),
+        "results": results,
+    }, f, ensure_ascii=False, indent=4)
+    f.write("\n")
+
+def compact_views(values):
+    if not isinstance(values, dict):
+        return ""
+    items = []
+    for view in ("front", "left", "top"):
+        value = values.get(view)
+        if value is not None:
+            items.append(f"{view}={value}")
+    return ", ".join(items)
+
+with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+    writer = csv.DictWriter(
+        f,
+        fieldnames=["name", "llm_model", "elapsed_s", "input_coverage", "hit_ratio"],
+    )
+    writer.writeheader()
+    for item in results:
+        writer.writerow({
+            "name": item.get("name", ""),
+            "llm_model": item.get("llm_model", ""),
+            "elapsed_s": item.get("elapsed_s", ""),
+            "input_coverage": compact_views(item.get("input_coverage")),
+            "hit_ratio": compact_views(item.get("hit_ratio")),
+        })
+
+os.remove(tmp_path)
+PY
 
 exit "${overall_rc}"

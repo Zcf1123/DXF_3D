@@ -14,8 +14,6 @@ references with translation / scale / rotation.  Anonymous `*Dn` blocks
 are intentionally **skipped** — they contain graphical decorations, not
 part geometry.  Dimension measurements are read from the DIMENSION entity
 ``dim_measurement`` field instead.
-
-This module never imports `ezdxf`.
 """
 from __future__ import annotations
 
@@ -81,10 +79,6 @@ class DxfEntity:
         d = asdict(self)
         d["bbox"] = self.bbox()
         return d
-
-
-def _try_import_ezdxf():  # kept for back-compat callers, always returns None
-    return None
 
 
 def _parse_ltype_descriptions(
